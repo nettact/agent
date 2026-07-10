@@ -15,13 +15,17 @@ import (
 	"net/http"
 	"time"
 
+	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
 
-// Ack is the server's response to a telemetry upload.
+// Ack is the server's response to a telemetry upload. DesiredState is present
+// when the server has newer monitoring config for this agent (config downlink).
 type Ack struct {
-	HighestSequence uint64    `json:"highest_sequence"`
-	ServerTime      time.Time `json:"server_time"`
+	HighestSequence uint64             `json:"highest_sequence"`
+	ServerTime      time.Time          `json:"server_time"`
+	ConfigVersion   int                `json:"config_version"`
+	DesiredState    *pcfg.DesiredState `json:"desired_state,omitempty"`
 }
 
 // Options configure an Uploader.

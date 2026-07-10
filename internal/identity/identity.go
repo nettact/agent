@@ -1,31 +1,66 @@
-// Package identity manages the agent's stable identity. M1 persists a random
-// agent ID to the data dir so restarts keep the same identity. M2 replaces this
-// with an ed25519 keypair + server-issued credential (architecture §11).
+// Package identity manages the agent's ed25519 keypair and the server-issued
+// credential (architecture §11). The private key never leaves the host; the
+// bearer token is obtained once at enrollment and reused for telemetry.
 package identity
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
-// LoadOrCreateAgentID returns the persisted agent ID under dataDir, creating
-// one on first run.
-func LoadOrCreateAgentID(dataDir string) (string, error) {
+// LoadOrCreateKey returns the agent's persisted ed25519 private key, generating
+// one on first run. The 32-byte seed is stored at dataDir/agent.key (0600).
+func LoadOrCreateKey(dataDir string) (ed25519.PrivateKey, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return "", err
+		return nil, err
 	}
-	path := filepath.Join(dataDir, "agent_id")
+	path := filepath.Join(dataDir, "agent.key")
 	if b, err := os.ReadFile(path); err == nil {
-		if id := strings.TrimSpace(string(b)); id != "" {
-			return id, nil
+		if seed, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b))); err == nil && len(seed) == ed25519.SeedSize {
+			return ed25519.NewKeyFromSeed(seed), nil
 		}
 	}
-	id := "agent_" + uuid.NewString()
-	if err := os.WriteFile(path, []byte(id), 0o600); err != nil {
-		return "", err
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
 	}
-	return id, nil
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(priv.Seed())), 0o600); err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
+// Credential is the server-issued agent identity persisted after enrollment.
+type Credential struct {
+	AgentID    string `json:"agent_id"`
+	SiteID     string `json:"site_id"`
+	AgentToken string `json:"agent_token"`
+}
+
+// LoadCredential returns the saved credential and whether the agent is enrolled.
+func LoadCredential(dataDir string) (Credential, bool, error) {
+	b, err := os.ReadFile(filepath.Join(dataDir, "agent.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return Credential{}, false, nil
+	}
+	if err != nil {
+		return Credential{}, false, err
+	}
+	var c Credential
+	if err := json.Unmarshal(b, &c); err != nil {
+		return Credential{}, false, err
+	}
+	return c, c.AgentToken != "", nil
+}
+
+// SaveCredential persists the credential (0600).
+func SaveCredential(dataDir string, c Credential) error {
+	b, _ := json.MarshalIndent(c, "", "  ")
+	return os.WriteFile(filepath.Join(dataDir, "agent.json"), b, 0o600)
 }
