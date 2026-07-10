@@ -1,0 +1,16 @@
+# Go
+*.exe
+*.test
+*.out
+/bin/
+
+# Agent local state / SQLite WAL
+agent-data/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
