@@ -27,6 +27,7 @@ func (winPlatform) Supports() []capability.Capability {
 		capability.NetIfaceRead,
 		capability.NetRouteRead,
 		capability.ProbeICMP,
+		capability.InventoryARP,
 	}
 }
 
@@ -85,13 +86,62 @@ func (winPlatform) Interfaces() ([]IfaceInfo, error) {
 	return out, nil
 }
 
-// iphlpapi ICMP echo API (loaded lazily; no admin required).
+// iphlpapi ICMP echo + ARP table APIs (loaded lazily; no admin required).
 var (
 	iphlpapi            = windows.NewLazySystemDLL("iphlpapi.dll")
 	procIcmpCreateFile  = iphlpapi.NewProc("IcmpCreateFile")
 	procIcmpCloseHandle = iphlpapi.NewProc("IcmpCloseHandle")
 	procIcmpSendEcho    = iphlpapi.NewProc("IcmpSendEcho")
+	procGetIpNetTable   = iphlpapi.NewProc("GetIpNetTable")
 )
+
+// mibIPNetRow mirrors MIB_IPNETROW (IPv4 ARP entry, 24 bytes on amd64).
+type mibIPNetRow struct {
+	Index       uint32
+	PhysAddrLen uint32
+	PhysAddr    [8]byte
+	Addr        uint32 // IPv4, network byte order
+	Type        uint32 // 1 other, 2 invalid, 3 dynamic, 4 static
+}
+
+const errorInsufficientBuffer = 122
+
+// Neighbors reads the IPv4 ARP table via GetIpNetTable (passive discovery; no
+// packet capture / Npcap needed).
+func (winPlatform) Neighbors() ([]Neighbor, error) {
+	var size uint32
+	_, _, _ = procGetIpNetTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	if size == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, size)
+	r0, _, _ := procGetIpNetTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+	if r0 != 0 {
+		if r0 == errorInsufficientBuffer {
+			return nil, nil // table grew between calls; skip this round
+		}
+		return nil, errors.New("GetIpNetTable failed")
+	}
+	num := *(*uint32)(unsafe.Pointer(&buf[0]))
+	rowSize := int(unsafe.Sizeof(mibIPNetRow{}))
+
+	var out []Neighbor
+	for i := 0; i < int(num); i++ {
+		off := 4 + i*rowSize
+		if off+rowSize > len(buf) {
+			break
+		}
+		row := (*mibIPNetRow)(unsafe.Pointer(&buf[off]))
+		if row.PhysAddrLen == 0 || row.Type == 2 { // skip incomplete/invalid
+			continue
+		}
+		ip := net.IPv4(byte(row.Addr), byte(row.Addr>>8), byte(row.Addr>>16), byte(row.Addr>>24))
+		mac := net.HardwareAddr(row.PhysAddr[:row.PhysAddrLen]).String()
+		out = append(out, Neighbor{IP: ip.String(), MAC: mac})
+	}
+	runtime.KeepAlive(buf)
+	return out, nil
+}
 
 // icmpEchoReply mirrors ICMP_ECHO_REPLY. Field order/alignment matches the C
 // struct on amd64 (40 bytes); Go's natural alignment reproduces the C padding.

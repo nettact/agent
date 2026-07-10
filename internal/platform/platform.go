@@ -29,12 +29,20 @@ type PingResult struct {
 	Received bool
 }
 
+// Neighbor is one entry from the ARP/neighbor table (a LAN device).
+type Neighbor struct {
+	IP  string
+	MAC string
+}
+
 // Platform is the per-OS capability surface used by collectors.
 type Platform interface {
 	// Interfaces enumerates NICs with their IPs, gateway and DNS servers.
 	Interfaces() ([]IfaceInfo, error)
 	// Ping sends one ICMP echo to target (IP or hostname) bounded by timeout.
 	Ping(ctx context.Context, target string, timeout time.Duration) (PingResult, error)
+	// Neighbors reads the ARP/neighbor table (passive LAN device discovery).
+	Neighbors() ([]Neighbor, error)
 	// Supports reports the capabilities this host actually implements.
 	Supports() []capability.Capability
 }
