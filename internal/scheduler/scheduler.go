@@ -16,10 +16,15 @@ import (
 // Sink receives each collector Result (the agent appends it to the WAL).
 type Sink func(collector.Result)
 
+// selfTick is how often self-scheduling collectors are polled; each such
+// collector then gates its own targets by their per-target interval.
+const selfTick = 1 * time.Second
+
 type Scheduler struct {
-	base    []collector.Collector
-	regular []collector.Collector
-	sink    Sink
+	base      []collector.Collector
+	regular   []collector.Collector
+	selfSched []collector.Collector
+	sink      Sink
 
 	mu              sync.Mutex
 	baseInterval    time.Duration
@@ -29,15 +34,19 @@ type Scheduler struct {
 	burstUntil      time.Time
 }
 
-func New(collectors []collector.Collector, sink Sink) *Scheduler {
+// New builds a scheduler. tiered collectors run on the base/regular/burst tier
+// loops; selfSched collectors are polled on a fine tick (selfTick) and gate
+// their own targets by each target's configured interval.
+func New(tiered []collector.Collector, selfSched []collector.Collector, sink Sink) *Scheduler {
 	s := &Scheduler{
 		sink:            sink,
+		selfSched:       selfSched,
 		baseInterval:    10 * time.Second,
 		regularInterval: 30 * time.Second,
 		burstInterval:   3 * time.Second,
 		burstWindow:     60 * time.Second,
 	}
-	for _, c := range collectors {
+	for _, c := range tiered {
 		if c.Tier() == collector.TierRegular {
 			s.regular = append(s.regular, c)
 		} else {
@@ -59,10 +68,47 @@ func (s *Scheduler) SetIntervals(base, regular time.Duration) {
 	s.mu.Unlock()
 }
 
-// Run starts the tier loops until ctx is cancelled.
+// Run starts the tier loops and the self-scheduled poll loop until ctx is
+// cancelled.
 func (s *Scheduler) Run(ctx context.Context) {
 	go s.tierLoop(ctx, s.base, true)
 	go s.tierLoop(ctx, s.regular, false)
+	go s.selfLoop(ctx)
+}
+
+// selfLoop polls self-scheduling collectors on a fine tick; each returns only
+// the targets due by their own interval (empty Result otherwise).
+func (s *Scheduler) selfLoop(ctx context.Context) {
+	if len(s.selfSched) == 0 {
+		return
+	}
+	t := time.NewTicker(selfTick)
+	defer t.Stop()
+	for {
+		for _, c := range s.selfSched {
+			res, err := c.Collect(ctx)
+			if err != nil {
+				continue
+			}
+			if len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 {
+				continue
+			}
+			// A self-scheduled probe reporting 100% loss is still a burst signal
+			// (public-ping moved off the base tier, so this is now the only place
+			// its faults would trigger burst diagnostics).
+			if faultDetected(res) {
+				s.mu.Lock()
+				s.burstUntil = time.Now().Add(s.burstWindow)
+				s.mu.Unlock()
+			}
+			s.sink(res)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 func (s *Scheduler) tierLoop(ctx context.Context, cols []collector.Collector, isBase bool) {

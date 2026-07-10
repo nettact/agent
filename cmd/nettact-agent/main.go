@@ -102,7 +102,13 @@ func main() {
 			log.Printf("WAL over capacity: dropped %d oldest samples (data gap)", dropped)
 		}
 	}
-	sched := scheduler.New([]collector.Collector{gateway, publicPing, iface, dns, httpc, arp}, sink)
+	// gateway/iface/arp run on the fixed tier loops; publicPing/dns/httpc are
+	// self-scheduling (each target probed on its own configured interval).
+	sched := scheduler.New(
+		[]collector.Collector{gateway, iface, arp},
+		[]collector.Collector{publicPing, dns, httpc},
+		sink,
+	)
 	sched.Run(ctx)
 
 	// Status heartbeat: report uptime + WAL depth outbound via the WAL/upload

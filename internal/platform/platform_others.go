@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"time"
 
 	"github.com/nettact/protocol/capability"
 )
@@ -43,7 +42,7 @@ func (genericPlatform) Interfaces() ([]IfaceInfo, error) {
 	return out, nil
 }
 
-func (genericPlatform) Ping(ctx context.Context, target string, timeout time.Duration) (PingResult, error) {
+func (genericPlatform) Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error) {
 	return PingResult{Target: target}, errors.New("icmp ping not yet implemented on this platform")
 }
 

@@ -29,6 +29,13 @@ type PingResult struct {
 	Received bool
 }
 
+// PingOptions tunes a single ICMP echo. Zero values mean "use defaults", so an
+// unconfigured caller behaves as before (2s timeout, small fixed payload).
+type PingOptions struct {
+	Timeout     time.Duration // per-echo timeout; 0 = 1s
+	PayloadSize int           // ICMP payload bytes; 0 = default probe payload
+}
+
 // Neighbor is one entry from the ARP/neighbor table (a LAN device).
 type Neighbor struct {
 	IP  string
@@ -39,8 +46,8 @@ type Neighbor struct {
 type Platform interface {
 	// Interfaces enumerates NICs with their IPs, gateway and DNS servers.
 	Interfaces() ([]IfaceInfo, error)
-	// Ping sends one ICMP echo to target (IP or hostname) bounded by timeout.
-	Ping(ctx context.Context, target string, timeout time.Duration) (PingResult, error)
+	// Ping sends one ICMP echo to target (IP or hostname) per opts.
+	Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error)
 	// Neighbors reads the ARP/neighbor table (passive LAN device discovery).
 	Neighbors() ([]Neighbor, error)
 	// Supports reports the capabilities this host actually implements.
@@ -49,3 +56,21 @@ type Platform interface {
 
 // New returns the platform implementation for the current OS.
 func New() Platform { return newPlatform() }
+
+// pingPayload builds an ICMP echo payload of the requested size. size <= 0 uses
+// the default 13-byte probe marker; otherwise the marker is repeated/truncated
+// to exactly size bytes (clamped to a sane maximum).
+func pingPayload(size int) []byte {
+	const marker = "nettact-probe"
+	if size <= 0 {
+		return []byte(marker)
+	}
+	if size > 65500 {
+		size = 65500
+	}
+	buf := make([]byte, size)
+	for i := range buf {
+		buf[i] = marker[i%len(marker)]
+	}
+	return buf
+}

@@ -163,8 +163,9 @@ type ipOptionInformation struct {
 	OptionsData uintptr
 }
 
-func (winPlatform) Ping(ctx context.Context, target string, timeout time.Duration) (PingResult, error) {
+func (winPlatform) Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error) {
 	res := PingResult{Target: target}
+	timeout := opts.Timeout
 
 	ip := net.ParseIP(target)
 	if ip == nil {
@@ -186,7 +187,7 @@ func (winPlatform) Ping(ctx context.Context, target string, timeout time.Duratio
 	defer procIcmpCloseHandle.Call(handle)
 
 	dest := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
-	reqData := []byte("nettact-probe")
+	reqData := pingPayload(opts.PayloadSize)
 	replyBuf := make([]byte, int(unsafe.Sizeof(icmpEchoReply{}))+len(reqData)+64)
 
 	to := uint32(timeout / time.Millisecond)

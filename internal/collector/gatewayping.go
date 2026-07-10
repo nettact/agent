@@ -49,7 +49,7 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 		}, nil
 	}
 
-	pr, err := c.p.Ping(ctx, gw, c.timeout)
+	pr, err := c.p.Ping(ctx, gw, platform.PingOptions{Timeout: c.timeout})
 	if err != nil {
 		return Result{}, err
 	}

@@ -3,7 +3,6 @@ package collector
 import (
 	"context"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/nettact/protocol/capability"
@@ -12,31 +11,32 @@ import (
 )
 
 // HTTPCollector performs HTTP/HTTPS availability checks against a
-// server-configured URL set (architecture §4 service layer).
+// server-configured URL set (architecture §4 service layer). Each URL carries
+// its own per-target params (timeout, interval, method, expected status) and is
+// probed on its own schedule via schedState.
 type HTTPCollector struct {
-	mu      sync.RWMutex
-	urls    []string
-	client  *http.Client
-	timeout time.Duration
+	client *http.Client
+	sched  *schedState
 }
 
 func NewHTTPCollector() *HTTPCollector {
+	// No client-level Timeout: each request is bounded by its own per-target
+	// context timeout, so a configured TimeoutMs above 10s is honored instead of
+	// being silently capped by a fixed client timeout.
 	return &HTTPCollector{
-		client:  &http.Client{Timeout: 10 * time.Second},
-		timeout: 10 * time.Second,
+		client: &http.Client{},
+		sched:  newSchedState(30 * time.Second),
 	}
 }
 
 func (c *HTTPCollector) SetTargets(targets []pcfg.ProbeTarget) {
-	var urls []string
+	var urls []pcfg.ProbeTarget
 	for _, t := range targets {
 		if t.Kind == "http" && t.Target != "" {
-			urls = append(urls, t.Target)
+			urls = append(urls, t)
 		}
 	}
-	c.mu.Lock()
-	c.urls = urls
-	c.mu.Unlock()
+	c.sched.set(urls)
 }
 
 func (c *HTTPCollector) Name() string { return "http" }
@@ -48,15 +48,25 @@ func (c *HTTPCollector) Capabilities() []capability.Capability {
 func (c *HTTPCollector) Tier() Tier { return TierRegular }
 
 func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
-	c.mu.RLock()
-	urls := append([]string(nil), c.urls...)
-	c.mu.RUnlock()
+	targets := c.sched.due(time.Now())
+	if len(targets) == 0 {
+		return Result{}, nil
+	}
 
 	now := time.Now().UTC()
 	var res Result
-	for _, url := range urls {
-		cctx, cancel := context.WithTimeout(ctx, c.timeout)
-		req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
+	for _, t := range targets {
+		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		method := t.Params.Method
+		if method == "" {
+			method = http.MethodGet
+		}
+
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := http.NewRequestWithContext(cctx, method, t.Target, nil)
 		if err != nil {
 			cancel()
 			continue
@@ -67,11 +77,11 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		if err != nil {
 			cancel()
 			res.Metrics = append(res.Metrics, telemetry.Metric{
-				TS: now, Kind: telemetry.HTTPOK, Target: url, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,
+				TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,
 			})
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
-				Severity: telemetry.SeverityWarn, Message: "HTTP request failed: " + url,
+				Severity: telemetry.SeverityWarn, Message: "HTTP request failed: " + t.Target,
 			})
 			continue
 		}
@@ -80,13 +90,17 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		cancel()
 
 		ok := 0.0
-		if status >= 200 && status < 400 {
+		if t.Params.ExpectedStatus > 0 {
+			if status == t.Params.ExpectedStatus {
+				ok = 1.0
+			}
+		} else if status >= 200 && status < 400 {
 			ok = 1.0
 		}
 		res.Metrics = append(res.Metrics,
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: url, Layer: telemetry.LayerService, Value: float64(status), Unit: telemetry.UnitCode},
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: url, Layer: telemetry.LayerService, Value: lat, Unit: telemetry.UnitMs},
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: url, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(status), Unit: telemetry.UnitCode},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: lat, Unit: telemetry.UnitMs},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool},
 		)
 	}
 	return res, nil
