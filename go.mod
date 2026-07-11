@@ -6,6 +6,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/nettact/protocol v0.0.0-00010101000000-000000000000
 	github.com/shirou/gopsutil/v3 v3.24.5
+	golang.org/x/net v0.21.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.34.5
 )

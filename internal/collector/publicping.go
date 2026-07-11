@@ -53,7 +53,12 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
-		count := t.Params.Retries + 1
+		// PacketCount supersedes the legacy Retries+1 count when set; both fall
+		// back to a single echo.
+		count := t.Params.PacketCount
+		if count < 1 {
+			count = t.Params.Retries + 1
+		}
 		if count < 1 {
 			count = 1
 		}
@@ -61,12 +66,38 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 		if timeout <= 0 {
 			timeout = 2 * time.Second
 		}
-		opts := platform.PingOptions{Timeout: timeout, PayloadSize: t.Params.PacketSize}
+		// GlobalTimeoutMs bounds the whole cycle across all echoes, regardless of
+		// how many packets are configured. We enforce it with a
+		// wall-clock deadline and by capping each ping's own timeout to the time
+		// remaining — context cancellation alone can't interrupt a synchronous
+		// platform ping (e.g. Windows IcmpSendEcho honors only PingOptions.Timeout).
+		pctx := ctx
+		var cancel context.CancelFunc
+		var deadline time.Time
+		if t.Params.GlobalTimeoutMs > 0 {
+			d := time.Duration(t.Params.GlobalTimeoutMs) * time.Millisecond
+			deadline = time.Now().Add(d)
+			pctx, cancel = context.WithTimeout(ctx, d)
+		}
 
 		received := 0
 		var rttSum time.Duration
 		for i := 0; i < count; i++ {
-			pr, err := c.p.Ping(ctx, t.Target, opts)
+			if pctx.Err() != nil {
+				break
+			}
+			callTimeout := timeout
+			if !deadline.IsZero() {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					break
+				}
+				if remaining < callTimeout {
+					callTimeout = remaining
+				}
+			}
+			opts := platform.PingOptions{Timeout: callTimeout, PayloadSize: t.Params.PacketSize}
+			pr, err := c.p.Ping(pctx, t.Target, opts)
 			if err != nil {
 				continue
 			}
@@ -74,6 +105,9 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 				received++
 				rttSum += pr.RTT
 			}
+		}
+		if cancel != nil {
+			cancel()
 		}
 		labels := map[string]string{"ip": t.Target}
 		loss := float64(count-received) / float64(count) * 100.0

@@ -6,7 +6,7 @@ package collector
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -56,11 +56,12 @@ func newSchedState(fallback time.Duration) *schedState {
 
 // schedKey uniquely identifies a probe within a collector. Keying by target
 // string alone collides when two probes share a target but differ in params
-// (e.g. DNS A vs AAAA for the same host), which would let one starve the other.
+// (e.g. DNS A vs AAAA for the same host, or two HTTP checks on the same URL with
+// different keywords), which would let one starve the other. Keying on the full
+// marshaled params guarantees any distinguishing field yields a distinct key.
 func schedKey(t pcfg.ProbeTarget) string {
-	return fmt.Sprintf("%s|%s|%s|%d|%d|%d",
-		t.Target, t.Params.RecordType, t.Params.Method,
-		t.Params.ExpectedStatus, t.Params.PacketSize, t.Params.TimeoutMs)
+	b, _ := json.Marshal(t.Params)
+	return t.Kind + "|" + t.Target + "|" + string(b)
 }
 
 // set replaces the target list (from a DesiredState push) and prunes due-times
