@@ -30,6 +30,7 @@ import (
 	"github.com/nettact/protocol/capability"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/protocol/wire"
 )
 
 const agentVersion = "0.3.0-m3"
@@ -45,6 +46,7 @@ func main() {
 	enrollToken := flag.String("enroll-token", "", "one-time enrollment token (first run only)")
 	insecure := flag.Bool("insecure", false, "skip TLS verification (LAN self-signed)")
 	uploadEvery := flag.Duration("upload-interval", 5*time.Second, "how often to drain the WAL and upload")
+	wireFormat := flag.String("wire-format", "protobuf", "telemetry upload encoding: protobuf (compact, default) or json (debug)")
 	// Host-monitoring opt-in. These flags are the SOLE authority: without them the
 	// agent never collects the corresponding data, so the server cannot obtain any
 	// host state from a non-opted-in agent (enforced agent-side, below).
@@ -55,6 +57,16 @@ func main() {
 
 	if *server == "" {
 		log.Fatal("--server is required")
+	}
+
+	var uploadFormat string
+	switch *wireFormat {
+	case "protobuf":
+		uploadFormat = wire.ContentTypeProtobuf
+	case "json":
+		uploadFormat = wire.ContentTypeJSON
+	default:
+		log.Fatalf("--wire-format must be 'protobuf' or 'json', got %q", *wireFormat)
 	}
 
 	priv, err := identity.LoadOrCreateKey(*dataDir)
@@ -171,8 +183,9 @@ func main() {
 	up := uploader.New(uploader.Options{
 		ServerURL: *server, Token: cred.AgentToken, Hostname: hostname,
 		Platform: runtime.GOOS, Version: agentVersion, Insecure: *insecure,
-		Capabilities: strings.Join(capStrs, ","),
+		Capabilities: strings.Join(capStrs, ","), Format: uploadFormat,
 	})
+	log.Printf("telemetry wire format: %s", *wireFormat)
 	appliedConfigVersion := -1 // start behind so the server resends current config
 	// pendingSnapshot holds a server-requested live snapshot until the next drain
 	// sends it. It persists across drain calls (a request may arrive on one tick
