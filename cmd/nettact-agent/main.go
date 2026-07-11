@@ -14,17 +14,20 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nettact/agent/internal/collector"
 	"github.com/nettact/agent/internal/enroll"
+	"github.com/nettact/agent/internal/hostsnapshot"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/internal/scheduler"
 	"github.com/nettact/agent/internal/uploader"
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/protocol"
+	"github.com/nettact/protocol/capability"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -42,6 +45,12 @@ func main() {
 	enrollToken := flag.String("enroll-token", "", "one-time enrollment token (first run only)")
 	insecure := flag.Bool("insecure", false, "skip TLS verification (LAN self-signed)")
 	uploadEvery := flag.Duration("upload-interval", 5*time.Second, "how often to drain the WAL and upload")
+	// Host-monitoring opt-in. These flags are the SOLE authority: without them the
+	// agent never collects the corresponding data, so the server cannot obtain any
+	// host state from a non-opted-in agent (enforced agent-side, below).
+	reportHost := flag.Bool("report-host", false, "report host CPU/memory/disk/load/uptime/network metrics (opt-in)")
+	reportProcs := flag.Bool("report-processes", false, "permit on-demand live process-list snapshots (opt-in)")
+	reportConns := flag.Bool("report-connections", false, "permit on-demand live network-connection snapshots (opt-in)")
 	flag.Parse()
 
 	if *server == "" {
@@ -55,6 +64,19 @@ func main() {
 	hostname, _ := os.Hostname()
 	p := platform.New()
 
+	// Capabilities advertised at enroll reflect only enabled opt-in flags, so the
+	// console can tell which agents will serve host metrics / live snapshots.
+	caps := append([]capability.Capability(nil), p.Supports()...)
+	if *reportHost {
+		caps = append(caps, capability.HostStatRead)
+	}
+	if *reportProcs {
+		caps = append(caps, capability.HostProcessRead)
+	}
+	if *reportConns {
+		caps = append(caps, capability.HostConnectionRead)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -66,7 +88,7 @@ func main() {
 		if *enrollToken == "" {
 			log.Fatal("first run requires --enroll-token (create one in the Lite console)")
 		}
-		cred, err = enroll.Enroll(ctx, *server, *insecure, priv, *enrollToken, hostname, runtime.GOOS, agentVersion, p.Supports())
+		cred, err = enroll.Enroll(ctx, *server, *insecure, priv, *enrollToken, hostname, runtime.GOOS, agentVersion, caps)
 		if err != nil {
 			log.Fatalf("enroll: %v", err)
 		}
@@ -104,8 +126,15 @@ func main() {
 	}
 	// gateway/iface/arp run on the fixed tier loops; publicPing/dns/httpc are
 	// self-scheduling (each target probed on its own configured interval).
+	tiered := []collector.Collector{gateway, iface, arp}
+	if *reportHost {
+		// Host metrics flow through the same WAL→upload→ingest→series pipeline as
+		// probes, so History and the alert engine work with no server changes.
+		tiered = append(tiered, collector.NewHostMetricsCollector())
+		log.Print("host metrics reporting enabled (--report-host)")
+	}
 	sched := scheduler.New(
-		[]collector.Collector{gateway, iface, arp},
+		tiered,
 		[]collector.Collector{publicPing, dns, httpc},
 		sink,
 	)
@@ -135,21 +164,56 @@ func main() {
 		}
 	}()
 
+	capStrs := make([]string, len(caps))
+	for i, c := range caps {
+		capStrs[i] = string(c)
+	}
 	up := uploader.New(uploader.Options{
 		ServerURL: *server, Token: cred.AgentToken, Hostname: hostname,
 		Platform: runtime.GOOS, Version: agentVersion, Insecure: *insecure,
+		Capabilities: strings.Join(capStrs, ","),
 	})
 	appliedConfigVersion := -1 // start behind so the server resends current config
+	// pendingSnapshot holds a server-requested live snapshot until the next drain
+	// sends it. It persists across drain calls (a request may arrive on one tick
+	// and be served on the next), so snapshot delivery must run even when the WAL
+	// is empty this tick.
+	var pendingSnapshot *pcfg.SnapshotRequest
+
+	// sendSnapshot collects a live host snapshot and uploads it in its own packet.
+	// The agent-side flags are re-checked here (defense in depth): a request for a
+	// cap the agent wasn't started with yields empty lists — never collected data.
+	// The packet carries no metrics, so the server processes HostSnapshot outside
+	// its sequence-dedup path; Sequence is irrelevant and left 0.
+	sendSnapshot := func(req *pcfg.SnapshotRequest) {
+		wantProcs := req.WantProcesses && *reportProcs
+		wantConns := req.WantConnections && *reportConns
+		snap := hostsnapshot.Collect(ctx, req.RequestID, wantProcs, wantConns)
+		pkt := telemetry.Packet{
+			SchemaVersion:         protocol.SchemaVersion,
+			AgentID:               cred.AgentID,
+			SiteID:                cred.SiteID,
+			SentAt:                time.Now().UTC(),
+			ReportedConfigVersion: appliedConfigVersion,
+			HostSnapshot:          &snap,
+		}
+		if _, err := up.Upload(ctx, pkt); err != nil {
+			log.Printf("snapshot upload (req=%s) failed: %v", req.RequestID, err)
+			return
+		}
+		log.Printf("sent host snapshot req=%s procs=%d conns=%d total=%d",
+			req.RequestID, len(snap.Processes), len(snap.Connections), snap.ProcessTotal)
+	}
 
 	drain := func() {
 		for i := 0; i < 100; i++ { // bound work per tick; backfill spans ticks
 			batch, ok, err := outbox.NextBatch(500)
 			if err != nil {
 				log.Printf("wal next batch: %v", err)
-				return
+				break
 			}
 			if !ok {
-				return
+				break
 			}
 			pkt := telemetry.Packet{
 				SchemaVersion:         protocol.SchemaVersion,
@@ -165,7 +229,7 @@ func main() {
 			ack, err := up.Upload(ctx, pkt)
 			if err != nil {
 				log.Printf("upload seq=%d failed: %v (will retry same sequence)", batch.Sequence, err)
-				return
+				break
 			}
 			if err := outbox.Ack(batch.Sequence); err != nil {
 				log.Printf("wal ack seq=%d: %v", batch.Sequence, err)
@@ -184,7 +248,25 @@ func main() {
 				)
 				appliedConfigVersion = ds.ConfigVersion
 				log.Printf("applied config v%d: %d probe targets", ds.ConfigVersion, len(ds.ProbeTargets))
+				if ds.SnapshotRequest != nil {
+					pendingSnapshot = ds.SnapshotRequest
+				}
 			}
+			// Serve a newly-received snapshot request immediately, mid-backfill: a
+			// large WAL (up to 100 batches this tick) could otherwise delay it past
+			// the server's snapshot-request TTL and make the live request time out.
+			if pendingSnapshot != nil {
+				req := pendingSnapshot
+				pendingSnapshot = nil
+				sendSnapshot(req)
+			}
+		}
+		// Also serve a request carried over from a previous tick when this tick had
+		// no WAL data to upload (the loop above broke before receiving any ack).
+		if pendingSnapshot != nil {
+			req := pendingSnapshot
+			pendingSnapshot = nil
+			sendSnapshot(req)
 		}
 	}
 

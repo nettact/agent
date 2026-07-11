@@ -30,12 +30,13 @@ type Ack struct {
 
 // Options configure an Uploader.
 type Options struct {
-	ServerURL string // e.g. http://localhost:8080
-	Token     string // bearer token (dev placeholder in M1)
-	Hostname  string
-	Platform  string
-	Version   string
-	Insecure  bool // skip TLS verification (LAN self-signed dev)
+	ServerURL    string // e.g. http://localhost:8080
+	Token        string // bearer token (dev placeholder in M1)
+	Hostname     string
+	Platform     string
+	Version      string
+	Capabilities string // comma-separated; lets the server refresh caps on restart
+	Insecure     bool   // skip TLS verification (LAN self-signed dev)
 }
 
 type Uploader struct {
@@ -79,6 +80,9 @@ func (u *Uploader) Upload(ctx context.Context, pkt telemetry.Packet) (Ack, error
 	req.Header.Set("X-Agent-Hostname", u.opts.Hostname)
 	req.Header.Set("X-Agent-Platform", u.opts.Platform)
 	req.Header.Set("X-Agent-Version", u.opts.Version)
+	if u.opts.Capabilities != "" {
+		req.Header.Set("X-Agent-Capabilities", u.opts.Capabilities)
+	}
 
 	resp, err := u.client.Do(req)
 	if err != nil {
