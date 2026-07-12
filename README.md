@@ -5,7 +5,7 @@ NetTact 软件 Agent —— 部署在 Windows / Linux / macOS / NAS 上的**纯�
 M1 已实现：
 - `internal/platform/` — 平台 HAL；Windows 用 `GetAdaptersAddresses`（网卡/网关/DNS）与 `IcmpSendEcho`（网关 ping，**免管理员**、CGO-free），可交叉编译到 Linux。
 - `internal/collector/` — interface + gateway-ping collector。
-- `internal/uploader/` — gzip 批量上传。
+- `internal/conn/` — 到服务器的持久 WebSocket 连接（遥测上行 + 配置/快照请求下行，断线自动重连）。
 - `internal/identity/` — 本地 agent 身份（M2 起换 ed25519 注册）。
 
 近零配置运行：

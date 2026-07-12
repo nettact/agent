@@ -3,6 +3,7 @@ module github.com/nettact/agent
 go 1.25.0
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/google/uuid v1.6.0
 	github.com/nettact/protocol v0.0.0-00010101000000-000000000000
 	github.com/pion/dtls/v3 v3.1.5

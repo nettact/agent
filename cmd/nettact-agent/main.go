@@ -1,9 +1,10 @@
 // Command nettact-agent is the endpoint/site monitoring agent — a pure outbound
-// client that never listens on any port (architecture §15.1). M3 makes the
-// pipeline durable: collectors (run at three scheduler tiers) append to a local
-// SQLite WAL, and a drain loop uploads batches with a persistent sequence so a
-// server outage or agent crash never loses data and never double-counts (the
-// server dedups on agent_id+sequence).
+// client that never listens on any port (architecture §15.1). Collectors (run
+// at three scheduler tiers) append to a local SQLite WAL for durability, and a
+// persistent WebSocket session to the server drains batches with a persistent
+// sequence — a server outage or agent crash never loses data and never
+// double-counts (the server dedups on agent_id+sequence). The same socket
+// carries server pushes (DesiredState config, live-snapshot requests) down.
 package main
 
 import (
@@ -14,39 +15,31 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nettact/agent/internal/collector"
+	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/enroll"
-	"github.com/nettact/agent/internal/hostsnapshot"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/internal/scheduler"
-	"github.com/nettact/agent/internal/uploader"
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/capability"
-	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 )
 
 const agentVersion = "0.3.0-m3"
 
-// configurable is a collector whose targets are pushed from the server.
-type configurable interface {
-	SetTargets([]pcfg.ProbeTarget)
-}
-
 func main() {
 	server := flag.String("server", "", "server base URL, e.g. http://localhost:8080 (required)")
 	dataDir := flag.String("data-dir", "./agent-data", "directory for agent state (key, credential, WAL)")
 	enrollToken := flag.String("enroll-token", "", "one-time enrollment token (first run only)")
 	insecure := flag.Bool("insecure", false, "skip TLS verification (LAN self-signed)")
-	uploadEvery := flag.Duration("upload-interval", 5*time.Second, "how often to drain the WAL and upload")
-	wireFormat := flag.String("wire-format", "protobuf", "telemetry upload encoding: protobuf (compact, default) or json (debug)")
+	uploadEvery := flag.Duration("upload-interval", 5*time.Second, "how often to drain the WAL over the WebSocket")
+	wireFormat := flag.String("wire-format", "protobuf", "telemetry wire encoding: protobuf (compact, default) or json (debug)")
 	// Host-monitoring opt-in. These flags are the SOLE authority: without them the
 	// agent never collects the corresponding data, so the server cannot obtain any
 	// host state from a non-opted-in agent (enforced agent-side, below).
@@ -59,12 +52,13 @@ func main() {
 		log.Fatal("--server is required")
 	}
 
-	var uploadFormat string
+	// The wire format is fixed per connection via the negotiated WS subprotocol.
+	var subprotocol string
 	switch *wireFormat {
 	case "protobuf":
-		uploadFormat = wire.ContentTypeProtobuf
+		subprotocol = wire.SubprotocolProtobuf
 	case "json":
-		uploadFormat = wire.ContentTypeJSON
+		subprotocol = wire.SubprotocolJSON
 	default:
 		log.Fatalf("--wire-format must be 'protobuf' or 'json', got %q", *wireFormat)
 	}
@@ -129,8 +123,7 @@ func main() {
 	httpc := collector.NewHTTPCollector()
 	tcpc := collector.NewTCPCollector()
 	natc := collector.NewNATCollector()
-	arp := collector.NewARPCollector(p)
-	configurables := []configurable{publicPing, dns, httpc, tcpc, natc}
+	configurables := []conn.Configurable{publicPing, dns, httpc, tcpc, natc}
 
 	sink := func(res collector.Result) {
 		dropped, err := outbox.Append(res.Metrics, res.Events, res.Inventory)
@@ -144,9 +137,10 @@ func main() {
 	}
 	// gateway/iface/arp run on the fixed tier loops; publicPing/dns/httpc are
 	// self-scheduling (each target probed on its own configured interval).
+	arp := collector.NewARPCollector(p)
 	tiered := []collector.Collector{gateway, iface, arp}
 	if *reportHost {
-		// Host metrics flow through the same WAL→upload→ingest→series pipeline as
+		// Host metrics flow through the same WAL→WS→ingest→series pipeline as
 		// probes, so History and the alert engine work with no server changes.
 		tiered = append(tiered, collector.NewHostMetricsCollector())
 		log.Print("host metrics reporting enabled (--report-host)")
@@ -158,8 +152,8 @@ func main() {
 	)
 	sched.Run(ctx)
 
-	// Status heartbeat: report uptime + WAL depth outbound via the WAL/upload
-	// path (the agent never exposes an endpoint).
+	// Status heartbeat: report uptime + WAL depth outbound via the WAL/WS path
+	// (the agent never exposes an endpoint).
 	start := time.Now()
 	go func() {
 		t := time.NewTicker(30 * time.Second)
@@ -186,127 +180,37 @@ func main() {
 	for i, c := range caps {
 		capStrs[i] = string(c)
 	}
-	up := uploader.New(uploader.Options{
-		ServerURL: *server, Token: cred.AgentToken, Hostname: hostname,
-		Platform: runtime.GOOS, Version: agentVersion, Insecure: *insecure,
-		Capabilities: strings.Join(capStrs, ","), Format: uploadFormat,
-	})
 	log.Printf("telemetry wire format: %s", *wireFormat)
-	appliedConfigVersion := -1 // start behind so the server resends current config
-	// pendingSnapshot holds a server-requested live snapshot until the next drain
-	// sends it. It persists across drain calls (a request may arrive on one tick
-	// and be served on the next), so snapshot delivery must run even when the WAL
-	// is empty this tick.
-	var pendingSnapshot *pcfg.SnapshotRequest
-
-	// sendSnapshot collects a live host snapshot and uploads it in its own packet.
-	// The agent-side flags are re-checked here (defense in depth): a request for a
-	// cap the agent wasn't started with yields empty lists — never collected data.
-	// The packet carries no metrics, so the server processes HostSnapshot outside
-	// its sequence-dedup path; Sequence is irrelevant and left 0.
-	sendSnapshot := func(req *pcfg.SnapshotRequest) {
-		wantProcs := req.WantProcesses && *reportProcs
-		wantConns := req.WantConnections && *reportConns
-		snap := hostsnapshot.Collect(ctx, req.RequestID, wantProcs, wantConns)
-		pkt := telemetry.Packet{
-			SchemaVersion:         protocol.SchemaVersion,
-			AgentID:               cred.AgentID,
-			SiteID:                cred.SiteID,
-			SentAt:                time.Now().UTC(),
-			ReportedConfigVersion: appliedConfigVersion,
-			HostSnapshot:          &snap,
-		}
-		if _, err := up.Upload(ctx, pkt); err != nil {
-			log.Printf("snapshot upload (req=%s) failed: %v", req.RequestID, err)
-			return
-		}
-		log.Printf("sent host snapshot req=%s procs=%d conns=%d total=%d",
-			req.RequestID, len(snap.Processes), len(snap.Connections), snap.ProcessTotal)
-	}
-
-	drain := func() {
-		for i := 0; i < 100; i++ { // bound work per tick; backfill spans ticks
-			batch, ok, err := outbox.NextBatch(500)
-			if err != nil {
-				log.Printf("wal next batch: %v", err)
-				break
-			}
-			if !ok {
-				break
-			}
-			pkt := telemetry.Packet{
-				SchemaVersion:         protocol.SchemaVersion,
-				AgentID:               cred.AgentID,
-				SiteID:                cred.SiteID,
-				Sequence:              batch.Sequence,
-				SentAt:                time.Now().UTC(),
-				Metrics:               batch.Metrics,
-				Events:                batch.Events,
-				InventoryDelta:        batch.Inventory,
-				ReportedConfigVersion: appliedConfigVersion,
-			}
-			ack, err := up.Upload(ctx, pkt)
-			if err != nil {
-				log.Printf("upload seq=%d failed: %v (will retry same sequence)", batch.Sequence, err)
-				break
-			}
-			if err := outbox.Ack(batch.Sequence); err != nil {
-				log.Printf("wal ack seq=%d: %v", batch.Sequence, err)
-			}
-			log.Printf("uploaded seq=%d metrics=%d events=%d inv=%d (watermark=%d, pending=%d)",
-				batch.Sequence, len(pkt.Metrics), len(pkt.Events), len(pkt.InventoryDelta), ack.HighestSequence, outbox.Pending())
-
-			if ack.DesiredState != nil {
-				ds := ack.DesiredState
-				for _, c := range configurables {
-					c.SetTargets(ds.ProbeTargets)
-				}
-				sched.SetIntervals(
-					time.Duration(ds.Intervals.BaseSeconds)*time.Second,
-					time.Duration(ds.Intervals.RegularSeconds)*time.Second,
-				)
-				appliedConfigVersion = ds.ConfigVersion
-				log.Printf("applied config v%d: %d probe targets", ds.ConfigVersion, len(ds.ProbeTargets))
-				if ds.SnapshotRequest != nil {
-					pendingSnapshot = ds.SnapshotRequest
-				}
-			}
-			// Serve a newly-received snapshot request immediately, mid-backfill: a
-			// large WAL (up to 100 batches this tick) could otherwise delay it past
-			// the server's snapshot-request TTL and make the live request time out.
-			if pendingSnapshot != nil {
-				req := pendingSnapshot
-				pendingSnapshot = nil
-				sendSnapshot(req)
-			}
-		}
-		// Also serve a request carried over from a previous tick when this tick had
-		// no WAL data to upload (the loop above broke before receiving any ack).
-		if pendingSnapshot != nil {
-			req := pendingSnapshot
-			pendingSnapshot = nil
-			sendSnapshot(req)
-		}
-	}
-
 	log.Printf("agent %s started (host=%s, platform=%s, caps=%v)", cred.AgentID, hostname, runtime.GOOS, p.Supports())
 
-	// Let the first collections land, then drain; thereafter on a ticker.
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(1500 * time.Millisecond):
+	// The connection loop owns everything session-scoped: WAL drain, ack
+	// tracking, config application, and snapshot serving. It blocks until ctx
+	// is cancelled, reconnecting with backoff as needed, and sends a clean
+	// WebSocket close on shutdown so the server marks us offline immediately.
+	err = conn.Run(ctx, conn.Options{
+		ServerURL: *server,
+		Token:     cred.AgentToken,
+		Insecure:  *insecure,
+		Format:    subprotocol,
+		AgentID:   cred.AgentID,
+		SiteID:    cred.SiteID,
+		Hello: wire.Hello{
+			SchemaVersion: protocol.SchemaVersion,
+			Hostname:      hostname,
+			Platform:      runtime.GOOS,
+			AgentVersion:  agentVersion,
+			Capabilities:  capStrs,
+		},
+	}, conn.Deps{
+		Outbox:        outbox,
+		Configurables: configurables,
+		Scheduler:     sched,
+		DrainInterval: *uploadEvery,
+		ReportProcs:   *reportProcs,
+		ReportConns:   *reportConns,
+	})
+	if err != nil {
+		log.Fatalf("connection: %v", err)
 	}
-	drain()
-	ticker := time.NewTicker(*uploadEvery)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("agent stopping")
-			return
-		case <-ticker.C:
-			drain()
-		}
-	}
+	log.Println("agent stopping")
 }
