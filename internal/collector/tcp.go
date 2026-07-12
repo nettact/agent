@@ -84,11 +84,13 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.TCPOK, Target: t.Target, Layer: telemetry.LayerService,
 			Value: ok, Unit: telemetry.UnitBool, Labels: map[string]string{"port": strconv.Itoa(t.Params.Port)},
+			MonitorID: t.MonitorID,
 		})
 		if err == nil {
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.TCPConnectMs, Target: t.Target, Layer: telemetry.LayerService,
 				Value: lat, Unit: telemetry.UnitMs, Labels: map[string]string{"port": strconv.Itoa(t.Params.Port)},
+				MonitorID: t.MonitorID,
 			})
 		} else {
 			res.Events = append(res.Events, telemetry.Event{

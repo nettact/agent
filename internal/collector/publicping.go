@@ -113,12 +113,12 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 		loss := float64(count-received) / float64(count) * 100.0
 		res.Metrics = append(res.Metrics,
 			telemetry.Metric{TS: now, Kind: telemetry.ICMPLoss, Target: t.Target, Layer: telemetry.LayerInternet,
-				Value: loss, Unit: telemetry.UnitPct, Labels: labels})
+				Value: loss, Unit: telemetry.UnitPct, Labels: labels, MonitorID: t.MonitorID})
 		if received > 0 {
 			avgMs := float64(rttSum.Microseconds()) / float64(received) / 1000.0
 			res.Metrics = append(res.Metrics,
 				telemetry.Metric{TS: now, Kind: telemetry.ICMPRTTms, Target: t.Target, Layer: telemetry.LayerInternet,
-					Value: avgMs, Unit: telemetry.UnitMs, Labels: labels})
+					Value: avgMs, Unit: telemetry.UnitMs, Labels: labels, MonitorID: t.MonitorID})
 		}
 	}
 	return res, nil

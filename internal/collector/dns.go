@@ -106,11 +106,13 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.DNSOK, Target: t.Target, Layer: telemetry.LayerDNS, Value: okv, Unit: telemetry.UnitBool,
+			MonitorID: t.MonitorID,
 		})
 		if ok {
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.DNSResolve, Target: t.Target, Layer: telemetry.LayerDNS,
 				Value: float64(time.Since(t0).Microseconds()) / 1000.0, Unit: telemetry.UnitMs,
+				MonitorID: t.MonitorID,
 			})
 		} else {
 			res.Events = append(res.Events, telemetry.Event{

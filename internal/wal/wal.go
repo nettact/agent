@@ -80,9 +80,16 @@ func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv
 		}
 	}()
 
+	// One prepared statement reused for every row in the batch — at 1s probe
+	// intervals a batch carries dozens of rows and per-row re-parsing adds up.
+	stmt, err := tx.Prepare(`INSERT INTO sample(created_at, kind, data, packet_seq) VALUES(?,?,?,NULL)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
 	ins := func(kind string, v any) error {
 		b, _ := json.Marshal(v)
-		_, e := tx.Exec(`INSERT INTO sample(created_at, kind, data, packet_seq) VALUES(?,?,?,NULL)`, now, kind, string(b))
+		_, e := stmt.Exec(now, kind, string(b))
 		return e
 	}
 	for i := range metrics {

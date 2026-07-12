@@ -54,14 +54,13 @@ func newSchedState(fallback time.Duration) *schedState {
 	return &schedState{nextDue: map[string]time.Time{}, fallback: fallback}
 }
 
-// schedKey uniquely identifies a probe within a collector. Keying by target
-// string alone collides when two probes share a target but differ in params
-// (e.g. DNS A vs AAAA for the same host, or two HTTP checks on the same URL with
-// different keywords), which would let one starve the other. Keying on the full
-// marshaled params guarantees any distinguishing field yields a distinct key.
+// schedKey uniquely identifies a probe within a collector. The monitor id leads:
+// two user-created monitors may share the same kind, target AND params, and each
+// must keep its own due-time slot so both run every interval. The kind/target/
+// params tail keeps distinct probes apart when ids are absent (older fixtures).
 func schedKey(t pcfg.ProbeTarget) string {
 	b, _ := json.Marshal(t.Params)
-	return t.Kind + "|" + t.Target + "|" + string(b)
+	return t.MonitorID + "|" + t.Kind + "|" + t.Target + "|" + string(b)
 }
 
 // set replaces the target list (from a DesiredState push) and prunes due-times

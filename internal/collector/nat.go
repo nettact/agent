@@ -133,7 +133,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	if transport != "udp" {
 		// tcp/tls/dtls: binding test only.
 		reflexive, rtt, err := streamBinding(rctx, transport, server, t.Params.IgnoreTLS, perReq)
-		c.emitBinding(now, t.Target, res, base, reflexive, rtt, err)
+		c.emitBinding(now, t, res, base, reflexive, rtt, err)
 		return
 	}
 
@@ -141,7 +141,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// leaves from the same local port (required for mapping/filtering).
 	rt, err := newUDPRoundTripper()
 	if err != nil {
-		c.emitBinding(now, t.Target, res, base, "", 0, err)
+		c.emitBinding(now, t, res, base, "", 0, err)
 		return
 	}
 	defer rt.close()
@@ -150,18 +150,18 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	t0 := time.Now()
 	resp, _, err := rt.do(rctx, server, perReq, 0)
 	if err != nil {
-		c.emitBinding(now, t.Target, res, base, "", 0, err)
+		c.emitBinding(now, t, res, base, "", 0, err)
 		return
 	}
 	rtt := float64(time.Since(t0).Microseconds()) / 1000.0
 
 	var xor stun.XORMappedAddress
 	if xor.GetFrom(resp) != nil {
-		c.emitBinding(now, t.Target, res, base, "", rtt, errors.New("no XOR-MAPPED-ADDRESS in response"))
+		c.emitBinding(now, t, res, base, "", rtt, errors.New("no XOR-MAPPED-ADDRESS in response"))
 		return
 	}
 	reflexive := net.JoinHostPort(xor.IP.String(), strconv.Itoa(xor.Port))
-	c.emitBinding(now, t.Target, res, base, reflexive, rtt, nil)
+	c.emitBinding(now, t, res, base, reflexive, rtt, nil)
 
 	var other stun.OtherAddress
 	hasOther := other.GetFrom(resp) == nil
@@ -172,7 +172,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// them and report unknown rather than misleading data.
 	if !hasOther {
 		mapping := mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
-		res.Metrics = append(res.Metrics, natMetric(now, t.Target, telemetry.NATMapping, mapping,
+		res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 			map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerWAN,
@@ -180,7 +180,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 			Message:  "NAT discovery inconclusive: STUN server " + server + " lacks OTHER-ADDRESS (RFC 5780)",
 			Attrs:    base,
 		})
-		res.Metrics = append(res.Metrics, natMetric(now, t.Target, telemetry.NATType, natTypeUnknown,
+		res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATType, natTypeUnknown,
 			map[string]string{"transport": transport, "type": natTypeLabel(natTypeUnknown)}))
 		return
 	}
@@ -206,14 +206,14 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		}
 		mapping = mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
 	}
-	res.Metrics = append(res.Metrics, natMetric(now, t.Target, telemetry.NATMapping, mapping,
+	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 		map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 
-	res.Metrics = append(res.Metrics, natMetric(now, t.Target, telemetry.NATFiltering, filtering,
+	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATFiltering, filtering,
 		map[string]string{"transport": transport, "behavior": mappingLabel(filtering)}))
 
 	natType := classify(reflexive, mapping, filtering)
-	res.Metrics = append(res.Metrics, natMetric(now, t.Target, telemetry.NATType, natType,
+	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATType, natType,
 		map[string]string{"transport": transport, "type": natTypeLabel(natType)}))
 }
 
@@ -222,11 +222,11 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 // address differs from the last one seen for this target — the metrics store does
 // not persist sample labels, so this event is how the mapped address surfaces, and
 // gating on change keeps it from spamming the timeline every run.
-func (c *NATCollector) emitBinding(now time.Time, target string, res *Result, base map[string]string, reflexive string, rtt float64, err error) {
+func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Result, base map[string]string, reflexive string, rtt float64, err error) {
 	if err != nil {
 		res.Metrics = append(res.Metrics, telemetry.Metric{
-			TS: now, Kind: telemetry.NATOK, Target: target, Layer: telemetry.LayerWAN,
-			Value: 0, Unit: telemetry.UnitBool, Labels: base,
+			TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,
+			Value: 0, Unit: telemetry.UnitBool, Labels: base, MonitorID: t.MonitorID,
 		})
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerWAN,
@@ -238,15 +238,17 @@ func (c *NATCollector) emitBinding(now time.Time, target string, res *Result, ba
 	}
 	okLabels := map[string]string{"transport": base["transport"], "server": base["server"], "mapped_addr": reflexive}
 	res.Metrics = append(res.Metrics,
-		telemetry.Metric{TS: now, Kind: telemetry.NATOK, Target: target, Layer: telemetry.LayerWAN,
-			Value: 1, Unit: telemetry.UnitBool, Labels: okLabels})
+		telemetry.Metric{TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,
+			Value: 1, Unit: telemetry.UnitBool, Labels: okLabels, MonitorID: t.MonitorID})
 	if rtt > 0 {
 		res.Metrics = append(res.Metrics,
-			telemetry.Metric{TS: now, Kind: telemetry.NATRTTms, Target: target, Layer: telemetry.LayerWAN,
-				Value: rtt, Unit: telemetry.UnitMs, Labels: base})
+			telemetry.Metric{TS: now, Kind: telemetry.NATRTTms, Target: t.Target, Layer: telemetry.LayerWAN,
+				Value: rtt, Unit: telemetry.UnitMs, Labels: base, MonitorID: t.MonitorID})
 	}
 
-	key := base["transport"] + "|" + target
+	// The change-gate is per monitor: two monitors probing the same server must
+	// each track their own last mapped address.
+	key := t.MonitorID + "|" + base["transport"] + "|" + t.Target
 	c.mu.Lock()
 	changed := c.lastMapped[key] != reflexive
 	c.lastMapped[key] = reflexive
@@ -261,10 +263,10 @@ func (c *NATCollector) emitBinding(now time.Time, target string, res *Result, ba
 	}
 }
 
-func natMetric(now time.Time, target string, kind telemetry.MetricKind, code int, labels map[string]string) telemetry.Metric {
+func natMetric(now time.Time, t pcfg.ProbeTarget, kind telemetry.MetricKind, code int, labels map[string]string) telemetry.Metric {
 	return telemetry.Metric{
-		TS: now, Kind: kind, Target: target, Layer: telemetry.LayerWAN,
-		Value: float64(code), Unit: telemetry.UnitCode, Labels: labels,
+		TS: now, Kind: kind, Target: t.Target, Layer: telemetry.LayerWAN,
+		Value: float64(code), Unit: telemetry.UnitCode, Labels: labels, MonitorID: t.MonitorID,
 	}
 }
 
