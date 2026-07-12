@@ -79,9 +79,10 @@ func main() {
 	// Capabilities advertised at enroll reflect only enabled opt-in flags, so the
 	// console can tell which agents will serve host metrics / live snapshots.
 	caps := append([]capability.Capability(nil), p.Supports()...)
-	// The TCP collector is registered unconditionally and is platform-independent
-	// (pure net.Dial), so advertise ProbeTCP so the console can discover it.
-	caps = append(caps, capability.ProbeTCP)
+	// The TCP and NAT collectors are registered unconditionally and are
+	// platform-independent (pure net/STUN), so advertise them so the console can
+	// discover them.
+	caps = append(caps, capability.ProbeTCP, capability.ProbeNAT)
 	if *reportHost {
 		caps = append(caps, capability.HostStatRead)
 	}
@@ -127,8 +128,9 @@ func main() {
 	dns := collector.NewDNSCollector()
 	httpc := collector.NewHTTPCollector()
 	tcpc := collector.NewTCPCollector()
+	natc := collector.NewNATCollector()
 	arp := collector.NewARPCollector(p)
-	configurables := []configurable{publicPing, dns, httpc, tcpc}
+	configurables := []configurable{publicPing, dns, httpc, tcpc, natc}
 
 	sink := func(res collector.Result) {
 		dropped, err := outbox.Append(res.Metrics, res.Events, res.Inventory)
@@ -151,7 +153,7 @@ func main() {
 	}
 	sched := scheduler.New(
 		tiered,
-		[]collector.Collector{publicPing, dns, httpc, tcpc},
+		[]collector.Collector{publicPing, dns, httpc, tcpc, natc},
 		sink,
 	)
 	sched.Run(ctx)
