@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -23,12 +24,16 @@ type winPlatform struct{}
 func newPlatform() Platform { return winPlatform{} }
 
 func (winPlatform) Supports() []capability.Capability {
-	return []capability.Capability{
+	caps := []capability.Capability{
 		capability.NetIfaceRead,
 		capability.NetRouteRead,
 		capability.ProbeICMP,
 		capability.InventoryARP,
 	}
+	if c := wifiCapability(); c != "" {
+		caps = append(caps, c)
+	}
+	return caps
 }
 
 // GetAdaptersAddresses flags / interface type not exported by x/sys.
@@ -37,6 +42,7 @@ const (
 	gaaFlagSkipMulticast   = 0x0004
 	gaaFlagIncludeGateways = 0x0080
 	ifTypeSoftwareLoopback = 24
+	ifTypeIEEE80211        = 71 // IF_TYPE_IEEE80211 (native Wi-Fi)
 )
 
 func (winPlatform) Interfaces() ([]IfaceInfo, error) {
@@ -61,9 +67,11 @@ func (winPlatform) Interfaces() ([]IfaceInfo, error) {
 	var out []IfaceInfo
 	for aa := head; aa != nil; aa = aa.Next {
 		info := IfaceInfo{
+			ID:         strings.ToUpper(windows.BytePtrToString(aa.AdapterName)),
 			Name:       windows.UTF16PtrToString(aa.FriendlyName),
 			Up:         aa.OperStatus == windows.IfOperStatusUp,
 			IsLoopback: aa.IfType == ifTypeSoftwareLoopback,
+			IsWireless: aa.IfType == ifTypeIEEE80211,
 		}
 		for ua := aa.FirstUnicastAddress; ua != nil; ua = ua.Next {
 			if ip := ua.Address.IP(); ip != nil {

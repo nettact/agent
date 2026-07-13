@@ -29,6 +29,10 @@ type Result struct {
 	Metrics   []telemetry.Metric
 	Events    []telemetry.Event
 	Inventory []telemetry.InventoryItem
+	// InterfaceSnapshot is the authoritative full interface set for this round
+	// (interface collector only; nil for other collectors). It replaces the old
+	// per-interface inventory delta.
+	InterfaceSnapshot *telemetry.InterfaceSnapshot
 }
 
 // Collector is a single monitoring probe.

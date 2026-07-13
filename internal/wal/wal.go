@@ -22,6 +22,7 @@ const (
 	kindMetric    = "m"
 	kindEvent     = "e"
 	kindInventory = "i"
+	kindSnapshot  = "n" // telemetry.InterfaceSnapshot (authoritative interface set)
 )
 
 // Store is the SQLite-backed outbox.
@@ -50,6 +51,7 @@ func Open(path string) (*Store, error) {
 			created_at TIMESTAMP NOT NULL,
 			kind TEXT NOT NULL,
 			data TEXT NOT NULL,
+			grp INTEGER NOT NULL,
 			packet_seq INTEGER
 		);
 		CREATE INDEX IF NOT EXISTS idx_sample_seq ON sample(packet_seq, id);
@@ -65,7 +67,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // Append durably stores one collect result's items and enforces caps. It
 // returns the number of untagged samples dropped for over-capacity (>0 means a
 // data gap the caller should surface).
-func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv []telemetry.InventoryItem) (dropped int, err error) {
+func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv []telemetry.InventoryItem, snaps []telemetry.InterfaceSnapshot) (dropped int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -80,16 +82,24 @@ func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv
 		}
 	}()
 
+	// Every row of this Append shares one group id, so NextBatch can claim the
+	// whole collector Result as an indivisible unit — its metrics/events/
+	// inventory/snapshot never split across packet sequences (WIFI-001).
+	grp, err := nextGrpTx(tx)
+	if err != nil {
+		return 0, err
+	}
+
 	// One prepared statement reused for every row in the batch — at 1s probe
 	// intervals a batch carries dozens of rows and per-row re-parsing adds up.
-	stmt, err := tx.Prepare(`INSERT INTO sample(created_at, kind, data, packet_seq) VALUES(?,?,?,NULL)`)
+	stmt, err := tx.Prepare(`INSERT INTO sample(created_at, kind, data, grp, packet_seq) VALUES(?,?,?,?,NULL)`)
 	if err != nil {
 		return 0, err
 	}
 	defer stmt.Close()
 	ins := func(kind string, v any) error {
 		b, _ := json.Marshal(v)
-		_, e := stmt.Exec(now, kind, string(b))
+		_, e := stmt.Exec(now, kind, string(b), grp)
 		return e
 	}
 	for i := range metrics {
@@ -107,27 +117,48 @@ func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv
 			return 0, err
 		}
 	}
+	for i := range snaps {
+		if err = ins(kindSnapshot, snaps[i]); err != nil {
+			return 0, err
+		}
+	}
 
-	// Time-based eviction of stale un-acked samples.
+	// Time-based eviction of stale un-acked samples. All rows of one Append share
+	// the same created_at (computed once above), so this removes whole groups —
+	// never a partial Result.
 	if _, err = tx.Exec(`DELETE FROM sample WHERE created_at < ?`, now.Add(-s.retention)); err != nil {
 		return 0, err
 	}
 
-	// Count-based cap: drop oldest UNTAGGED samples beyond maxRows.
+	// Count-based cap: drop the oldest UNTAGGED groups (whole Appends) until the
+	// store is at or below maxRows, or no untagged group remains. Whole-group
+	// deletion preserves the indivisible-Result invariant — a row-level delete of
+	// just the exact overflow could strip one metric from an old group while
+	// leaving its remaining metrics/snapshot. This may drop slightly more rows
+	// than the exact overflow; the actual count is returned/logged.
 	var total int
 	if err = tx.QueryRow(`SELECT COUNT(*) FROM sample`).Scan(&total); err != nil {
 		return 0, err
 	}
-	if total > s.maxRows {
-		over := total - s.maxRows
-		res, e := tx.Exec(`DELETE FROM sample WHERE packet_seq IS NULL AND id IN
-			(SELECT id FROM sample WHERE packet_seq IS NULL ORDER BY id LIMIT ?)`, over)
+	for total > s.maxRows {
+		var g sql.NullInt64
+		if err = tx.QueryRow(`SELECT MIN(grp) FROM sample WHERE packet_seq IS NULL`).Scan(&g); err != nil {
+			return 0, err
+		}
+		if !g.Valid {
+			break // nothing untagged left to evict (the backlog is all in-flight)
+		}
+		res, e := tx.Exec(`DELETE FROM sample WHERE packet_seq IS NULL AND grp=?`, g.Int64)
 		if e != nil {
 			err = e
 			return 0, err
 		}
 		n, _ := res.RowsAffected()
-		dropped = int(n)
+		if n == 0 {
+			break // defensive: no progress possible
+		}
+		dropped += int(n)
+		total -= int(n)
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -142,6 +173,7 @@ type Batch struct {
 	Metrics   []telemetry.Metric
 	Events    []telemetry.Event
 	Inventory []telemetry.InventoryItem
+	Snapshots []telemetry.InterfaceSnapshot
 }
 
 // NextBatch returns the next packet to send. A pending (previously-tagged)
@@ -172,23 +204,46 @@ func (s *Store) NextBatch(maxItems int) (Batch, bool, error) {
 		}
 	}()
 
-	rows, err := tx.Query(`SELECT id FROM sample WHERE packet_seq IS NULL ORDER BY id LIMIT ?`, maxItems)
+	// Claim whole result-groups. Take up to maxItems rows in id order, then
+	// extend to the end of the group the window cut through, so one Append (one
+	// collector Result) is never split across sequences — its metrics, events,
+	// inventory and interface snapshot always ride the same packet even when the
+	// backlog exceeds maxItems. A single group larger than maxItems is sent whole
+	// (progress is always made). Groups are contiguous in id order (one Append =
+	// consecutive ids + one grp), so only the last group in the window can be
+	// partial, and the tail query completes exactly that one.
+	rows, err := tx.Query(`SELECT id, grp FROM sample WHERE packet_seq IS NULL ORDER BY id LIMIT ?`, maxItems)
 	if err != nil {
 		return Batch{}, false, err
 	}
 	var ids []int64
+	var lastGrp, lastID int64
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var id, grp int64
+		if err := rows.Scan(&id, &grp); err != nil {
 			rows.Close()
 			return Batch{}, false, err
 		}
 		ids = append(ids, id)
+		lastGrp, lastID = grp, id
 	}
 	rows.Close()
 	if len(ids) == 0 {
 		return Batch{}, false, nil
 	}
+	tail, err := tx.Query(`SELECT id FROM sample WHERE packet_seq IS NULL AND grp=? AND id>? ORDER BY id`, lastGrp, lastID)
+	if err != nil {
+		return Batch{}, false, err
+	}
+	for tail.Next() {
+		var id int64
+		if err := tail.Scan(&id); err != nil {
+			tail.Close()
+			return Batch{}, false, err
+		}
+		ids = append(ids, id)
+	}
+	tail.Close()
 
 	seq, err := nextSeqTx(tx)
 	if err != nil {
@@ -255,6 +310,11 @@ func (s *Store) loadBatch(seq uint64) (Batch, bool, error) {
 			if json.Unmarshal([]byte(data), &it) == nil {
 				b.Inventory = append(b.Inventory, it)
 			}
+		case kindSnapshot:
+			var s telemetry.InterfaceSnapshot
+			if json.Unmarshal([]byte(data), &s) == nil {
+				b.Snapshots = append(b.Snapshots, s)
+			}
 		}
 	}
 	return b, true, rows.Err()
@@ -278,4 +338,26 @@ func nextSeqTx(tx *sql.Tx) (uint64, error) {
 		return 0, err
 	}
 	return seq, nil
+}
+
+// nextGrpTx allocates the next monotonic group id (persisted in meta so ids stay
+// unique across restarts, keeping any leftover un-acked rows correctly grouped).
+func nextGrpTx(tx *sql.Tx) (int64, error) {
+	var v string
+	err := tx.QueryRow(`SELECT v FROM meta WHERE k='next_grp'`).Scan(&v)
+	grp := int64(1)
+	if err == nil {
+		n, e := strconv.ParseInt(v, 10, 64)
+		if e != nil {
+			return 0, fmt.Errorf("corrupt next_grp: %w", e)
+		}
+		grp = n
+	} else if err != sql.ErrNoRows {
+		return 0, err
+	}
+	if _, err := tx.Exec(`INSERT INTO meta(k,v) VALUES('next_grp',?)
+		ON CONFLICT(k) DO UPDATE SET v=excluded.v`, strconv.FormatInt(grp+1, 10)); err != nil {
+		return 0, err
+	}
+	return grp, nil
 }

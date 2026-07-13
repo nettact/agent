@@ -14,12 +14,47 @@ import (
 
 // IfaceInfo is a normalized view of one network interface.
 type IfaceInfo struct {
+	// ID is a stable per-OS adapter key used to join Wi-Fi status onto the right
+	// interface row: on Windows the adapter GUID (IpAdapterAddresses.AdapterName),
+	// elsewhere the interface name. Never empty.
+	ID         string
 	Name       string
 	Addrs      []string // unicast IP addresses
 	Gateways   []string // default gateway IPs on this interface
 	DNS        []string // DNS server IPs configured on this interface
 	Up         bool
 	IsLoopback bool
+	// IsWireless marks known Wi-Fi hardware (Windows IfType==71, Linux
+	// /sys/class/net/<name>/wireless, macOS a CoreWLAN-listed name matched during
+	// snapshot assembly). True even when the adapter's Wi-Fi status is unreadable,
+	// so wireless hardware never masquerades as a wired interface.
+	IsWireless bool
+}
+
+// WiFiResult is the collection-level outcome of one WiFi() call: the Wi-Fi
+// subsystem verdict plus every adapter's current status. There is no error
+// return — the classification IS the result (architecture §4 wireless layer).
+type WiFiResult struct {
+	State    string // "ok" | "unreadable" (collection level)
+	Reason   string // "permission" | "driver" when State=="unreadable"
+	Adapters []WiFiStatus
+}
+
+// WiFiStatus is one wireless adapter's current status as read from the OS. State
+// and Reason mirror the telemetry enums (open strings). Nil numeric pointers mean
+// "unknown / not reported" — never a synthetic zero.
+type WiFiStatus struct {
+	ID        string // joins IfaceInfo.ID (GUID on Windows, name elsewhere)
+	Name      string
+	State     string // "connected" | "disconnected" | "unreadable"
+	Reason    string // "permission" | "driver" when relevant
+	SSID      string
+	Band      string // "2.4" | "5" | "6" | ""
+	Channel   int    // 0 unknown
+	SignalDBm *int
+	Quality   *int // 0-100 percent
+	RxMbps    *float64
+	TxMbps    *float64
 }
 
 // PingResult is the outcome of a single ICMP echo.
@@ -50,6 +85,10 @@ type Platform interface {
 	Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error)
 	// Neighbors reads the ARP/neighbor table (passive LAN device discovery).
 	Neighbors() ([]Neighbor, error)
+	// WiFi reports the current Wi-Fi status of every wireless adapter plus a
+	// collection-level verdict (no adapter vs unreadable). Wired-only or
+	// unsupported hosts return WiFiResult{State:"ok"} with no adapters.
+	WiFi() WiFiResult
 	// Supports reports the capabilities this host actually implements.
 	Supports() []capability.Capability
 }

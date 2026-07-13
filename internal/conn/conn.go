@@ -421,6 +421,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c *websocket.Conn, ackCh
 			Metrics:               batch.Metrics,
 			Events:                batch.Events,
 			InventoryDelta:        batch.Inventory,
+			InterfaceSnapshots:    batch.Snapshots,
 			ReportedConfigVersion: r.appliedConfigVersion,
 		}
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {

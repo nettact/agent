@@ -21,6 +21,7 @@ func (f fakePlatform) Ping(context.Context, string, platform.PingOptions) (platf
 	return platform.PingResult{}, nil
 }
 func (f fakePlatform) Neighbors() ([]platform.Neighbor, error) { return f.neighbors, f.err }
+func (f fakePlatform) WiFi() platform.WiFiResult               { return platform.WiFiResult{State: "ok"} }
 func (f fakePlatform) Supports() []capability.Capability       { return nil }
 
 func TestARPCollectorResolvesHostnames(t *testing.T) {

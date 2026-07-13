@@ -126,7 +126,11 @@ func main() {
 	configurables := []conn.Configurable{publicPing, dns, httpc, tcpc, natc}
 
 	sink := func(res collector.Result) {
-		dropped, err := outbox.Append(res.Metrics, res.Events, res.Inventory)
+		var snaps []telemetry.InterfaceSnapshot
+		if res.InterfaceSnapshot != nil {
+			snaps = []telemetry.InterfaceSnapshot{*res.InterfaceSnapshot}
+		}
+		dropped, err := outbox.Append(res.Metrics, res.Events, res.Inventory, snaps)
 		if err != nil {
 			log.Printf("wal append: %v", err)
 			return
@@ -163,7 +167,7 @@ func main() {
 			_, _ = outbox.Append([]telemetry.Metric{
 				{TS: now, Kind: telemetry.AgentUptime, Target: "agent", Layer: telemetry.LayerLocal, Value: time.Since(start).Seconds(), Unit: telemetry.UnitSec},
 				{TS: now, Kind: telemetry.AgentWALPending, Target: "agent", Layer: telemetry.LayerLocal, Value: float64(outbox.Pending()), Unit: telemetry.UnitCount},
-			}, nil, nil)
+			}, nil, nil, nil)
 		}
 		emit()
 		for {

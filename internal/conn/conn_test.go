@@ -226,7 +226,7 @@ func TestHelloThenDrainAck(t *testing.T) {
 			deps, outbox, _, _ := newTestDeps(t)
 			if _, err := outbox.Append([]telemetry.Metric{
 				{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 1, Unit: telemetry.UnitSec},
-			}, nil, nil); err != nil {
+			}, nil, nil, nil); err != nil {
 				t.Fatalf("wal append: %v", err)
 			}
 
@@ -326,7 +326,7 @@ func TestDesiredStateApplied(t *testing.T) {
 	// A packet sent after the push must carry the applied version.
 	if _, err := outbox.Append([]telemetry.Metric{
 		{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2, Unit: telemetry.UnitSec},
-	}, nil, nil); err != nil {
+	}, nil, nil, nil); err != nil {
 		t.Fatalf("wal append: %v", err)
 	}
 	select {

@@ -18,7 +18,11 @@ type genericPlatform struct{}
 func newPlatform() Platform { return genericPlatform{} }
 
 func (genericPlatform) Supports() []capability.Capability {
-	return []capability.Capability{capability.NetIfaceRead}
+	caps := []capability.Capability{capability.NetIfaceRead}
+	if c := wifiCapability(); c != "" {
+		caps = append(caps, c)
+	}
+	return caps
 }
 
 func (genericPlatform) Interfaces() ([]IfaceInfo, error) {
@@ -29,9 +33,11 @@ func (genericPlatform) Interfaces() ([]IfaceInfo, error) {
 	var out []IfaceInfo
 	for _, ifc := range ifaces {
 		info := IfaceInfo{
+			ID:         ifc.Name, // name is the stable adapter key off Windows
 			Name:       ifc.Name,
 			Up:         ifc.Flags&net.FlagUp != 0,
 			IsLoopback: ifc.Flags&net.FlagLoopback != 0,
+			IsWireless: ifaceIsWireless(ifc.Name),
 		}
 		addrs, _ := ifc.Addrs()
 		for _, a := range addrs {
