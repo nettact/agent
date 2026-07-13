@@ -13,6 +13,7 @@ package conn
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -43,6 +44,23 @@ const (
 	// statusRevoked: the agent was deleted server-side; the credential is dead
 	// and the process must re-enroll to come back.
 	statusRevoked websocket.StatusCode = 4004
+)
+
+// Terminal session sentinels. Run returns one of these (wrapped) when the server
+// closes with an application code that makes reconnecting pointless or harmful,
+// so a supervisor (agentrt) can classify the outcome without re-parsing close
+// codes. They live here — not in agentrt — because agentrt imports conn, and the
+// reverse would be an import cycle.
+var (
+	// ErrSuperseded: another process connected with this credential and the
+	// server kicked us; redialing would kick that one back in a loop.
+	ErrSuperseded = errors.New("agent instance superseded")
+	// ErrUnsupportedSchema: the server rejected our schema version; nothing
+	// changes until one side is upgraded.
+	ErrUnsupportedSchema = errors.New("server rejected schema version")
+	// ErrRevoked: the agent row was deleted server-side; the credential is dead
+	// and the process must re-enroll to come back.
+	ErrRevoked = errors.New("agent revoked on server")
 )
 
 const (
@@ -89,6 +107,13 @@ type Options struct {
 	// (re)connect. ReportedConfigVersion is overwritten per connect with the
 	// version applied in this process — the caller's value is ignored.
 	Hello wire.Hello
+
+	// OnSession, if non-nil, is called with up=true right after the Hello frame
+	// is written (the session is live) and up=false when that session ends. It
+	// lets a supervisor surface connected/disconnected without treating a
+	// transient reconnect as an error. Must be fast and non-blocking: it runs on
+	// the session goroutine.
+	OnSession func(up bool)
 
 	// Test knobs. Zero values select the production defaults above; only tests
 	// (same package) can set them, so the production surface stays minimal.
@@ -184,11 +209,11 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// an endless loop). CloseStatus sees through the %w wrapping.
 		switch websocket.CloseStatus(err) {
 		case statusSuperseded:
-			return fmt.Errorf("superseded: another agent instance connected with this credential")
+			return fmt.Errorf("another agent instance connected with this credential: %w", ErrSuperseded)
 		case statusUnsupportedSchema:
-			return fmt.Errorf("server rejected schema version %d; upgrade the agent or server", protocol.SchemaVersion)
+			return fmt.Errorf("server rejected schema version %d; upgrade the agent or server: %w", protocol.SchemaVersion, ErrUnsupportedSchema)
 		case statusRevoked:
-			return fmt.Errorf("agent was deleted on the server; re-enroll to continue")
+			return fmt.Errorf("agent was deleted on the server; re-enroll to continue: %w", ErrRevoked)
 		}
 		if time.Since(start) > stableSession {
 			bo.reset()
@@ -291,6 +316,13 @@ func (r *runner) session(ctx context.Context) error {
 	hello.ReportedConfigVersion = r.appliedConfigVersion
 	if err := r.writeFrame(sessionCtx, c, wire.Frame{Hello: &hello}); err != nil {
 		return fmt.Errorf("send hello: %w", err)
+	}
+	// The session is live once Hello is on the wire. Fire OnSession(true) here and
+	// pair it with a deferred (false) — placed after the write so the false only
+	// fires when the true did (a dial/Hello failure reports no session at all).
+	if r.opts.OnSession != nil {
+		r.opts.OnSession(true)
+		defer r.opts.OnSession(false)
 	}
 
 	// One reader goroutine feeds these; the session goroutine is the ONLY

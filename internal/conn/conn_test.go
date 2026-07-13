@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -114,11 +115,35 @@ func (f *fakeScheduler) intervals() (base, regular time.Duration) {
 // stub snapshot collector (the real one burns a ~300ms CPU sample window).
 func newTestDeps(t *testing.T) (Deps, *wal.Store, *fakeConfigurable, *fakeScheduler) {
 	t.Helper()
-	outbox, err := wal.Open(filepath.Join(t.TempDir(), "wal.db"))
+	dataDir, err := os.MkdirTemp("", "nettact-conn-test-")
 	if err != nil {
+		t.Fatalf("make temp dir: %v", err)
+	}
+	outbox, err := wal.Open(filepath.Join(dataDir, "wal.db"))
+	if err != nil {
+		_ = os.RemoveAll(dataDir)
 		t.Fatalf("open wal: %v", err)
 	}
-	t.Cleanup(func() { outbox.Close() })
+	t.Cleanup(func() {
+		_ = outbox.Close()
+		// modernc SQLite can release/delete its Windows WAL sidecars a fraction
+		// after Close returns. Retry the test-only directory cleanup so a transient
+		// ERROR_DIR_NOT_EMPTY does not turn a passing protocol test flaky.
+		deadline := time.Now().Add(time.Second)
+		for {
+			err := os.RemoveAll(dataDir)
+			if err == nil {
+				if _, statErr := os.Stat(dataDir); os.IsNotExist(statErr) {
+					return
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("remove temp dir %s: %v", dataDir, err)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 	fc := &fakeConfigurable{}
 	fs := &fakeScheduler{}
 	deps := Deps{

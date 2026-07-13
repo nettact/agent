@@ -26,6 +26,8 @@ type Scheduler struct {
 	selfSched []collector.Collector
 	sink      Sink
 
+	wg sync.WaitGroup
+
 	mu              sync.Mutex
 	baseInterval    time.Duration
 	regularInterval time.Duration
@@ -69,12 +71,18 @@ func (s *Scheduler) SetIntervals(base, regular time.Duration) {
 }
 
 // Run starts the tier loops and the self-scheduled poll loop until ctx is
-// cancelled.
+// cancelled. The loops are tracked so the caller can Wait for them to exit
+// before tearing down shared state (e.g. closing the WAL the sink writes to).
 func (s *Scheduler) Run(ctx context.Context) {
-	go s.tierLoop(ctx, s.base, true)
-	go s.tierLoop(ctx, s.regular, false)
-	go s.selfLoop(ctx)
+	s.wg.Add(3)
+	go func() { defer s.wg.Done(); s.tierLoop(ctx, s.base, true) }()
+	go func() { defer s.wg.Done(); s.tierLoop(ctx, s.regular, false) }()
+	go func() { defer s.wg.Done(); s.selfLoop(ctx) }()
 }
+
+// Wait blocks until every loop started by Run has returned. It only returns once
+// the Run ctx is cancelled and all in-flight collects/sinks have drained.
+func (s *Scheduler) Wait() { s.wg.Wait() }
 
 // selfLoop polls self-scheduling collectors on a fine tick; each returns only
 // the targets due by their own interval (empty Result otherwise).

@@ -64,3 +64,16 @@ func SaveCredential(dataDir string, c Credential) error {
 	b, _ := json.MarshalIndent(c, "", "  ")
 	return os.WriteFile(filepath.Join(dataDir, "agent.json"), b, 0o600)
 }
+
+// DeleteCredential removes the persisted credential so the next run re-enrolls.
+// Used when the server revokes the agent (WS close 4004): the bearer token is
+// dead, and keeping agent.json would loop a redial into the same rejection. The
+// ed25519 key (agent.key) is intentionally kept so re-enrollment reuses the same
+// identity. Missing file is not an error.
+func DeleteCredential(dataDir string) error {
+	err := os.Remove(filepath.Join(dataDir, "agent.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
