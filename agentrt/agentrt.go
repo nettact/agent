@@ -217,7 +217,7 @@ func Run(ctx context.Context, cfg Config) error {
 	httpc := collector.NewHTTPCollector()
 	tcpc := collector.NewTCPCollector()
 	natc := collector.NewNATCollector()
-	configurables := []conn.Configurable{publicPing, dns, httpc, tcpc, natc}
+	configurables := []conn.Configurable{gateway, publicPing, dns, httpc, tcpc, natc}
 
 	sink := func(res collector.Result) {
 		var snaps []telemetry.InterfaceSnapshot
@@ -235,14 +235,14 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	arp := collector.NewARPCollector(p)
-	tiered := []collector.Collector{gateway, iface, arp}
+	tiered := []collector.Collector{iface, arp}
 	if cfg.ReportHost {
 		tiered = append(tiered, collector.NewHostMetricsCollector())
 		log.Print("host metrics reporting enabled")
 	}
 	sched := scheduler.New(
 		tiered,
-		[]collector.Collector{publicPing, dns, httpc, tcpc, natc},
+		[]collector.Collector{gateway, publicPing, dns, httpc, tcpc, natc},
 		sink,
 	)
 

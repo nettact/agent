@@ -1,7 +1,10 @@
 // Package scheduler runs collectors at three frequency tiers (architecture
-// §3.2): base (fast — gateway/public ping), regular (slower — DNS/HTTP/ARP/
-// interface), and a burst mode that temporarily speeds up the base tier when a
-// fault is detected, to capture more evidence during an incident.
+// §3.2): base (fast — interface/ARP snapshots), regular (slower), and a burst
+// mode that temporarily speeds up the base tier when a fault is detected, to
+// capture more evidence during an incident. Target-driven probes (gateway /
+// public ping / DNS / HTTP / TCP / NAT) are self-scheduled instead: polled on a
+// fine tick, each gates its own targets by their per-target interval, and their
+// 100% loss still arms burst mode via selfLoop.
 package scheduler
 
 import (
