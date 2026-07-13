@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -271,6 +272,50 @@ func (s *Store) Ack(seq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM sample WHERE packet_seq=?`, int64(seq))
+	return err
+}
+
+// FastForward durably raises the next-sequence allocator to at least
+// watermark+1 so the WAL stops re-emitting sequences the server has already
+// consumed. It exists to recover the one case where the local allocator falls
+// behind the server: the WAL db was recreated/reset (next_seq back near 1)
+// while the agent kept its enrollment and the server still retains far higher
+// packet sequences. Without this, every fresh batch reuses an already-stored
+// (agent_id, sequence) and the server silently dedups it — telemetry is
+// suppressed for as long as the counter takes to climb past the watermark.
+//
+// The allocator is never lowered: a normal ack whose watermark equals the
+// just-sent sequence leaves next_seq untouched (target <= current), so ordinary
+// operation is unchanged and no in-flight sequence is renumbered. Overflow is
+// explicit — a watermark at the uint64 max has no representable successor, so it
+// errors rather than wrapping next_seq back to zero.
+func (s *Store) FastForward(watermark uint64) error {
+	if watermark == math.MaxUint64 {
+		return fmt.Errorf("wal: watermark %d at uint64 max; no successor sequence", watermark)
+	}
+	target := watermark + 1
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var v string
+	err := s.db.QueryRow(`SELECT v FROM meta WHERE k='next_seq'`).Scan(&v)
+	cur := uint64(1)
+	switch {
+	case err == nil:
+		n, e := strconv.ParseUint(v, 10, 64)
+		if e != nil {
+			return fmt.Errorf("corrupt next_seq: %w", e)
+		}
+		cur = n
+	case err != sql.ErrNoRows:
+		return err
+	}
+	if target <= cur {
+		return nil // allocator already at/above the watermark; never lower it
+	}
+	_, err = s.db.Exec(`INSERT INTO meta(k,v) VALUES('next_seq',?)
+		ON CONFLICT(k) DO UPDATE SET v=excluded.v`, strconv.FormatUint(target, 10))
 	return err
 }
 

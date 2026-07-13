@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -44,5 +45,63 @@ func TestNextBatchKeepsCollectorResultWhole(t *testing.T) {
 	}
 	if _, ok, err := s.NextBatch(1); err != nil || ok {
 		t.Fatalf("after Ack: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestFastForwardPreservesInflightAndAdvancesNewBatches(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "wal.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	metric := func(v float64) []telemetry.Metric {
+		return []telemetry.Metric{{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: v}}
+	}
+
+	if _, err := s.Append(metric(1), nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	first, ok, err := s.NextBatch(10)
+	if err != nil || !ok || first.Sequence != 1 {
+		t.Fatalf("first batch=%+v ok=%v err=%v", first, ok, err)
+	}
+	if err := s.FastForward(33711); err != nil {
+		t.Fatalf("FastForward: %v", err)
+	}
+	// Fast-forwarding only changes the allocator. The already-tagged batch must
+	// remain sequence 1 until it is acknowledged.
+	retry, ok, err := s.NextBatch(10)
+	if err != nil || !ok || retry.Sequence != first.Sequence {
+		t.Fatalf("in-flight batch renumbered: first=%d retry=%d ok=%v err=%v", first.Sequence, retry.Sequence, ok, err)
+	}
+	if err := s.Ack(first.Sequence); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Append(metric(2), nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	advanced, ok, err := s.NextBatch(10)
+	if err != nil || !ok || advanced.Sequence != 33712 {
+		t.Fatalf("advanced batch=%+v ok=%v err=%v", advanced, ok, err)
+	}
+	if err := s.Ack(advanced.Sequence); err != nil {
+		t.Fatal(err)
+	}
+
+	// A lower watermark is a no-op; the allocator continues monotonically.
+	if err := s.FastForward(50); err != nil {
+		t.Fatalf("lower FastForward: %v", err)
+	}
+	if _, err := s.Append(metric(3), nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := s.NextBatch(10)
+	if err != nil || !ok || next.Sequence != 33713 {
+		t.Fatalf("next batch=%+v ok=%v err=%v", next, ok, err)
+	}
+
+	if err := s.FastForward(math.MaxUint64); err == nil {
+		t.Fatal("FastForward(MaxUint64) succeeded; want explicit overflow error")
 	}
 }

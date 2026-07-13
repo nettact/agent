@@ -433,6 +433,20 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c *websocket.Conn, ackCh
 			// sequence by the next session, so nothing is lost or double-counted.
 			return err
 		}
+		// Reconcile the local sequence allocator to the server's watermark BEFORE
+		// deleting the acked batch. If this WAL's next_seq was reset below the
+		// server's retained watermark (e.g. the WAL db was recreated while the
+		// agent kept its enrollment), every fresh batch would otherwise reuse an
+		// already-stored (agent_id, sequence) and be silently deduped, suppressing
+		// all telemetry until the counter climbed back past the watermark.
+		// FastForward raises next_seq to HighestSequence+1 (never lowering it), so
+		// the next claimed batch lands above the watermark and is accepted. On
+		// persistence failure we do NOT delete the batch and yield the drain: the
+		// same sequence is retried on the next tick, not in a tight loop.
+		if err := r.deps.Outbox.FastForward(ack.HighestSequence); err != nil {
+			log.Printf("wal fast-forward to watermark=%d: %v", ack.HighestSequence, err)
+			return nil
+		}
 		if err := r.deps.Outbox.Ack(batch.Sequence); err != nil {
 			log.Printf("wal ack seq=%d: %v", batch.Sequence, err)
 		}

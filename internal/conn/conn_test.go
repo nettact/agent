@@ -282,6 +282,78 @@ func TestHelloThenDrainAck(t *testing.T) {
 	}
 }
 
+// TestDrainFastForwardsResetWAL reproduces WIFI-010 end to end: the local WAL
+// starts at sequence 1 while the server ACK reports a much higher retained
+// watermark. The in-flight packet remains sequence 1, then the next newly
+// claimed packet must jump directly to watermark+1.
+func TestDrainFastForwardsResetWAL(t *testing.T) {
+	for name, format := range map[string]string{
+		"protobuf": wire.SubprotocolProtobuf,
+		"json":     wire.SubprotocolJSON,
+	} {
+		t.Run(name, func(t *testing.T) {
+			deps, outbox, _, _ := newTestDeps(t)
+			if _, err := outbox.Append([]telemetry.Metric{{
+				TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 1,
+			}}, nil, nil, nil); err != nil {
+				t.Fatalf("append first: %v", err)
+			}
+
+			const watermark uint64 = 33711
+			firstAcked := make(chan struct{})
+			seqs := make(chan [2]uint64, 1)
+			srv := startServer(t, func(ctx context.Context, c *websocket.Conn) {
+				if f, err := srvRead(ctx, c); err != nil || f.Hello == nil {
+					t.Errorf("first frame: %+v err=%v; want Hello", f, err)
+					return
+				}
+				first, err := srvRead(ctx, c)
+				if err != nil || first.Packet == nil {
+					t.Errorf("first packet: %+v err=%v", first, err)
+					return
+				}
+				if err := srvWrite(ctx, c, wire.Frame{Ack: &wire.Ack{HighestSequence: watermark, ServerTime: time.Now().UTC()}}); err != nil {
+					t.Errorf("write high-watermark ack: %v", err)
+					return
+				}
+				close(firstAcked)
+
+				second, err := srvRead(ctx, c)
+				if err != nil || second.Packet == nil {
+					t.Errorf("second packet: %+v err=%v", second, err)
+					return
+				}
+				_ = srvWrite(ctx, c, wire.Frame{Ack: &wire.Ack{HighestSequence: second.Packet.Sequence, ServerTime: time.Now().UTC()}})
+				seqs <- [2]uint64{first.Packet.Sequence, second.Packet.Sequence}
+				_, _ = srvRead(ctx, c)
+			})
+
+			cancel := runAgent(t, testOptions(srv.URL, format), deps)
+			select {
+			case <-firstAcked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("server never acknowledged first packet")
+			}
+			if _, err := outbox.Append([]telemetry.Metric{{
+				TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2,
+			}}, nil, nil, nil); err != nil {
+				t.Fatalf("append second: %v", err)
+			}
+
+			select {
+			case got := <-seqs:
+				if got[0] != 1 || got[1] != watermark+1 {
+					t.Fatalf("packet sequences=%v want [1 %d]", got, watermark+1)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("server never received fast-forwarded packet")
+			}
+			waitFor(t, "WAL cleared after fast-forwarded ack", func() bool { return outbox.Pending() == 0 })
+			cancel()
+		})
+	}
+}
+
 // TestDesiredStateApplied covers the config downlink: a pushed DesiredState
 // reaches every configurable and the scheduler, and the next packet reports
 // the new config version.
