@@ -538,7 +538,8 @@ func TestSupersededStopsReconnecting(t *testing.T) {
 			t.Errorf("first frame: %+v, err %v; want Hello", f, err)
 			return
 		}
-		_ = c.Close(statusSuperseded, "superseded")
+		// 4000 = superseded application close code (wire.CloseSuperseded).
+		_ = c.Close(websocket.StatusCode(wire.CloseSuperseded), "superseded")
 	})
 
 	errCh := make(chan error, 1)

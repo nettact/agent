@@ -30,6 +30,7 @@ import (
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/capability"
+	protoenroll "github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 )
@@ -78,11 +79,21 @@ type Event struct {
 
 // Config drives one Run. Zero values select production defaults where noted.
 type Config struct {
-	ServerURL      string        // e.g. http://127.0.0.1:52344 (required)
+	ServerURL      string        // e.g. http://127.0.0.1:52344; required unless both Dialer and Enroller are set
 	DataDir        string        // holds agent.key, agent.json, wal.db
 	Insecure       bool          // skip TLS verification (LAN self-signed)
 	UploadInterval time.Duration // WAL drain cadence; 0 → 5s
 	WireFormat     string        // "protobuf" (default when empty) or "json"
+
+	// Dialer establishes the server session. Nil selects a WebSocket to ServerURL
+	// (the standalone path). The desktop injects the embedded Lite server's
+	// in-process pipe dialer so telemetry never touches a loopback socket.
+	Dialer wire.Dialer
+
+	// Enroller performs the enrollment exchange for a signed request. Nil selects
+	// the HTTP POST to ServerURL/api/v1/enroll (standalone). The desktop injects a
+	// direct registry call so first-run enrollment needs no HTTP round-trip.
+	Enroller func(ctx context.Context, req protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error)
 
 	// Privacy opt-ins. All default false; the desktop bundled agent leaves them
 	// false (network monitoring only). They are the sole authority for host data
@@ -116,8 +127,10 @@ func (c Config) emit(ev Event) {
 // All goroutines it starts are stopped before it returns, and the WAL is closed,
 // so re-running on the same DataDir is safe.
 func Run(ctx context.Context, cfg Config) error {
-	if cfg.ServerURL == "" {
-		return errors.New("agentrt: ServerURL is required")
+	// ServerURL feeds the default WebSocket dialer and the default HTTP enroller.
+	// When the desktop injects both a Dialer and an Enroller, no URL is needed.
+	if cfg.ServerURL == "" && (cfg.Dialer == nil || cfg.Enroller == nil) {
+		return errors.New("agentrt: ServerURL is required unless both Dialer and Enroller are set")
 	}
 	if cfg.UploadInterval == 0 {
 		cfg.UploadInterval = 5 * time.Second
@@ -162,10 +175,20 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("obtain enrollment token: %v: %w", err, ErrEnroll)
 		}
-		cred, err = enroll.Enroll(ctx, cfg.ServerURL, cfg.Insecure, priv, token, hostname, runtime.GOOS, Version, caps)
+		// Build+sign the request, then run it through the injected Enroller (direct
+		// registry call in desktop) or the default HTTP POST (standalone).
+		req := enroll.BuildRequest(priv, token, hostname, runtime.GOOS, Version, caps)
+		exchange := cfg.Enroller
+		if exchange == nil {
+			exchange = func(ctx context.Context, r protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
+				return enroll.Post(ctx, cfg.ServerURL, cfg.Insecure, r)
+			}
+		}
+		resp, err := exchange(ctx, req)
 		if err != nil {
 			return fmt.Errorf("enroll: %v: %w", err, ErrEnroll)
 		}
+		cred = identity.Credential{AgentID: resp.AgentID, SiteID: resp.SiteID, AgentToken: resp.AgentToken}
 		if err := identity.SaveCredential(cfg.DataDir, cred); err != nil {
 			return fmt.Errorf("save credential: %w", err)
 		}
@@ -277,6 +300,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Token:     cred.AgentToken,
 		Insecure:  cfg.Insecure,
 		Format:    subprotocol,
+		Dialer:    cfg.Dialer,
 		AgentID:   cred.AgentID,
 		SiteID:    cred.SiteID,
 		Hello: wire.Hello{

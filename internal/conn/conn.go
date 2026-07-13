@@ -12,15 +12,10 @@ package conn
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
-	"net/url"
 	"time"
-
-	"github.com/coder/websocket"
 
 	"github.com/nettact/agent/internal/hostsnapshot"
 	"github.com/nettact/agent/internal/wal"
@@ -30,27 +25,13 @@ import (
 	"github.com/nettact/protocol/wire"
 )
 
-// Application close codes mirrored from the server's agentws package. When a
-// session ends with one of these, reconnecting can never help — retrying would
-// either fight another process for the credential or replay the same rejection
-// forever — so Run returns instead of backing off.
-const (
-	// statusSuperseded: another process connected with this agent's credential
-	// and the server kicked us. Redialing would kick that one back, looping.
-	statusSuperseded websocket.StatusCode = 4000
-	// statusUnsupportedSchema: the server rejected our schema version; nothing
-	// changes until one side is upgraded.
-	statusUnsupportedSchema websocket.StatusCode = 4001
-	// statusRevoked: the agent was deleted server-side; the credential is dead
-	// and the process must re-enroll to come back.
-	statusRevoked websocket.StatusCode = 4004
-)
-
 // Terminal session sentinels. Run returns one of these (wrapped) when the server
 // closes with an application code that makes reconnecting pointless or harmful,
 // so a supervisor (agentrt) can classify the outcome without re-parsing close
 // codes. They live here — not in agentrt — because agentrt imports conn, and the
-// reverse would be an import cycle.
+// reverse would be an import cycle. The close codes themselves are wire.Close*
+// (wire.CloseSuperseded/UnsupportedSchema/Revoked), classified via
+// wire.CloseStatus regardless of whether the link is a WebSocket or a pipe.
 var (
 	// ErrSuperseded: another process connected with this credential and the
 	// server kicked us; redialing would kick that one back in a loop.
@@ -64,13 +45,6 @@ var (
 )
 
 const (
-	// wsPath is the server's agent WebSocket endpoint (bearer auth on upgrade).
-	wsPath = "/api/v1/agent/ws"
-
-	// readLimit raises coder/websocket's 32 KiB default: a DesiredState push
-	// for a site with many probe targets easily exceeds that.
-	readLimit = 1 << 20
-
 	writeTimeout = 10 * time.Second
 	pingInterval = 15 * time.Second
 	pingTimeout  = 5 * time.Second
@@ -98,6 +72,12 @@ type Options struct {
 	Token     string // bearer token presented on the upgrade request
 	Insecure  bool   // skip TLS verification (LAN self-signed dev)
 	Format    string // wire.SubprotocolProtobuf or wire.SubprotocolJSON
+
+	// Dialer establishes the session link. Nil selects the default WebSocket
+	// dialer built from ServerURL/Insecure/Format. The desktop injects the
+	// embedded Lite server's in-process pipe dialer here, so no loopback socket
+	// is used and ServerURL/Format are then irrelevant.
+	Dialer wire.Dialer
 
 	// AgentID/SiteID stamp every telemetry packet (from the enrollment credential).
 	AgentID string
@@ -158,9 +138,14 @@ type Deps struct {
 // the life of the agent and returns nil on shutdown; a non-nil error means the
 // configuration is unusable (bad URL) and retrying would never help.
 func Run(ctx context.Context, opts Options, deps Deps) error {
-	wsURL, err := deriveWSURL(opts.ServerURL)
-	if err != nil {
-		return err
+	if opts.Dialer == nil {
+		// Standalone path: build the WebSocket dialer. A bad ServerURL surfaces
+		// here as the "config unusable, retrying won't help" early error.
+		d, err := wsDialer(opts)
+		if err != nil {
+			return err
+		}
+		opts.Dialer = d
 	}
 	if opts.dialTimeout == 0 {
 		opts.dialTimeout = defaultDialTimeout
@@ -178,19 +163,10 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		deps.CollectSnapshot = hostsnapshot.Collect
 	}
 
-	// One HTTP client for every dial; the transport only skips TLS verification
-	// when explicitly opted in for LAN self-signed setups.
-	tr := &http.Transport{}
-	if opts.Insecure {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // opt-in for LAN self-signed
-	}
-
 	r := &runner{
-		opts:        opts,
-		deps:        deps,
-		wsURL:       wsURL,
-		contentType: wire.SubprotocolContentType(opts.Format),
-		httpClient:  &http.Client{Transport: tr},
+		opts:   opts,
+		deps:   deps,
+		dialer: opts.Dialer,
 		// Start behind any real version so the server's unconditional
 		// on-connect DesiredState push is always applied, even after an agent
 		// restart where the server thinks we are current.
@@ -206,13 +182,14 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		}
 		// Application close codes that make reconnecting pointless (or actively
 		// harmful — a superseded session redialing would kick its replacement in
-		// an endless loop). CloseStatus sees through the %w wrapping.
-		switch websocket.CloseStatus(err) {
-		case statusSuperseded:
+		// an endless loop). CloseStatus sees through the %w wrapping and works
+		// for both the WebSocket adapter and the in-memory pipe.
+		switch wire.CloseStatus(err) {
+		case wire.CloseSuperseded:
 			return fmt.Errorf("another agent instance connected with this credential: %w", ErrSuperseded)
-		case statusUnsupportedSchema:
+		case wire.CloseUnsupportedSchema:
 			return fmt.Errorf("server rejected schema version %d; upgrade the agent or server: %w", protocol.SchemaVersion, ErrUnsupportedSchema)
-		case statusRevoked:
+		case wire.CloseRevoked:
 			return fmt.Errorf("agent was deleted on the server; re-enroll to continue: %w", ErrRevoked)
 		}
 		if time.Since(start) > stableSession {
@@ -230,31 +207,12 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 	}
 }
 
-// deriveWSURL maps the --server base URL onto the WebSocket endpoint.
-func deriveWSURL(server string) (string, error) {
-	u, err := url.Parse(server)
-	if err != nil {
-		return "", fmt.Errorf("parse server URL: %w", err)
-	}
-	switch u.Scheme {
-	case "http":
-		u.Scheme = "ws"
-	case "https":
-		u.Scheme = "wss"
-	default:
-		return "", fmt.Errorf("server URL scheme must be http or https, got %q", u.Scheme)
-	}
-	return u.JoinPath(wsPath).String(), nil
-}
-
 // runner holds the state that survives across sessions. appliedConfigVersion
 // is in-memory only and touched exclusively by the session goroutine.
 type runner struct {
-	opts        Options
-	deps        Deps
-	wsURL       string
-	contentType string // canonical codec content-type derived from the subprotocol
-	httpClient  *http.Client
+	opts   Options
+	deps   Deps
+	dialer wire.Dialer
 
 	appliedConfigVersion int
 }
@@ -264,27 +222,23 @@ type runner struct {
 // connection closed.
 func (r *runner) session(ctx context.Context) error {
 	dialCtx, cancel := context.WithTimeout(ctx, r.opts.dialTimeout)
-	c, _, err := websocket.Dial(dialCtx, r.wsURL, &websocket.DialOptions{
-		HTTPHeader:   http.Header{"Authorization": {"Bearer " + r.opts.Token}},
-		Subprotocols: []string{r.opts.Format},
-		HTTPClient:   r.httpClient,
-	})
+	c, err := r.dialer(dialCtx, r.opts.Token)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return err
 	}
-	c.SetReadLimit(readLimit)
 
-	// sessionCtx is deliberately detached from the parent ctx: coder/websocket
-	// tears the whole connection down (no close frame) when a Read/Write
+	// sessionCtx is deliberately detached from the parent ctx: the WebSocket
+	// adapter tears the whole connection down (no close frame) when a Read/Write
 	// context dies, so in-session I/O must not abort on shutdown before the
-	// clean close below has gone out.
+	// clean close below has gone out. (Harmless for the in-memory pipe, which
+	// has no such handshake.)
 	sessionCtx, endSession := context.WithCancel(context.Background())
 	defer endSession()
 
 	// Shutdown watcher: on parent cancel, perform the close handshake. This
 	// close frame is the whole point of the redesign's shutdown path — the
-	// server sees StatusNormalClosure and flips the agent offline immediately
+	// server sees a normal closure and flips the agent offline immediately
 	// (Ctrl+C → offline in seconds). Close takes no context (it uses an
 	// internal timeout), so the dead parent ctx cannot wedge it, and it also
 	// unblocks any in-flight Read/Write on this connection.
@@ -293,7 +247,7 @@ func (r *runner) session(ctx context.Context) error {
 		defer close(closeDone)
 		select {
 		case <-ctx.Done():
-			_ = c.Close(websocket.StatusNormalClosure, "shutdown")
+			_ = c.Close(wire.CloseNormalClosure, "shutdown")
 		case <-sessionCtx.Done():
 		}
 	}()
@@ -305,7 +259,7 @@ func (r *runner) session(ctx context.Context) error {
 		if ctx.Err() != nil {
 			<-closeDone
 		} else {
-			_ = c.Close(websocket.StatusInternalError, "session error")
+			_ = c.Close(wire.CloseInternalError, "session error")
 		}
 	}()
 
@@ -341,16 +295,11 @@ func (r *runner) session(ctx context.Context) error {
 // readLoop is the session's sole reader: it decodes each frame and routes it
 // to the session goroutine. Any read/decode failure ends the session (via
 // errCh) — after a transport error the frame stream cannot be trusted.
-func (r *runner) readLoop(sessionCtx context.Context, c *websocket.Conn, ackCh chan<- wire.Ack, pushCh chan<- wire.Frame, errCh chan<- error) {
+func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- wire.Ack, pushCh chan<- wire.Frame, errCh chan<- error) {
 	for {
-		_, data, err := c.Read(sessionCtx)
+		f, err := c.ReadFrame(sessionCtx)
 		if err != nil {
-			errCh <- fmt.Errorf("read: %w", err)
-			return
-		}
-		f, err := wire.UnmarshalFrame(data, r.contentType)
-		if err != nil {
-			errCh <- fmt.Errorf("decode frame: %w", err)
+			errCh <- err
 			return
 		}
 		switch {
@@ -377,9 +326,9 @@ func (r *runner) readLoop(sessionCtx context.Context, c *websocket.Conn, ackCh c
 
 // pingLoop keeps liveness honest: TCP alone can sit half-open for minutes
 // after e.g. a suspend or NAT idle-out, silently stalling telemetry. A failed
-// ping ends the session so Run can redial. coder/websocket serializes writes
-// internally, so pinging concurrently with the session writer is safe.
-func (r *runner) pingLoop(sessionCtx context.Context, c *websocket.Conn, errCh chan<- error) {
+// ping ends the session so Run can redial. Over the in-memory pipe a Ping
+// always succeeds while the link is open, so this loop harmlessly no-ops.
+func (r *runner) pingLoop(sessionCtx context.Context, c wire.Conn, errCh chan<- error) {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
 	for {
@@ -400,7 +349,7 @@ func (r *runner) pingLoop(sessionCtx context.Context, c *websocket.Conn, errCh c
 
 // sessionLoop is the session goroutine's main loop: drain the WAL on a ticker
 // (plus once immediately) and apply server pushes as they arrive.
-func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c *websocket.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
+func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	// Immediate first drain: a freshly-(re)connected session should flush
 	// whatever accumulated while offline without waiting a full tick —
 	// preserves the old loop's fast-startup behavior.
@@ -432,7 +381,7 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c *websocket.Conn,
 // tick, same-sequence retry on failure, server dedups on agent_id+sequence).
 // All WAL access happens here, on the session goroutine — the store rides a
 // single SQLite connection.
-func (r *runner) drain(ctx, sessionCtx context.Context, c *websocket.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
+func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	for i := 0; i < maxBatchesPerDrain; i++ {
 		batch, ok, err := r.deps.Outbox.NextBatch(batchItems)
 		if err != nil {
@@ -493,7 +442,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c *websocket.Conn, ackCh
 // consuming pushCh while it waits — the deadlock guard: if pushes queued up
 // unconsumed, the reader would block sending to pushCh and the ack could never
 // be read off the wire.
-func (r *runner) awaitAck(ctx, sessionCtx context.Context, c *websocket.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
+func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
 	timer := time.NewTimer(r.opts.ackTimeout)
 	defer timer.Stop()
 	for {
@@ -518,7 +467,7 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c *websocket.Conn, ac
 
 // applyPush handles one server push. Runs only on the session goroutine, so
 // config application and appliedConfigVersion stay race-free.
-func (r *runner) applyPush(ctx, sessionCtx context.Context, c *websocket.Conn, f wire.Frame) error {
+func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.Frame) error {
 	switch {
 	case f.DesiredState != nil:
 		ds := f.DesiredState
@@ -565,19 +514,11 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c *websocket.Conn, f
 	return nil
 }
 
-// writeFrame encodes and sends one frame. Protobuf sessions use binary
-// messages, JSON sessions text — matching the negotiated subprotocol so
-// middleboxes and debug tooling see consistent framing.
-func (r *runner) writeFrame(sessionCtx context.Context, c *websocket.Conn, f wire.Frame) error {
-	data, err := wire.MarshalFrame(f, r.contentType)
-	if err != nil {
-		return err
-	}
-	msgType := websocket.MessageBinary
-	if r.contentType == wire.ContentTypeJSON {
-		msgType = websocket.MessageText
-	}
+// writeFrame sends one frame with a bounded write deadline. The codec now lives
+// in the transport adapter, so this only enforces the timeout that keeps a
+// stuck writer from wedging the session.
+func (r *runner) writeFrame(sessionCtx context.Context, c wire.Conn, f wire.Frame) error {
 	wctx, cancel := context.WithTimeout(sessionCtx, writeTimeout)
 	defer cancel()
-	return c.Write(wctx, msgType, data)
+	return c.WriteFrame(wctx, f)
 }
