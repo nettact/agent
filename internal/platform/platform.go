@@ -9,7 +9,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // IfaceInfo is a normalized view of one network interface.
@@ -77,20 +77,37 @@ type Neighbor struct {
 	MAC string
 }
 
+// IfaceQuery selects which per-interface fields the platform reads from the OS.
+// The status fields (ID/Name/Up/IsLoopback/IsWireless) are always read; the
+// address-bearing fields are read only when requested, so a scope the local
+// policy denied never invokes the OS path that reads it (field-level no-call:
+// the agent must not read a denied field then redact it).
+type IfaceQuery struct {
+	Addrs    bool // unicast IP addresses (network.interface.address.read)
+	Gateways bool // default gateway IPs (address.read, or network.gateway.probe)
+	DNS      bool // configured DNS server IPs (network.interface.address.read)
+}
+
 // Platform is the per-OS capability surface used by collectors.
 type Platform interface {
-	// Interfaces enumerates NICs with their IPs, gateway and DNS servers.
-	Interfaces() ([]IfaceInfo, error)
+	// Interfaces enumerates NICs. Address/gateway/DNS fields are populated only for
+	// the field families requested in q; unrequested fields are never read from the
+	// OS, keeping the field-level no-call boundary.
+	Interfaces(q IfaceQuery) ([]IfaceInfo, error)
 	// Ping sends one ICMP echo to target (IP or hostname) per opts.
 	Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error)
 	// Neighbors reads the ARP/neighbor table (passive LAN device discovery).
 	Neighbors() ([]Neighbor, error)
 	// WiFi reports the current Wi-Fi status of every wireless adapter plus a
 	// collection-level verdict (no adapter vs unreadable). Wired-only or
-	// unsupported hosts return WiFiResult{State:"ok"} with no adapters.
-	WiFi() WiFiResult
-	// Supports reports the capabilities this host actually implements.
-	Supports() []capability.Capability
+	// unsupported hosts return WiFiResult{State:"ok"} with no adapters. The SSID is
+	// read from the OS only when includeSSID is true (network.wifi.ssid.read) — it
+	// is never read then redacted.
+	WiFi(includeSSID bool) WiFiResult
+	// Supports reports the platform-dependent permissions this host actually
+	// implements. Platform-independent probe permissions (dns/http/tcp/nat) are
+	// added by the runtime, not here.
+	Supports() permission.Set
 }
 
 // New returns the platform implementation for the current OS.

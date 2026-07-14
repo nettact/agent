@@ -9,7 +9,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // Windows Wi-Fi status via a thin wlanapi.dll adapter (no qualifying maintained
@@ -19,7 +19,9 @@ import (
 // band/channel). No scanning trigger, no BSSID storage, no profile/key APIs, no
 // connect/disconnect.
 
-func wifiCapability() capability.Capability { return capability.NetWiFiRead }
+func wifiPermissions() []permission.ID {
+	return []permission.ID{permission.NetWiFiStatusRead, permission.NetWiFiSSIDRead}
+}
 
 // On Windows IsWireless is set from the adapter IfType during the
 // GetAdaptersAddresses walk (see platform_windows.go), not from a per-name hook.
@@ -131,7 +133,7 @@ type wlanBssList struct {
 	wlanBssEntries  [1]wlanBssEntry
 }
 
-func (winPlatform) WiFi() WiFiResult {
+func (winPlatform) WiFi(includeSSID bool) WiFiResult {
 	var handle windows.Handle
 	var negotiated uint32
 	r, _, _ := procWlanOpenHandle.Call(uintptr(wlanClientVersion2), 0,
@@ -156,12 +158,12 @@ func (winPlatform) WiFi() WiFiResult {
 	infos := unsafe.Slice(&listPtr.interfaceInfo[0], n)
 	adapters := make([]WiFiStatus, 0, n)
 	for i := range infos {
-		adapters = append(adapters, readWinAdapter(handle, &infos[i]))
+		adapters = append(adapters, readWinAdapter(handle, &infos[i], includeSSID))
 	}
 	return WiFiResult{State: "ok", Adapters: adapters}
 }
 
-func readWinAdapter(handle windows.Handle, info *wlanInterfaceInfo) WiFiStatus {
+func readWinAdapter(handle windows.Handle, info *wlanInterfaceInfo, includeSSID bool) WiFiStatus {
 	st := WiFiStatus{
 		ID:   guidKey(info.InterfaceGUID),
 		Name: windows.UTF16ToString(info.strInterfaceDescription[:]),
@@ -186,7 +188,11 @@ func readWinAdapter(handle windows.Handle, info *wlanInterfaceInfo) WiFiStatus {
 
 	assoc := conn.wlanAssociationAttributes
 	st.State = "connected"
-	st.SSID = decodeDot11SSID(assoc.dot11Ssid)
+	// The SSID is decoded from the association only when network.wifi.ssid.read is
+	// granted; otherwise it is never read from the OS (no read-then-redact).
+	if includeSSID {
+		st.SSID = decodeDot11SSID(assoc.dot11Ssid)
+	}
 	q := int(assoc.wlanSignalQuality)
 	if q > 100 {
 		q = 100

@@ -16,6 +16,7 @@ import (
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 )
@@ -151,7 +152,7 @@ func newTestDeps(t *testing.T) (Deps, *wal.Store, *fakeConfigurable, *fakeSchedu
 		Configurables: []Configurable{fc},
 		Scheduler:     fs,
 		DrainInterval: 50 * time.Millisecond,
-		CollectSnapshot: func(_ context.Context, requestID string, _, _ bool) telemetry.HostSnapshot {
+		CollectSnapshot: func(_ context.Context, requestID string, _ permission.Set) telemetry.HostSnapshot {
 			return telemetry.HostSnapshot{TS: time.Now().UTC(), RequestID: requestID}
 		},
 	}
@@ -172,7 +173,7 @@ func testOptions(serverURL, format string) Options {
 			Hostname:      "test-host",
 			Platform:      "test",
 			AgentVersion:  "0.0.0-test",
-			Capabilities:  []string{"probe.icmp"},
+			Permissions:   permission.PermissionReport{Effective: []string{"probe.icmp"}},
 		},
 		dialTimeout: 2 * time.Second,
 		ackTimeout:  2 * time.Second,
@@ -436,19 +437,26 @@ func TestDesiredStateApplied(t *testing.T) {
 	}
 }
 
-// TestSnapshotRequestServed covers the on-demand snapshot path, including the
-// agent-side opt-in re-check: connections were NOT enabled at launch, so a
-// request wanting both must collect processes only.
+// TestSnapshotRequestServed covers the on-demand scoped snapshot path, including
+// the agent-side scope gate: the connection-summary scope is NOT effective, so a
+// request for both process-basic and connection-summary collects basic only and
+// reports the other scope as denied.
 func TestSnapshotRequestServed(t *testing.T) {
 	deps, _, _, _ := newTestDeps(t)
-	deps.ReportProcs = true // ReportConns deliberately left false
+	deps.Supported = permission.All()
+	deps.Granted = permission.NewSet(permission.HostProcessBasicRead)
+	deps.Effective = permission.NewSet(permission.HostProcessBasicRead) // summary deliberately absent
 	var mu sync.Mutex
-	var collectedProcs, collectedConns bool
-	deps.CollectSnapshot = func(_ context.Context, requestID string, wantProcs, wantConns bool) telemetry.HostSnapshot {
+	var gotCollect permission.Set
+	deps.CollectSnapshot = func(_ context.Context, requestID string, collect permission.Set) telemetry.HostSnapshot {
 		mu.Lock()
-		collectedProcs, collectedConns = wantProcs, wantConns
+		gotCollect = collect
 		mu.Unlock()
-		return telemetry.HostSnapshot{TS: time.Now().UTC(), RequestID: requestID, ProcessTotal: 42}
+		total := 42
+		return telemetry.HostSnapshot{
+			TS: time.Now().UTC(), RequestID: requestID, ProcessTotal: &total,
+			Scopes: []telemetry.SnapshotScopeResult{{Scope: string(permission.HostProcessBasicRead), Status: telemetry.ScopeCollected}},
+		}
 	}
 
 	snapCh := make(chan telemetry.HostSnapshot, 1)
@@ -458,7 +466,7 @@ func TestSnapshotRequestServed(t *testing.T) {
 			return
 		}
 		if err := srvWrite(ctx, c, wire.Frame{SnapshotRequest: &pcfg.SnapshotRequest{
-			RequestID: "r1", WantProcesses: true, WantConnections: true,
+			RequestID: "r1", Scopes: []string{string(permission.HostProcessBasicRead), string(permission.HostConnectionSummaryRead)},
 		}}); err != nil {
 			t.Errorf("write snapshot request: %v", err)
 			return
@@ -481,7 +489,7 @@ func TestSnapshotRequestServed(t *testing.T) {
 
 	select {
 	case snap := <-snapCh:
-		if snap.RequestID != "r1" || snap.ProcessTotal != 42 {
+		if snap.RequestID != "r1" || snap.ProcessTotal == nil || *snap.ProcessTotal != 42 {
 			t.Errorf("snapshot = %+v, want RequestID r1 / ProcessTotal 42", snap)
 		}
 	case <-time.After(5 * time.Second):
@@ -489,8 +497,8 @@ func TestSnapshotRequestServed(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !collectedProcs || collectedConns {
-		t.Errorf("collected procs=%v conns=%v, want procs only (conns not opted in)", collectedProcs, collectedConns)
+	if !gotCollect.Has(permission.HostProcessBasicRead) || gotCollect.Has(permission.HostConnectionSummaryRead) {
+		t.Errorf("collect set = %v, want basic only (summary not effective)", gotCollect.Strings())
 	}
 }
 

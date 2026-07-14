@@ -18,9 +18,11 @@ import (
 	"time"
 
 	"github.com/nettact/agent/internal/hostsnapshot"
+	"github.com/nettact/agent/internal/monitoreval"
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 )
@@ -121,16 +123,26 @@ type Deps struct {
 	Scheduler     IntervalSetter
 	DrainInterval time.Duration // how often to drain the WAL over the socket
 
-	// Host-monitoring opt-in flags, re-checked on every SnapshotRequest
-	// (defense in depth: the server should never ask for a cap the agent didn't
-	// advertise, but the launch flags stay the sole authority regardless).
-	ReportProcs bool
-	ReportConns bool
+	// Tracker evaluates each pushed monitor against effective permissions and the
+	// target-access policy, yielding the runnable subset and the full-state
+	// MonitorStatus frame reported to the server.
+	Tracker *monitoreval.Tracker
 
-	// CollectSnapshot produces a live host snapshot for a SnapshotRequest.
-	// Nil selects hostsnapshot.Collect; tests inject a stub to avoid the
-	// ~300ms CPU sample window.
-	CollectSnapshot func(ctx context.Context, requestID string, wantProcs, wantConns bool) telemetry.HostSnapshot
+	// Effective/Granted/Supported are the agent's permission views, used to
+	// classify each requested snapshot scope (collected/denied/unsupported).
+	Effective permission.Set
+	Granted   permission.Set
+	Supported permission.Set
+
+	// SnapshotMinInterval rate-limits back-to-back snapshot requests; SnapshotTimeout
+	// bounds one collection. Zero selects sane defaults.
+	SnapshotMinInterval time.Duration
+	SnapshotTimeout     time.Duration
+
+	// CollectSnapshot produces a live host snapshot for the granted scopes. Nil
+	// selects hostsnapshot.Collect; tests inject a stub to avoid the CPU sample
+	// window.
+	CollectSnapshot func(ctx context.Context, requestID string, collect permission.Set) telemetry.HostSnapshot
 }
 
 // Run dials the server and keeps a session alive until ctx is cancelled,
@@ -161,6 +173,12 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 	}
 	if deps.CollectSnapshot == nil {
 		deps.CollectSnapshot = hostsnapshot.Collect
+	}
+	if deps.SnapshotMinInterval == 0 {
+		deps.SnapshotMinInterval = 3 * time.Second
+	}
+	if deps.SnapshotTimeout == 0 {
+		deps.SnapshotTimeout = 10 * time.Second
 	}
 
 	r := &runner{
@@ -215,6 +233,7 @@ type runner struct {
 	dialer wire.Dialer
 
 	appliedConfigVersion int
+	lastSnapshotAt       time.Time
 }
 
 // session runs one connection lifecycle: dial, Hello, then the frame loop
@@ -358,6 +377,12 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 	}
 	ticker := time.NewTicker(r.deps.DrainInterval)
 	defer ticker.Stop()
+	// trackerUpdates is the cap-1 latest-wins channel of runtime MonitorStatus
+	// transitions; nil when no tracker is wired (tests).
+	var trackerUpdates <-chan wire.MonitorStatus
+	if r.deps.Tracker != nil {
+		trackerUpdates = r.deps.Tracker.Updates()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -367,6 +392,12 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 		case f := <-pushCh:
 			if err := r.applyPush(ctx, sessionCtx, c, f); err != nil {
 				return err
+			}
+		case ms := <-trackerUpdates:
+			// Runtime target-policy transition — write the full-state frame on the
+			// session goroutine (single-writer invariant preserved).
+			if err := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: &ms}); err != nil {
+				return fmt.Errorf("write monitor status: %w", err)
 			}
 		case <-ticker.C:
 			if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh); err != nil {
@@ -474,44 +505,139 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		// Guard against out-of-order delivery: the server's fan-out builds
 		// DesiredState on independent goroutines, so a push carrying version N
 		// can arrive after N+1 was already applied. Applying it would silently
-		// regress targets/intervals; equal versions re-apply harmlessly (the
-		// content is identical and SetTargets is idempotent).
+		// regress targets/intervals; equal versions re-apply harmlessly.
 		if ds.ConfigVersion < r.appliedConfigVersion {
 			log.Printf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
 			return nil
 		}
+		// Evaluate every monitor against effective permissions and target policy.
+		// Only the runnable subset reaches the collectors, so a permission/target
+		// blocked monitor is never scheduled and produces no synthetic failure.
+		runnable := ds.ProbeTargets
+		if r.deps.Tracker != nil {
+			run, frame := r.deps.Tracker.ApplyDesired(ds.ConfigVersion, ds.ProbeTargets)
+			runnable = run
+			// Emit the full-state MonitorStatus after applying config (covers the
+			// reconnect/restart reevaluation for free).
+			if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: &frame}); werr != nil {
+				return fmt.Errorf("write monitor status: %w", werr)
+			}
+		}
 		for _, cfg := range r.deps.Configurables {
-			cfg.SetTargets(ds.ProbeTargets)
+			cfg.SetTargets(runnable)
 		}
 		r.deps.Scheduler.SetIntervals(
 			time.Duration(ds.Intervals.BaseSeconds)*time.Second,
 			time.Duration(ds.Intervals.RegularSeconds)*time.Second,
 		)
 		r.appliedConfigVersion = ds.ConfigVersion
-		log.Printf("applied config v%d: %d probe targets", ds.ConfigVersion, len(ds.ProbeTargets))
+		log.Printf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
 
 	case f.SnapshotRequest != nil:
 		req := f.SnapshotRequest
-		// Re-check the launch flags (defense in depth): a request for a cap the
-		// agent wasn't started with must never trigger collection. If nothing
-		// permitted remains, drop the request outright.
-		wantProcs := req.WantProcesses && r.deps.ReportProcs
-		wantConns := req.WantConnections && r.deps.ReportConns
-		if !wantProcs && !wantConns {
-			log.Printf("dropping snapshot request %s: no permitted data requested", req.RequestID)
-			return nil
-		}
-		// ~300ms CPU sample window; running it here just slips a drain tick
-		// slightly, which is acceptable for an on-demand diagnostic.
-		snap := r.deps.CollectSnapshot(ctx, req.RequestID, wantProcs, wantConns)
-		// Fire and forget: snapshots live outside the sequence/ack path.
+		snap := r.collectSnapshot(ctx, req)
+		// The agent ALWAYS answers a snapshot request — including the all-denied
+		// case — so the console never waits out the old timeout.
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{HostSnapshot: &snap}); err != nil {
 			return fmt.Errorf("write snapshot req=%s: %w", req.RequestID, err)
 		}
-		log.Printf("sent host snapshot req=%s procs=%d conns=%d total=%d",
-			req.RequestID, len(snap.Processes), len(snap.Connections), snap.ProcessTotal)
+		log.Printf("sent host snapshot req=%s scopes=%d procs=%d conns=%d",
+			req.RequestID, len(snap.Scopes), len(snap.Processes), len(snap.Connections))
 	}
 	return nil
+}
+
+// collectSnapshot classifies each requested scope (collected/denied/unsupported/
+// failed), collects only the effective scopes, and merges the per-scope results.
+// gopsutil is invoked only for effective scopes.
+func (r *runner) collectSnapshot(ctx context.Context, req *pcfg.SnapshotRequest) telemetry.HostSnapshot {
+	requested := permission.FromStrings(req.Scopes)
+
+	// Rate-limit back-to-back requests.
+	if !r.lastSnapshotAt.IsZero() && time.Since(r.lastSnapshotAt) < r.deps.SnapshotMinInterval {
+		snap := telemetry.HostSnapshot{TS: time.Now().UTC(), RequestID: req.RequestID}
+		for _, id := range requested.Sorted() {
+			snap.Scopes = append(snap.Scopes, telemetry.SnapshotScopeResult{Scope: string(id), Status: telemetry.ScopeFailed, Reason: "rate_limited"})
+		}
+		return snap
+	}
+	r.lastSnapshotAt = time.Now()
+
+	// Classify each requested scope; build the effective collect set.
+	collect := permission.Set{}
+	extra := map[string]telemetry.SnapshotScopeResult{}
+	for id := range requested {
+		switch {
+		case r.deps.Effective.Has(id) && depsRequested(id, requested):
+			collect.Add(id)
+		case r.deps.Effective.Has(id):
+			// The scope is granted and effective, but its base scope was not
+			// requested, so no rows will carry its fields — reject it rather than
+			// claim it was collected.
+			extra[string(id)] = telemetry.SnapshotScopeResult{Scope: string(id), Status: telemetry.ScopeDenied, Reason: "unsatisfied_dependency"}
+		case r.deps.Granted.Has(id) && !r.deps.Supported.Has(id):
+			extra[string(id)] = telemetry.SnapshotScopeResult{Scope: string(id), Status: telemetry.ScopeUnsupported}
+		case !isKnownScope(id):
+			extra[string(id)] = telemetry.SnapshotScopeResult{Scope: string(id), Status: telemetry.ScopeFailed, Reason: "unknown_scope"}
+		default:
+			reason := ""
+			if missingDep(id, requested, r.deps.Effective) {
+				reason = "unsatisfied_dependency"
+			}
+			extra[string(id)] = telemetry.SnapshotScopeResult{Scope: string(id), Status: telemetry.ScopeDenied, Reason: reason}
+		}
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, r.deps.SnapshotTimeout)
+	defer cancel()
+	snap := r.deps.CollectSnapshot(cctx, req.RequestID, collect)
+
+	// Merge the denied/unsupported/failed results, keeping canonical order.
+	merged := snap.Scopes
+	for _, id := range requested.Sorted() {
+		if e, ok := extra[string(id)]; ok {
+			merged = append(merged, e)
+		}
+	}
+	snap.Scopes = merged
+	return snap
+}
+
+// isKnownScope reports whether id is a compiled process/connection snapshot scope.
+func isKnownScope(id permission.ID) bool {
+	switch id {
+	case permission.HostProcessBasicRead, permission.HostProcessOwnerRead,
+		permission.HostProcessResourceRead, permission.HostProcessIORead,
+		permission.HostConnectionSummaryRead, permission.HostConnectionLocalRead,
+		permission.HostConnectionRemoteRead, permission.HostConnectionOwnerRead:
+		return true
+	default:
+		return false
+	}
+}
+
+// missingDep reports whether a denied scope is denied because a required parent
+// is not effective (so the console can say "unsatisfied_dependency").
+func missingDep(id permission.ID, requested, effective permission.Set) bool {
+	for _, parent := range permission.Dependencies(id) {
+		if !effective.Has(parent) {
+			return true
+		}
+	}
+	return false
+}
+
+// depsRequested reports whether every required base scope of id is also present
+// in the request. A child scope (e.g. process.owner) carries its fields on the
+// rows produced by its base scope (process.basic); if the base is not requested,
+// no rows exist to carry the child's data, so it cannot be collected.
+func depsRequested(id permission.ID, requested permission.Set) bool {
+	for _, parent := range permission.Dependencies(id) {
+		if !requested.Has(parent) {
+			return false
+		}
+	}
+	return true
 }
 
 // writeFrame sends one frame with a bounded write deadline. The codec now lives

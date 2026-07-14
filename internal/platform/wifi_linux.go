@@ -9,7 +9,7 @@ import (
 
 	"github.com/mdlayher/wifi"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // Linux Wi-Fi status via nl80211 (github.com/mdlayher/wifi) — pure Go netlink,
@@ -18,7 +18,9 @@ import (
 // list, associated BSS (SSID/frequency), and station info (signal, bitrates).
 // No scanning, no BSSID storage, no connect/disconnect, no keys.
 
-func wifiCapability() capability.Capability { return capability.NetWiFiRead }
+func wifiPermissions() []permission.ID {
+	return []permission.ID{permission.NetWiFiStatusRead, permission.NetWiFiSSIDRead}
+}
 
 // ifaceIsWireless reports whether a netdev is backed by Wi-Fi hardware, using the
 // kernel's /sys/class/net/<name>/wireless marker. This is independent of nl80211
@@ -48,7 +50,7 @@ func isPermErr(err error) bool {
 	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)
 }
 
-func (genericPlatform) WiFi() WiFiResult {
+func (genericPlatform) WiFi(includeSSID bool) WiFiResult {
 	cl, err := wifi.New()
 	if err != nil {
 		return classifyLinuxWiFiOpenErr(err)
@@ -67,7 +69,7 @@ func (genericPlatform) WiFi() WiFiResult {
 		if ifi.Name == "" || (ifi.Type != wifi.InterfaceTypeStation && ifi.Type != wifi.InterfaceTypeUnspecified) {
 			continue
 		}
-		adapters = append(adapters, readLinuxAdapter(cl, ifi))
+		adapters = append(adapters, readLinuxAdapter(cl, ifi, includeSSID))
 	}
 	return WiFiResult{State: "ok", Adapters: adapters}
 }
@@ -85,7 +87,7 @@ func classifyLinuxWiFiOpenErr(err error) WiFiResult {
 	return WiFiResult{State: "ok"} // missing nl80211 family + no hardware ⇒ no adapter
 }
 
-func readLinuxAdapter(cl *wifi.Client, ifi *wifi.Interface) WiFiStatus {
+func readLinuxAdapter(cl *wifi.Client, ifi *wifi.Interface, includeSSID bool) WiFiStatus {
 	st := WiFiStatus{ID: ifi.Name, Name: ifi.Name}
 
 	bss, err := cl.BSS(ifi)
@@ -106,7 +108,11 @@ func readLinuxAdapter(cl *wifi.Client, ifi *wifi.Interface) WiFiStatus {
 	}
 
 	st.State = "connected"
-	st.SSID = bss.SSID
+	// The SSID is retained only when network.wifi.ssid.read is granted; the BSS
+	// netlink response is not kept otherwise (no read-then-redact into WiFiStatus).
+	if includeSSID {
+		st.SSID = bss.SSID
+	}
 	freq := bss.Frequency
 	if freq == 0 {
 		freq = ifi.Frequency

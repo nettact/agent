@@ -101,7 +101,7 @@ func (s *Scheduler) selfLoop(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			if len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 {
+			if len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 && len(res.Blocked) == 0 {
 				continue
 			}
 			// A self-scheduled probe reporting 100% loss is still a burst signal

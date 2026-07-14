@@ -14,7 +14,7 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/stun/v3"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/agent/internal/netguard"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -32,15 +32,16 @@ import (
 // over UDP, so they are not emitted for the connection/session transports.
 type NATCollector struct {
 	sched *schedState
+	guard *netguard.Guard
 
 	mu         sync.Mutex
 	lastMapped map[string]string // target -> last reflexive addr, so we only event on change
 }
 
-func NewNATCollector() *NATCollector {
+func NewNATCollector(guard *netguard.Guard) *NATCollector {
 	// 30-min fallback: NAT type changes rarely and a full run is multi-RTT, so we
 	// avoid probing every self-tick when a target sets no interval_seconds.
-	return &NATCollector{sched: newSchedState(30 * time.Minute), lastMapped: map[string]string{}}
+	return &NATCollector{guard: guard, sched: newSchedState(30 * time.Minute), lastMapped: map[string]string{}}
 }
 
 // SetTargets replaces the NAT target list from a DesiredState update.
@@ -55,10 +56,6 @@ func (c *NATCollector) SetTargets(targets []pcfg.ProbeTarget) {
 }
 
 func (c *NATCollector) Name() string { return "nat" }
-
-func (c *NATCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.ProbeNAT}
-}
 
 func (c *NATCollector) Tier() Tier { return TierRegular }
 
@@ -132,14 +129,14 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 
 	if transport != "udp" {
 		// tcp/tls/dtls: binding test only.
-		reflexive, rtt, err := streamBinding(rctx, transport, server, t.Params.IgnoreTLS, perReq)
+		reflexive, rtt, err := streamBinding(rctx, c.guard, transport, server, t.Params.IgnoreTLS, perReq)
 		c.emitBinding(now, t, res, base, reflexive, rtt, err)
 		return
 	}
 
 	// UDP: full RFC 5780 discovery over one unconnected socket so every round trip
 	// leaves from the same local port (required for mapping/filtering).
-	rt, err := newUDPRoundTripper()
+	rt, err := newUDPRoundTripper(c.guard)
 	if err != nil {
 		c.emitBinding(now, t, res, base, "", 0, err)
 		return
@@ -150,6 +147,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	t0 := time.Now()
 	resp, _, err := rt.do(rctx, server, perReq, 0)
 	if err != nil {
+		// emitBinding routes a *netguard.BlockedError to res.Blocked (no metric).
 		c.emitBinding(now, t, res, base, "", 0, err)
 		return
 	}
@@ -161,7 +159,6 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		return
 	}
 	reflexive := net.JoinHostPort(xor.IP.String(), strconv.Itoa(xor.Port))
-	c.emitBinding(now, t, res, base, reflexive, rtt, nil)
 
 	var other stun.OtherAddress
 	hasOther := other.GetFrom(resp) == nil
@@ -171,7 +168,14 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// filtering probes would just time out and be misread as "blocked", so we skip
 	// them and report unknown rather than misleading data.
 	if !hasOther {
-		mapping := mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
+		mapping, merr := mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
+		if be := asBlockedProbe(t.MonitorID, merr); be != nil {
+			// A denied second STUN server is a target-policy block for the monitor;
+			// emit no synthetic NAT metric, route it to the status tracker.
+			res.Blocked = append(res.Blocked, *be)
+			return
+		}
+		c.emitBinding(now, t, res, base, reflexive, rtt, nil)
 		res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 			map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 		res.Events = append(res.Events, telemetry.Event{
@@ -192,29 +196,50 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// mapping probes, and the filtering reply would arrive and read as a false
 	// endpoint-independent (full cone). At this point only the primary server has
 	// been contacted (by the binding test), so the filtering test is uncontaminated.
-	filtering := filteringBehavior(rctx, server, perReq)
+	filtering, ferr := filteringBehavior(rctx, c.guard, server, perReq)
+	if be := asBlockedProbe(t.MonitorID, ferr); be != nil {
+		res.Blocked = append(res.Blocked, *be)
+		return
+	}
 
 	// A Test II/III reply can be lost or rate-limited on flaky STUN servers, which
 	// would report a transient "unknown". Since the server did return OTHER-ADDRESS,
 	// a real answer exists — retry a couple of times, spaced out to dodge rate limits,
 	// before accepting unknown.
-	mapping := mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
-	for attempt := 0; mapping == natUnknown && attempt < 2 && rctx.Err() == nil; attempt++ {
+	mapping, merr := mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
+	for attempt := 0; mapping == natUnknown && merr == nil && attempt < 2 && rctx.Err() == nil; attempt++ {
 		select {
 		case <-rctx.Done():
 		case <-time.After(400 * time.Millisecond):
 		}
-		mapping = mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
+		mapping, merr = mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
 	}
+	if be := asBlockedProbe(t.MonitorID, merr); be != nil {
+		res.Blocked = append(res.Blocked, *be)
+		return
+	}
+
+	// No block anywhere in the discovery: emit the binding + behavior metrics.
+	c.emitBinding(now, t, res, base, reflexive, rtt, nil)
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 		map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
-
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATFiltering, filtering,
 		map[string]string{"transport": transport, "behavior": mappingLabel(filtering)}))
 
 	natType := classify(reflexive, mapping, filtering)
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATType, natType,
 		map[string]string{"transport": transport, "type": natTypeLabel(natType)}))
+}
+
+// asBlockedProbe converts a policy-block error from a NAT sub-probe into a
+// BlockedProbe for the monitor, or nil for any non-block error.
+func asBlockedProbe(monitorID string, err error) *BlockedProbe {
+	var be *netguard.BlockedError
+	if errors.As(err, &be) {
+		bp := blockedFromErr(monitorID, be)
+		return &bp
+	}
+	return nil
 }
 
 // emitBinding appends the ok/rtt metrics and, on failure, a probe-failed event.
@@ -224,6 +249,13 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 // gating on change keeps it from spamming the timeline every run.
 func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Result, base map[string]string, reflexive string, rtt float64, err error) {
 	if err != nil {
+		// A policy block on the STUN server is a target-policy block, not a binding
+		// failure: emit no metric/event, route it to the monitor-status tracker.
+		var be *netguard.BlockedError
+		if errors.As(err, &be) {
+			res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+			return
+		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,
 			Value: 0, Unit: telemetry.UnitBool, Labels: base, MonitorID: t.MonitorID,
@@ -275,26 +307,31 @@ func natMetric(now time.Time, t pcfg.ProbeTarget, kind telemetry.MetricKind, cod
 // Test III sends to the full OTHER-ADDRESS. When the server returns no
 // OTHER-ADDRESS but a second STUN server is configured, a coarse fallback compares
 // the reflexive address against that server (endpoint-independent vs "hard").
-func mappingBehavior(ctx context.Context, rt *udpRoundTripper, primary string, xor stun.XORMappedAddress, other stun.OtherAddress, hasOther bool, server2 string, timeout time.Duration) int {
+//
+// It returns the behavior code plus a non-nil error only when a destination
+// (second STUN server, or a server-supplied OTHER-ADDRESS) is denied by policy —
+// that block must be reported as a target block, never collapsed into a synthetic
+// natUnknown metric. Ordinary timeouts/losses stay natUnknown with a nil error.
+func mappingBehavior(ctx context.Context, rt *udpRoundTripper, primary string, xor stun.XORMappedAddress, other stun.OtherAddress, hasOther bool, server2 string, timeout time.Duration) (int, error) {
 	if !hasOther {
 		if server2 == "" {
-			return natUnknown
+			return natUnknown, nil
 		}
 		resp, _, err := rt.do(ctx, stunHostPort(server2, 0, defaultSTUNPort), timeout, 0)
 		if err != nil {
-			return natUnknown
+			return natUnknown, asBlock(err)
 		}
 		var x2 stun.XORMappedAddress
 		if x2.GetFrom(resp) != nil {
-			return natUnknown
+			return natUnknown, nil
 		}
 		if x2.IP.Equal(xor.IP) && x2.Port == xor.Port {
-			return natEndpointIndependent
+			return natEndpointIndependent, nil
 		}
 		// Different reflexive address from a different server: not endpoint
 		// independent. Without OTHER-ADDRESS we cannot separate address- from
 		// address-and-port-dependent, so report the conservative "hardest" value.
-		return natAddressAndPortDependent
+		return natAddressAndPortDependent, nil
 	}
 
 	_, primaryPort, _ := net.SplitHostPort(primary)
@@ -308,14 +345,14 @@ func mappingBehavior(ctx context.Context, rt *udpRoundTripper, primary string, x
 	testII := net.JoinHostPort(other.IP.String(), strconv.Itoa(pport))
 	resp, _, err := rt.do(ctx, testII, timeout, 0)
 	if err != nil {
-		return natUnknown
+		return natUnknown, asBlock(err)
 	}
 	var x2 stun.XORMappedAddress
 	if x2.GetFrom(resp) != nil {
-		return natUnknown
+		return natUnknown, nil
 	}
 	if x2.IP.Equal(xor.IP) && x2.Port == xor.Port {
-		return natEndpointIndependent
+		return natEndpointIndependent, nil
 	}
 
 	// Test III: other IP, other port. Compared against Test II's reflexive: equal
@@ -323,16 +360,27 @@ func mappingBehavior(ctx context.Context, rt *udpRoundTripper, primary string, x
 	// different means it also depends on the port.
 	resp, _, err = rt.do(ctx, testIII(other), timeout, 0)
 	if err != nil {
-		return natUnknown
+		return natUnknown, asBlock(err)
 	}
 	var x3 stun.XORMappedAddress
 	if x3.GetFrom(resp) != nil {
-		return natUnknown
+		return natUnknown, nil
 	}
 	if x3.IP.Equal(x2.IP) && x3.Port == x2.Port {
-		return natAddressDependent
+		return natAddressDependent, nil
 	}
-	return natAddressAndPortDependent
+	return natAddressAndPortDependent, nil
+}
+
+// asBlock returns err when it carries a *netguard.BlockedError (a policy block to
+// be reported as a target block), or nil for any other error (an ordinary
+// timeout/loss that stays a natUnknown result).
+func asBlock(err error) error {
+	var be *netguard.BlockedError
+	if errors.As(err, &be) {
+		return err
+	}
+	return nil
 }
 
 // testIII builds the Test III destination (other IP + other port).
@@ -351,31 +399,35 @@ func testIII(other stun.OtherAddress) string {
 // full-cone). Each reply is also checked to have genuinely come from a changed
 // source, so a server that ignores CHANGE-REQUEST and answers from its primary
 // address is not counted as a pass.
-func filteringBehavior(ctx context.Context, primary string, timeout time.Duration) int {
-	rt, err := newUDPRoundTripper()
+func filteringBehavior(ctx context.Context, guard *netguard.Guard, primary string, timeout time.Duration) (int, error) {
+	rt, err := newUDPRoundTripper(guard)
 	if err != nil {
-		return natUnknown
+		return natUnknown, nil
 	}
 	defer rt.close()
 
-	// Resolve the primary to a concrete IP once and send to that exact address (not
-	// the hostname). Otherwise a round-robin DNS name (many public STUN servers have
-	// several A records) could be re-resolved to a different IP inside do(), so a
-	// reply from the address we actually contacted would compare unequal to `pa` and
-	// be misread as a changed source → false endpoint-independent.
-	pa, err := net.ResolveUDPAddr("udp4", primary)
+	// Vet+pin the primary to a concrete address once and send to that exact address
+	// (not the hostname). Otherwise a round-robin DNS name (many public STUN servers
+	// have several A records) could be re-resolved to a different IP inside do(), so
+	// a reply from the address we actually contacted would compare unequal to `pa`
+	// and be misread as a changed source → false endpoint-independent. Using the
+	// guard keeps the host:/deny semantics and IP pinning consistent.
+	pa, err := guard.VetUDPAddr(ctx, primary)
 	if err != nil {
-		return natUnknown
+		return natUnknown, asBlock(err)
 	}
-	dst := pa.String()
 
-	if _, from, err := rt.do(ctx, dst, timeout, 0x06); err == nil && sourceChanged(from, pa, true) {
-		return natEndpointIndependent
+	if _, from, err := rt.doAddr(ctx, pa, timeout, 0x06); err == nil && sourceChanged(from, pa, true) {
+		return natEndpointIndependent, nil
+	} else if be := asBlock(err); be != nil {
+		return natUnknown, be
 	}
-	if _, from, err := rt.do(ctx, dst, timeout, 0x02); err == nil && sourceChanged(from, pa, false) {
-		return natAddressDependent
+	if _, from, err := rt.doAddr(ctx, pa, timeout, 0x02); err == nil && sourceChanged(from, pa, false) {
+		return natAddressDependent, nil
+	} else if be := asBlock(err); be != nil {
+		return natUnknown, be
 	}
-	return natAddressAndPortDependent
+	return natAddressAndPortDependent, nil
 }
 
 // sourceChanged reports whether a change-request reply actually came from a changed
@@ -432,27 +484,41 @@ func isLocalIP(ip net.IP) bool {
 // an arbitrary destination and returns the matching response, so mapping/filtering
 // tests all leave from the same local port.
 type udpRoundTripper struct {
-	conn *net.UDPConn
+	conn  *net.UDPConn
+	guard *netguard.Guard
 }
 
-func newUDPRoundTripper() (*udpRoundTripper, error) {
-	conn, err := net.ListenUDP("udp4", nil)
+func newUDPRoundTripper(guard *netguard.Guard) (*udpRoundTripper, error) {
+	// Dual-stack socket so a STUN server (or its OTHER-ADDRESS) that vets to an
+	// IPv6 address is reachable; net.IP.Equal in sourceChanged treats the v4/v4-in-v6
+	// forms as equal, so the filtering comparison is unaffected.
+	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err
 	}
-	return &udpRoundTripper{conn: conn}, nil
+	return &udpRoundTripper{conn: conn, guard: guard}, nil
 }
 
 func (u *udpRoundTripper) close() { _ = u.conn.Close() }
 
-// do sends a binding request to addr. When changeReq is non-zero, a CHANGE-REQUEST
-// attribute with that flag byte is added (0x06 change IP+port, 0x02 change port).
-// It returns the first response carrying the request's transaction ID.
+// do vets the destination (host or literal IP, IPv4/IPv6) through the guard —
+// applying CheckHost/vetted-resolution/deny-precedence and pinning the returned
+// address — then sends the binding request. A denied destination is returned as a
+// *netguard.BlockedError and no datagram is sent.
 func (u *udpRoundTripper) do(ctx context.Context, addr string, timeout time.Duration, changeReq byte) (*stun.Message, net.Addr, error) {
-	dst, err := net.ResolveUDPAddr("udp4", addr)
+	dst, err := u.guard.VetUDPAddr(ctx, addr)
 	if err != nil {
 		return nil, nil, err
 	}
+	return u.doAddr(ctx, dst, timeout, changeReq)
+}
+
+// doAddr sends a binding request to an already-vetted destination. When changeReq
+// is non-zero, a CHANGE-REQUEST attribute with that flag byte is added (0x06
+// change IP+port, 0x02 change port). It returns the first response carrying the
+// request's transaction ID. The destination must already have passed the guard
+// (via do or VetUDPAddr) so the vetted address stays pinned to the send.
+func (u *udpRoundTripper) doAddr(ctx context.Context, dst *net.UDPAddr, timeout time.Duration, changeReq byte) (*stun.Message, net.Addr, error) {
 	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 	if changeReq != 0 {
 		req.Add(stun.AttrChangeRequest, []byte{0x00, 0x00, 0x00, changeReq})
@@ -502,13 +568,13 @@ func (u *udpRoundTripper) do(ctx context.Context, addr string, timeout time.Dura
 
 // streamBinding performs a single STUN binding exchange over a connected transport
 // and returns the reflexive (mapped) address and round-trip latency (ms).
-func streamBinding(ctx context.Context, transport, server string, ignoreTLS bool, timeout time.Duration) (string, float64, error) {
+func streamBinding(ctx context.Context, guard *netguard.Guard, transport, server string, ignoreTLS bool, timeout time.Duration) (string, float64, error) {
 	deadline := time.Now().Add(timeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
 
-	conn, datagram, err := dialSTUN(ctx, transport, server, ignoreTLS, timeout)
+	conn, datagram, err := dialSTUN(ctx, guard, transport, server, ignoreTLS, timeout)
 	if err != nil {
 		return "", 0, err
 	}
@@ -535,16 +601,14 @@ func streamBinding(ctx context.Context, transport, server string, ignoreTLS bool
 
 // dialSTUN opens a connection for the tcp/tls/dtls transports. datagram is true for
 // dtls (one Read returns a whole record) so readSTUN uses datagram framing.
-func dialSTUN(ctx context.Context, transport, server string, ignoreTLS bool, timeout time.Duration) (conn net.Conn, datagram bool, err error) {
+func dialSTUN(ctx context.Context, guard *netguard.Guard, transport, server string, ignoreTLS bool, timeout time.Duration) (conn net.Conn, datagram bool, err error) {
 	host, _, _ := net.SplitHostPort(server)
 	switch transport {
 	case "tcp":
-		d := net.Dialer{Timeout: timeout}
-		c, err := d.DialContext(ctx, "tcp", server)
+		c, err := guard.DialContext(ctx, "tcp", server)
 		return c, false, err
 	case "tls":
-		d := net.Dialer{Timeout: timeout}
-		raw, err := d.DialContext(ctx, "tcp", server)
+		raw, err := guard.DialContext(ctx, "tcp", server)
 		if err != nil {
 			return nil, false, err
 		}
@@ -555,7 +619,9 @@ func dialSTUN(ctx context.Context, transport, server string, ignoreTLS bool, tim
 		}
 		return tc, false, nil
 	case "dtls":
-		raddr, err := net.ResolveUDPAddr("udp4", server)
+		// Vet+pin the DTLS destination through the guard (host:/deny semantics, IPv6,
+		// resolved-address privacy) before opening the socket.
+		raddr, err := guard.VetUDPAddr(ctx, server)
 		if err != nil {
 			return nil, true, err
 		}
@@ -564,7 +630,7 @@ func dialSTUN(ctx context.Context, transport, server string, ignoreTLS bool, tim
 		// any deadline). Own the UDP socket and drive a cancellable HandshakeContext
 		// so a timeout actually aborts the handshake and releases the socket — no
 		// leaked goroutine or connection on an unresponsive endpoint.
-		pconn, err := net.ListenUDP("udp4", nil)
+		pconn, err := net.ListenUDP("udp", nil)
 		if err != nil {
 			return nil, true, err
 		}
@@ -658,3 +724,6 @@ func natTypeLabel(code int) string {
 		return "unknown"
 	}
 }
+
+// SetMinInterval applies the local per-target probe-interval floor (stability limit).
+func (c *NATCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

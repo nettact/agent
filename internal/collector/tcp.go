@@ -3,11 +3,12 @@ package collector
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"strconv"
 	"time"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/agent/internal/netguard"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -18,10 +19,11 @@ import (
 // and is probed on its own schedule via schedState.
 type TCPCollector struct {
 	sched *schedState
+	guard *netguard.Guard
 }
 
-func NewTCPCollector() *TCPCollector {
-	return &TCPCollector{sched: newSchedState(30 * time.Second)}
+func NewTCPCollector(guard *netguard.Guard) *TCPCollector {
+	return &TCPCollector{sched: newSchedState(30 * time.Second), guard: guard}
 }
 
 func (c *TCPCollector) SetTargets(targets []pcfg.ProbeTarget) {
@@ -35,10 +37,6 @@ func (c *TCPCollector) SetTargets(targets []pcfg.ProbeTarget) {
 }
 
 func (c *TCPCollector) Name() string { return "tcp" }
-
-func (c *TCPCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.ProbeTCP}
-}
 
 func (c *TCPCollector) Tier() Tier { return TierRegular }
 
@@ -59,11 +57,12 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		t0 := time.Now()
-		var dialer net.Dialer
-		conn, err := dialer.DialContext(cctx, "tcp", addr)
+		conn, err := c.guard.DialContext(cctx, "tcp", addr)
 		if err == nil && t.Params.TLS {
 			// Wrap the live connection in a TLS handshake so a mismatched cert or
-			// non-TLS port is reported as down (optional SSL/TLS check).
+			// non-TLS port is reported as down (optional SSL/TLS check). ServerName
+			// stays the original host so verification is against the intended name
+			// even though the guard pinned the vetted IP.
 			tconn := tls.Client(conn, &tls.Config{
 				ServerName:         t.Target,
 				InsecureSkipVerify: t.Params.IgnoreTLS,
@@ -75,6 +74,13 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 		cancel()
 		if conn != nil {
 			_ = conn.Close()
+		}
+
+		// A policy block is not a connect failure.
+		var be *netguard.BlockedError
+		if errors.As(err, &be) {
+			res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+			continue
 		}
 
 		ok := 0.0
@@ -101,3 +107,6 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 	}
 	return res, nil
 }
+
+// SetMinInterval applies the local per-target probe-interval floor (stability limit).
+func (c *TCPCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

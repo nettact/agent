@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/nettact/agent/internal/platform"
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // fakePlatform implements platform.Platform; only Neighbors is exercised here.
@@ -16,13 +16,13 @@ type fakePlatform struct {
 	err       error
 }
 
-func (f fakePlatform) Interfaces() ([]platform.IfaceInfo, error) { return nil, nil }
+func (f fakePlatform) Interfaces(platform.IfaceQuery) ([]platform.IfaceInfo, error) { return nil, nil }
 func (f fakePlatform) Ping(context.Context, string, platform.PingOptions) (platform.PingResult, error) {
 	return platform.PingResult{}, nil
 }
 func (f fakePlatform) Neighbors() ([]platform.Neighbor, error) { return f.neighbors, f.err }
-func (f fakePlatform) WiFi() platform.WiFiResult               { return platform.WiFiResult{State: "ok"} }
-func (f fakePlatform) Supports() []capability.Capability       { return nil }
+func (f fakePlatform) WiFi(includeSSID bool) platform.WiFiResult { return platform.WiFiResult{State: "ok"} }
+func (f fakePlatform) Supports() permission.Set                { return nil }
 
 func TestARPCollectorResolvesHostnames(t *testing.T) {
 	p := fakePlatform{neighbors: []platform.Neighbor{
@@ -33,7 +33,7 @@ func TestARPCollectorResolvesHostnames(t *testing.T) {
 	}}
 
 	var calls int32
-	c := NewARPCollector(p)
+	c := NewARPCollector(p, true)
 	c.lookup = func(_ context.Context, addr string) ([]string, error) {
 		atomic.AddInt32(&calls, 1)
 		if addr == "192.168.1.10" {

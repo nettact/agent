@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // winPlatform implements Platform using CGO-free Windows syscalls (iphlpapi):
@@ -23,30 +23,46 @@ type winPlatform struct{}
 
 func newPlatform() Platform { return winPlatform{} }
 
-func (winPlatform) Supports() []capability.Capability {
-	caps := []capability.Capability{
-		capability.NetIfaceRead,
-		capability.NetRouteRead,
-		capability.ProbeICMP,
-		capability.InventoryARP,
+func (winPlatform) Supports() permission.Set {
+	s := permission.NewSet(
+		permission.NetIfaceStatusRead,
+		permission.NetIfaceAddressRead,
+		permission.NetworkGatewayProbe,
+		permission.ProbeICMP,
+		permission.NetNeighborRead,
+		permission.NetNeighborHostRead,
+	)
+	for _, id := range wifiPermissions() {
+		s.Add(id)
 	}
-	if c := wifiCapability(); c != "" {
-		caps = append(caps, c)
-	}
-	return caps
+	return s
 }
 
 // GetAdaptersAddresses flags / interface type not exported by x/sys.
 const (
+	gaaFlagSkipUnicast     = 0x0001
 	gaaFlagSkipAnycast     = 0x0002
 	gaaFlagSkipMulticast   = 0x0004
+	gaaFlagSkipDNSServer   = 0x0008
 	gaaFlagIncludeGateways = 0x0080
 	ifTypeSoftwareLoopback = 24
 	ifTypeIEEE80211        = 71 // IF_TYPE_IEEE80211 (native Wi-Fi)
 )
 
-func (winPlatform) Interfaces() ([]IfaceInfo, error) {
-	const flags = gaaFlagSkipAnycast | gaaFlagSkipMulticast | gaaFlagIncludeGateways
+func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
+	// Field-level no-read: tell the OS to omit the denied structures entirely
+	// rather than fetching them and skipping the iteration. A denied address or
+	// DNS scope must not have its data populated into the buffer at all.
+	flags := uint32(gaaFlagSkipAnycast | gaaFlagSkipMulticast)
+	if !q.Addrs {
+		flags |= gaaFlagSkipUnicast
+	}
+	if !q.DNS {
+		flags |= gaaFlagSkipDNSServer
+	}
+	if q.Gateways {
+		flags |= gaaFlagIncludeGateways
+	}
 
 	size := uint32(15000)
 	var buf []byte
@@ -73,19 +89,27 @@ func (winPlatform) Interfaces() ([]IfaceInfo, error) {
 			IsLoopback: aa.IfType == ifTypeSoftwareLoopback,
 			IsWireless: aa.IfType == ifTypeIEEE80211,
 		}
-		for ua := aa.FirstUnicastAddress; ua != nil; ua = ua.Next {
-			if ip := ua.Address.IP(); ip != nil {
-				info.Addrs = append(info.Addrs, ip.String())
+		// Address-bearing fields are read only when requested — a denied scope must
+		// not have its data extracted from the OS structures at all.
+		if q.Addrs {
+			for ua := aa.FirstUnicastAddress; ua != nil; ua = ua.Next {
+				if ip := ua.Address.IP(); ip != nil {
+					info.Addrs = append(info.Addrs, ip.String())
+				}
 			}
 		}
-		for ga := aa.FirstGatewayAddress; ga != nil; ga = ga.Next {
-			if ip := ga.Address.IP(); ip != nil {
-				info.Gateways = append(info.Gateways, ip.String())
+		if q.Gateways {
+			for ga := aa.FirstGatewayAddress; ga != nil; ga = ga.Next {
+				if ip := ga.Address.IP(); ip != nil {
+					info.Gateways = append(info.Gateways, ip.String())
+				}
 			}
 		}
-		for da := aa.FirstDnsServerAddress; da != nil; da = da.Next {
-			if ip := da.Address.IP(); ip != nil {
-				info.DNS = append(info.DNS, ip.String())
+		if q.DNS {
+			for da := aa.FirstDnsServerAddress; da != nil; da = da.Next {
+				if ip := da.Address.IP(); ip != nil {
+					info.DNS = append(info.DNS, ip.String())
+				}
 			}
 		}
 		out = append(out, info)

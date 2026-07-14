@@ -22,14 +22,14 @@ import (
 	"time"
 
 	"github.com/nettact/protocol"
-	"github.com/nettact/protocol/capability"
 	protoenroll "github.com/nettact/protocol/enroll"
+	"github.com/nettact/protocol/permission"
 )
 
 // BuildRequest assembles and signs an enrollment request, proving possession of
 // the private key by signing a fresh random nonce.
 func BuildRequest(priv ed25519.PrivateKey, token, hostname, platform, version string,
-	caps []capability.Capability) protoenroll.EnrollRequest {
+	report permission.PermissionReport) protoenroll.EnrollRequest {
 
 	nonceBytes := make([]byte, 32)
 	_, _ = rand.Read(nonceBytes)
@@ -44,7 +44,7 @@ func BuildRequest(priv ed25519.PrivateKey, token, hostname, platform, version st
 		Hostname:        hostname,
 		Platform:        platform,
 		AgentVersion:    version,
-		Capabilities:    caps,
+		Permissions:     report,
 	}
 }
 

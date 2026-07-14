@@ -2,8 +2,8 @@
 // Run that owns identity, enrollment, the collector scheduler, the status
 // heartbeat, and the persistent server session. The standalone nettact-agent
 // command and the desktop all-in-one both drive the same code through this
-// package — the command is a thin flags→Config wrapper, and the desktop passes
-// an in-process enrollment TokenSource so no token ever touches a CLI.
+// package — the command is a thin environment→Config wrapper, and the desktop
+// passes an in-process enrollment TokenSource so no token ever touches a CLI.
 //
 // Run never calls log.Fatal, never parses flags, and never installs signal
 // handlers; the caller owns process lifecycle via ctx. All traffic stays
@@ -12,12 +12,16 @@ package agentrt
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,12 +29,15 @@ import (
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/enroll"
 	"github.com/nettact/agent/internal/identity"
+	"github.com/nettact/agent/internal/monitoreval"
+	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/internal/scheduler"
 	"github.com/nettact/agent/internal/wal"
+	"github.com/nettact/agent/probepolicy"
 	"github.com/nettact/protocol"
-	"github.com/nettact/protocol/capability"
 	protoenroll "github.com/nettact/protocol/enroll"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 )
@@ -77,6 +84,25 @@ type Event struct {
 	Err     error
 }
 
+// Limits are the local stability controls (spec §3.1). Zero values select the
+// production defaults in DefaultLimits.
+type Limits struct {
+	MinProbeInterval    time.Duration
+	MaxProbeConcurrency int
+	SnapshotMinInterval time.Duration
+	SnapshotTimeout     time.Duration
+}
+
+// DefaultLimits are the spec §17.1 stability defaults.
+func DefaultLimits() Limits {
+	return Limits{
+		MinProbeInterval:    1 * time.Second,
+		MaxProbeConcurrency: 16,
+		SnapshotMinInterval: 3 * time.Second,
+		SnapshotTimeout:     10 * time.Second,
+	}
+}
+
 // Config drives one Run. Zero values select production defaults where noted.
 type Config struct {
 	ServerURL      string        // e.g. http://127.0.0.1:52344; required unless both Dialer and Enroller are set
@@ -84,6 +110,19 @@ type Config struct {
 	Insecure       bool          // skip TLS verification (LAN self-signed)
 	UploadInterval time.Duration // WAL drain cadence; 0 → 5s
 	WireFormat     string        // "protobuf" (default when empty) or "json"
+
+	// Policy is the agent's immutable local permission grant (spec §3). The
+	// standalone binary builds it from NETTACT_AGENT_PERMISSIONS (or the frozen
+	// default); the desktop passes permission.FullAccess(). Run validates it is
+	// non-zero.
+	Policy permission.Policy
+
+	// ProbeAccess is the immutable target-access policy (spec §3.4). The desktop
+	// leaves it zero (the guard never consults it under FullAccess bypass).
+	ProbeAccess probepolicy.Policy
+
+	// Limits are the local stability controls. Zero fields select DefaultLimits.
+	Limits Limits
 
 	// Dialer establishes the server session. Nil selects a WebSocket to ServerURL
 	// (the standalone path). The desktop injects the embedded Lite server's
@@ -95,18 +134,10 @@ type Config struct {
 	// direct registry call so first-run enrollment needs no HTTP round-trip.
 	Enroller func(ctx context.Context, req protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error)
 
-	// Privacy opt-ins. All default false; the desktop bundled agent leaves them
-	// false (network monitoring only). They are the sole authority for host data
-	// collection: without them the agent never advertises the capability and
-	// never collects, so the server can obtain nothing.
-	ReportHost  bool
-	ReportProcs bool
-	ReportConns bool
-
 	// TokenSource supplies a one-time enrollment token, invoked ONLY when there
-	// is no credential on disk. The CLI returns --enroll-token (or an error); the
-	// desktop returns srv.MintEnrollmentToken. Required for first-run enrollment;
-	// if nil and enrollment is needed, Run returns ErrEnroll.
+	// is no credential on disk. The CLI returns the enrollment token (or an
+	// error); the desktop returns srv.MintEnrollmentToken. Required for first-run
+	// enrollment; if nil and enrollment is needed, Run returns ErrEnroll.
 	TokenSource func(ctx context.Context) (string, error)
 
 	// OnEvent, if non-nil, receives lifecycle events. It must be fast and
@@ -135,6 +166,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.UploadInterval == 0 {
 		cfg.UploadInterval = 5 * time.Second
 	}
+	if cfg.Policy.Granted == nil {
+		return errors.New("agentrt: Config.Policy must be set (permission grant)")
+	}
+	cfg.Limits = fillLimits(cfg.Limits)
 
 	subprotocol, err := subprotocolFor(cfg.WireFormat)
 	if err != nil {
@@ -148,19 +183,24 @@ func Run(ctx context.Context, cfg Config) error {
 	hostname, _ := os.Hostname()
 	p := platform.New()
 
-	// Advertised capabilities reflect only enabled opt-ins, so the console can
-	// tell which agents will serve host metrics / live snapshots. TCP and NAT are
-	// platform-independent and always advertised.
-	caps := append([]capability.Capability(nil), p.Supports()...)
-	caps = append(caps, capability.ProbeTCP, capability.ProbeNAT)
-	if cfg.ReportHost {
-		caps = append(caps, capability.HostStatRead)
+	// The three permission views: supported (platform-independent probes plus what
+	// this OS implements), granted (the local policy), effective (usable
+	// intersection). Effective is computed once and immutable for this process.
+	supported := platformIndependentSupported()
+	for id := range p.Supports() {
+		supported.Add(id)
 	}
-	if cfg.ReportProcs {
-		caps = append(caps, capability.HostProcessRead)
-	}
-	if cfg.ReportConns {
-		caps = append(caps, capability.HostConnectionRead)
+	granted := cfg.Policy.Granted
+	effective := permission.EffectiveFrom(granted, supported)
+
+	guard := netguard.New(cfg.ProbeAccess, cfg.Policy.FullAccess)
+	hash := policyHash(cfg)
+	report := permission.PermissionReport{
+		Supported:  supported.Strings(),
+		Granted:    granted.Strings(),
+		Effective:  effective.Strings(),
+		Source:     string(cfg.Policy.Source),
+		PolicyHash: hash,
 	}
 
 	cred, enrolled, err := identity.LoadCredential(cfg.DataDir)
@@ -177,7 +217,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		// Build+sign the request, then run it through the injected Enroller (direct
 		// registry call in desktop) or the default HTTP POST (standalone).
-		req := enroll.BuildRequest(priv, token, hostname, runtime.GOOS, Version, caps)
+		req := enroll.BuildRequest(priv, token, hostname, runtime.GOOS, Version, report)
 		exchange := cfg.Enroller
 		if exchange == nil {
 			exchange = func(ctx context.Context, r protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
@@ -210,16 +250,51 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("open wal: %w", err)
 	}
 
-	gateway := collector.NewGatewayPingCollector(p)
-	publicPing := collector.NewPublicPingCollector(p)
-	iface := collector.NewInterfaceCollector(p)
-	dns := collector.NewDNSCollector()
-	httpc := collector.NewHTTPCollector()
-	tcpc := collector.NewTCPCollector()
-	natc := collector.NewNATCollector()
-	configurables := []conn.Configurable{gateway, publicPing, dns, httpc, tcpc, natc}
+	// Construct collectors gated by effective permissions. A denied collector is
+	// never built, so its OS/gopsutil operations are never invoked.
+	var configurables []conn.Configurable
+	var selfSched []collector.Collector
+	tracker := monitoreval.New(effective, granted, supported, guard, hash)
 
+	addProbe := func(c interface {
+		conn.Configurable
+		collector.Collector
+		SetMinInterval(time.Duration)
+	}) {
+		c.SetMinInterval(cfg.Limits.MinProbeInterval)
+		configurables = append(configurables, c)
+		selfSched = append(selfSched, c)
+	}
+	if effective.Has(permission.NetworkGatewayProbe) {
+		addProbe(collector.NewGatewayPingCollector(p, guard))
+	}
+	if effective.Has(permission.ProbeICMP) {
+		addProbe(collector.NewPublicPingCollector(p, guard))
+	}
+	if effective.Has(permission.ProbeDNS) {
+		addProbe(collector.NewDNSCollector(guard))
+	}
+	if effective.Has(permission.ProbeHTTP) {
+		addProbe(collector.NewHTTPCollector(guard, effective.Has(permission.ProbeHTTPExtended)))
+	}
+	if effective.Has(permission.ProbeTCP) {
+		addProbe(collector.NewTCPCollector(guard))
+	}
+	if effective.Has(permission.ProbeNAT) {
+		addProbe(collector.NewNATCollector(guard))
+	}
+
+	// The runtime-block sink routes collector policy blocks to the tracker and a
+	// later clean metric back to active.
 	sink := func(res collector.Result) {
+		for _, b := range res.Blocked {
+			tracker.RuntimeBlocked(b.MonitorID, b.Matched, b.Reason)
+		}
+		for _, m := range res.Metrics {
+			if m.MonitorID != "" {
+				tracker.RuntimeOK(m.MonitorID)
+			}
+		}
 		var snaps []telemetry.InterfaceSnapshot
 		if res.InterfaceSnapshot != nil {
 			snaps = []telemetry.InterfaceSnapshot{*res.InterfaceSnapshot}
@@ -234,24 +309,34 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	arp := collector.NewARPCollector(p)
-	tiered := []collector.Collector{iface, arp}
-	if cfg.ReportHost {
-		tiered = append(tiered, collector.NewHostMetricsCollector())
-		log.Print("host metrics reporting enabled")
+	// Tiered collectors: interface (status), ARP (neighbor), host metrics — each
+	// gated on its permission family.
+	var tiered []collector.Collector
+	if effective.Has(permission.NetIfaceStatusRead) {
+		tiered = append(tiered, collector.NewInterfaceCollector(
+			p,
+			effective.Has(permission.NetIfaceAddressRead),
+			effective.Has(permission.NetWiFiStatusRead),
+			effective.Has(permission.NetWiFiSSIDRead),
+		))
 	}
-	sched := scheduler.New(
-		tiered,
-		[]collector.Collector{gateway, publicPing, dns, httpc, tcpc, natc},
-		sink,
-	)
+	if effective.Has(permission.NetNeighborRead) {
+		tiered = append(tiered, collector.NewARPCollector(p, effective.Has(permission.NetNeighborHostRead)))
+	}
+	if hostMetricsEnabled(effective) {
+		tiered = append(tiered, collector.NewHostMetricsCollector(
+			effective.Has(permission.HostCPURead),
+			effective.Has(permission.HostMemoryRead),
+			effective.Has(permission.HostDiskRead),
+			effective.Has(permission.HostLoadRead),
+			effective.Has(permission.HostUptimeRead),
+			effective.Has(permission.HostNetworkIORead),
+		))
+	}
+	sched := scheduler.New(tiered, selfSched, sink)
 
 	// Ordered shutdown, in this exact order: cancel runCtx so the scheduler and
-	// heartbeat stop, join them, and only then close the WAL. conn.Run touches the
-	// WAL solely on its own goroutine and returns before this runs, so once these
-	// background writers are joined nothing can append to a closed store. A
-	// terminal session error returns from conn.Run WITHOUT cancelling runCtx, so
-	// the explicit cancel here (not a bare defer) is what stops the loops.
+	// heartbeat stop, join them, and only then close the WAL.
 	var hbWG sync.WaitGroup
 	defer func() {
 		cancel()
@@ -287,12 +372,9 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	capStrs := make([]string, len(caps))
-	for i, c := range caps {
-		capStrs[i] = string(c)
-	}
 	log.Printf("telemetry wire format: %s", subprotocol)
-	log.Printf("agent %s started (host=%s, platform=%s, caps=%v)", cred.AgentID, hostname, runtime.GOOS, p.Supports())
+	log.Printf("agent %s started (host=%s, platform=%s, source=%s, effective=%v)",
+		cred.AgentID, hostname, runtime.GOOS, cfg.Policy.Source, effective.Strings())
 
 	agentID := cred.AgentID
 	err = conn.Run(runCtx, conn.Options{
@@ -308,7 +390,7 @@ func Run(ctx context.Context, cfg Config) error {
 			Hostname:      hostname,
 			Platform:      runtime.GOOS,
 			AgentVersion:  Version,
-			Capabilities:  capStrs,
+			Permissions:   report,
 		},
 		OnSession: func(up bool) {
 			if up {
@@ -318,12 +400,16 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		},
 	}, conn.Deps{
-		Outbox:        outbox,
-		Configurables: configurables,
-		Scheduler:     sched,
-		DrainInterval: cfg.UploadInterval,
-		ReportProcs:   cfg.ReportProcs,
-		ReportConns:   cfg.ReportConns,
+		Outbox:              outbox,
+		Configurables:       configurables,
+		Scheduler:           sched,
+		DrainInterval:       cfg.UploadInterval,
+		Tracker:             tracker,
+		Effective:           effective,
+		Granted:             granted,
+		Supported:           supported,
+		SnapshotMinInterval: cfg.Limits.SnapshotMinInterval,
+		SnapshotTimeout:     cfg.Limits.SnapshotTimeout,
 	})
 
 	// On revocation the credential is dead; delete it here so re-running enrolls
@@ -353,4 +439,93 @@ func subprotocolFor(format string) (string, error) {
 	default:
 		return "", fmt.Errorf("wire format must be 'protobuf' or 'json', got %q", format)
 	}
+}
+
+// platformIndependentSupported returns the permissions that work on every OS via
+// the Go stdlib (DNS/HTTP/TCP/NAT probes) or the always-compiled gopsutil host
+// metric and process/connection snapshot collectors; the platform adds ICMP,
+// gateway, wifi, and neighbor support where implemented.
+func platformIndependentSupported() permission.Set {
+	return permission.NewSet(
+		// Active probes backed by the Go stdlib.
+		permission.ProbeDNS,
+		permission.ProbeHTTP,
+		permission.ProbeHTTPExtended,
+		permission.ProbeTCP,
+		permission.ProbeNAT,
+		// Host metrics — gopsutil cpu/mem/disk/load/host/net, compiled everywhere.
+		permission.HostCPURead,
+		permission.HostMemoryRead,
+		permission.HostDiskRead,
+		permission.HostLoadRead,
+		permission.HostUptimeRead,
+		permission.HostNetworkIORead,
+		// Process snapshot scopes — gopsutil/process, compiled everywhere.
+		permission.HostProcessBasicRead,
+		permission.HostProcessOwnerRead,
+		permission.HostProcessResourceRead,
+		permission.HostProcessIORead,
+		// Connection snapshot scopes — gopsutil/net, compiled everywhere.
+		permission.HostConnectionSummaryRead,
+		permission.HostConnectionLocalRead,
+		permission.HostConnectionRemoteRead,
+		permission.HostConnectionOwnerRead,
+	)
+}
+
+// hostMetricsEnabled reports whether any host.* metric family is effective.
+func hostMetricsEnabled(effective permission.Set) bool {
+	for _, id := range []permission.ID{
+		permission.HostCPURead, permission.HostMemoryRead, permission.HostDiskRead,
+		permission.HostLoadRead, permission.HostUptimeRead, permission.HostNetworkIORead,
+	} {
+		if effective.Has(id) {
+			return true
+		}
+	}
+	return false
+}
+
+// fillLimits substitutes DefaultLimits for any zero field.
+func fillLimits(l Limits) Limits {
+	d := DefaultLimits()
+	if l.MinProbeInterval <= 0 {
+		l.MinProbeInterval = d.MinProbeInterval
+	}
+	if l.MaxProbeConcurrency <= 0 {
+		l.MaxProbeConcurrency = d.MaxProbeConcurrency
+	}
+	if l.SnapshotMinInterval <= 0 {
+		l.SnapshotMinInterval = d.SnapshotMinInterval
+	}
+	if l.SnapshotTimeout <= 0 {
+		l.SnapshotTimeout = d.SnapshotTimeout
+	}
+	return l
+}
+
+// policyHash is the single computation site for the policy hash: SHA-256,
+// lowercase hex, over a versioned canonical preimage. The supported set (a
+// platform fact) is deliberately excluded. Selectors are canonicalized and
+// sorted (order is semantically irrelevant — deny always wins).
+func policyHash(cfg Config) string {
+	mode := string(cfg.ProbeAccess.Mode)
+	if cfg.Policy.FullAccess {
+		mode = "bypass"
+	}
+	limits := fillLimits(cfg.Limits)
+	var b strings.Builder
+	b.WriteString("nettact-agent-policy/v1\n")
+	b.WriteString("source=" + string(cfg.Policy.Source) + "\n")
+	b.WriteString("permissions=" + strings.Join(cfg.Policy.Granted.Strings(), ",") + "\n")
+	b.WriteString("probe_access.mode=" + mode + "\n")
+	b.WriteString("probe_access.allow=" + strings.Join(cfg.ProbeAccess.AllowStrings(), ",") + "\n")
+	b.WriteString("probe_access.deny=" + strings.Join(cfg.ProbeAccess.DenyStrings(), ",") + "\n")
+	b.WriteString("limits=" +
+		strconv.FormatInt(int64(limits.MinProbeInterval), 10) + "," +
+		strconv.Itoa(limits.MaxProbeConcurrency) + "," +
+		strconv.FormatInt(int64(limits.SnapshotMinInterval), 10) + "," +
+		strconv.FormatInt(int64(limits.SnapshotTimeout), 10) + "\n")
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
 }

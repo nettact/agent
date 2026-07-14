@@ -3,10 +3,11 @@ package collector
 import (
 	"context"
 	"net"
+	"net/netip"
 	"time"
 
+	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
-	"github.com/nettact/protocol/capability"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -24,13 +25,14 @@ import (
 // resolved IP and chosen interface travel in labels.
 type GatewayPingCollector struct {
 	p     platform.Platform
+	guard *netguard.Guard
 	sched *schedState
 }
 
-func NewGatewayPingCollector(p platform.Platform) *GatewayPingCollector {
+func NewGatewayPingCollector(p platform.Platform, guard *netguard.Guard) *GatewayPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &GatewayPingCollector{p: p, sched: newSchedState(10 * time.Second)}
+	return &GatewayPingCollector{p: p, guard: guard, sched: newSchedState(10 * time.Second)}
 }
 
 // SetTargets replaces the gateway target list from a DesiredState update.
@@ -45,10 +47,6 @@ func (c *GatewayPingCollector) SetTargets(targets []pcfg.ProbeTarget) {
 }
 
 func (c *GatewayPingCollector) Name() string { return "gateway_ping" }
-
-func (c *GatewayPingCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.ProbeICMP}
-}
 
 func (c *GatewayPingCollector) Tier() Tier { return TierBase }
 
@@ -78,6 +76,17 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 			continue
 		}
 
+		// The gateway must be an address the OS currently reports as a gateway, and
+		// must survive an explicit ip:/cidr: deny. The OS-supplied gateway otherwise
+		// bypasses scope denies (so a default scope:link-local deny does not break an
+		// fe80:: gateway). A block here is a target-policy block, not a ping failure.
+		if a, perr := netip.ParseAddr(gw); perr == nil {
+			if dec := c.guard.CheckGateway(a.Unmap(), c.osGateways()); !dec.Allowed {
+				res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, Matched: dec.Matched, Reason: "literal_denied"})
+				continue
+			}
+		}
+
 		loss, avgMs, received := pingCycle(ctx, c.p, gw, t.Params)
 		labels := gatewayLabels(gw, t.Params.Interface)
 		res.Metrics = append(res.Metrics,
@@ -102,6 +111,24 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 	return res, nil
 }
 
+// osGateways returns every gateway address the OS currently reports across all
+// interfaces, so CheckGateway can confirm the target is a real gateway.
+func (c *GatewayPingCollector) osGateways() []netip.Addr {
+	ifaces, err := c.p.Interfaces(platform.IfaceQuery{Gateways: true})
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, ifc := range ifaces {
+		for _, gw := range ifc.Gateways {
+			if a, perr := netip.ParseAddr(gw); perr == nil {
+				out = append(out, a.Unmap())
+			}
+		}
+	}
+	return out
+}
+
 // gatewayLabels builds the metric/event label set. The chosen interface is only
 // included when set (empty means "default NIC").
 func gatewayLabels(ip, iface string) map[string]string {
@@ -121,7 +148,7 @@ func gatewayLabels(ip, iface string) map[string]string {
 // gateway), it returns "" so the caller reports the gateway as unreachable
 // rather than silently probing a different NIC's gateway.
 func (c *GatewayPingCollector) gatewayFor(iface string) string {
-	ifaces, err := c.p.Interfaces()
+	ifaces, err := c.p.Interfaces(platform.IfaceQuery{Gateways: true})
 	if err != nil {
 		return ""
 	}
@@ -140,3 +167,6 @@ func (c *GatewayPingCollector) gatewayFor(iface string) string {
 	}
 	return ""
 }
+
+// SetMinInterval applies the local per-target probe-interval floor (stability limit).
+func (c *GatewayPingCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

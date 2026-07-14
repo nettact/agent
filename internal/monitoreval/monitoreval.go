@@ -1,0 +1,250 @@
+// Package monitoreval evaluates each server-pushed monitor against the agent's
+// effective permissions and target-access policy, producing the runnable subset
+// (handed to the collectors) and a full-state wire.MonitorStatus frame (sent to
+// the server, which derives operational issues from it). It also tracks runtime
+// target-policy transitions (a hostname that flips from allowed to denied, a
+// denied redirect, a recovery) reported by the collectors.
+//
+// The tracker is owned by the agent runtime and driven from the session
+// goroutine, so its state is single-writer and needs no locking beyond the
+// runtime-transition path (which is fed from collector goroutines).
+package monitoreval
+
+import (
+	"net"
+	"net/netip"
+	"net/url"
+	"strings"
+	"sync"
+
+	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
+	"github.com/nettact/protocol/wire"
+)
+
+// Tracker holds the immutable policy views plus the latest evaluated state.
+type Tracker struct {
+	effective  permission.Set
+	granted    permission.Set
+	supported  permission.Set
+	guard      *netguard.Guard
+	policyHash string
+
+	mu            sync.Mutex
+	configVersion int
+	base          map[string]wire.MonitorStatusEntry // static evaluation per monitor
+	runtime       map[string]wire.MonitorStatusEntry // runtime override per monitor
+	order         []string                           // monitor ids in push order
+
+	updates chan wire.MonitorStatus // cap-1 latest-wins
+}
+
+// New builds a Tracker.
+func New(effective, granted, supported permission.Set, guard *netguard.Guard, policyHash string) *Tracker {
+	return &Tracker{
+		effective:  effective,
+		granted:    granted,
+		supported:  supported,
+		guard:      guard,
+		policyHash: policyHash,
+		base:       map[string]wire.MonitorStatusEntry{},
+		runtime:    map[string]wire.MonitorStatusEntry{},
+		updates:    make(chan wire.MonitorStatus, 1),
+	}
+}
+
+// Updates is the cap-1 latest-wins channel the session goroutine selects on to
+// forward a runtime-transition frame to the server.
+func (t *Tracker) Updates() <-chan wire.MonitorStatus { return t.updates }
+
+// ApplyDesired evaluates every target for a new DesiredState version. It returns
+// the runnable subset (status active) and the full-state MonitorStatus frame.
+// Statically blocked monitors are excluded from the runnable set so they are
+// never scheduled — no synthetic failure metric is ever produced for them.
+func (t *Tracker) ApplyDesired(configVersion int, targets []config.ProbeTarget) ([]config.ProbeTarget, wire.MonitorStatus) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.configVersion = configVersion
+	t.base = map[string]wire.MonitorStatusEntry{}
+	t.runtime = map[string]wire.MonitorStatusEntry{}
+	t.order = t.order[:0]
+
+	var runnable []config.ProbeTarget
+	for _, tgt := range targets {
+		if tgt.MonitorID == "" {
+			// Only user-created monitors have ids and thus a reportable status.
+			runnable = append(runnable, tgt)
+			continue
+		}
+		entry := t.evaluate(tgt)
+		t.base[tgt.MonitorID] = entry
+		t.order = append(t.order, tgt.MonitorID)
+		if entry.Status == wire.MonitorStatusActive {
+			runnable = append(runnable, tgt)
+		}
+	}
+	return runnable, t.frameLocked()
+}
+
+// evaluate computes a monitor's static status: permission first, then target
+// policy. All missing granted-but-unsupported permissions yield unsupported;
+// otherwise any missing permission yields permission_blocked (combined into one
+// entry). A literal-IP or hostname destination denied by policy yields
+// target_blocked.
+func (t *Tracker) evaluate(tgt config.ProbeTarget) wire.MonitorStatusEntry {
+	entry := wire.MonitorStatusEntry{MonitorID: tgt.MonitorID, Status: wire.MonitorStatusActive}
+
+	var missing, unsupported []string
+	for _, id := range permission.RequiredForTarget(tgt) {
+		if t.effective.Has(id) {
+			continue
+		}
+		if t.granted.Has(id) && !t.supported.Has(id) {
+			unsupported = append(unsupported, string(id))
+		} else {
+			missing = append(missing, string(id))
+		}
+	}
+	if len(missing) > 0 {
+		entry.Status = wire.MonitorStatusPermissionBlocked
+		entry.MissingPermissions = missing
+		return entry
+	}
+	if len(unsupported) > 0 {
+		entry.Status = wire.MonitorStatusUnsupported
+		entry.MissingPermissions = unsupported
+		return entry
+	}
+
+	// Target policy (static): literal-IP destination fully checked; hostname
+	// destination checked for a conclusive deny. Runtime resolution catches a
+	// name that resolves into a denied address later.
+	host := staticHost(tgt)
+	if host == "" {
+		return entry
+	}
+	if a, err := netip.ParseAddr(host); err == nil {
+		if dec := t.guard.CheckAddr(a.Unmap()); !dec.Allowed {
+			entry.Status = wire.MonitorStatusTargetBlocked
+			entry.MatchedSelector = dec.Matched
+			entry.Reason = "literal_denied"
+		}
+		return entry
+	}
+	if hd := t.guard.CheckHost(host); hd.Denied {
+		entry.Status = wire.MonitorStatusTargetBlocked
+		entry.MatchedSelector = hd.Matched
+		entry.Reason = "literal_denied"
+	}
+	return entry
+}
+
+// RuntimeBlocked records a runtime target-policy block for a monitor and pushes
+// an updated full-state frame. A monitor already statically blocked is left as
+// is (the static block is authoritative for scheduling).
+func (t *Tracker) RuntimeBlocked(monitorID, matched, reason string) {
+	t.mu.Lock()
+	if _, tracked := t.base[monitorID]; !tracked {
+		t.mu.Unlock()
+		return
+	}
+	cur := t.runtime[monitorID]
+	if cur.Status == wire.MonitorStatusTargetBlocked && cur.MatchedSelector == matched && cur.Reason == reason {
+		t.mu.Unlock()
+		return // no change
+	}
+	t.runtime[monitorID] = wire.MonitorStatusEntry{
+		MonitorID: monitorID, Status: wire.MonitorStatusTargetBlocked,
+		MatchedSelector: matched, Reason: reason,
+	}
+	frame := t.frameLocked()
+	t.mu.Unlock()
+	t.push(frame)
+}
+
+// RuntimeOK clears a runtime block for a monitor (a later clean dial) and pushes
+// an updated frame if the state changed.
+func (t *Tracker) RuntimeOK(monitorID string) {
+	t.mu.Lock()
+	if _, had := t.runtime[monitorID]; !had {
+		t.mu.Unlock()
+		return
+	}
+	delete(t.runtime, monitorID)
+	frame := t.frameLocked()
+	t.mu.Unlock()
+	t.push(frame)
+}
+
+// frameLocked builds the full-state frame from base+runtime. Caller holds mu.
+func (t *Tracker) frameLocked() wire.MonitorStatus {
+	statuses := make([]wire.MonitorStatusEntry, 0, len(t.order))
+	for _, id := range t.order {
+		if rt, ok := t.runtime[id]; ok && t.base[id].Status == wire.MonitorStatusActive {
+			// A runtime block only overrides an otherwise-active monitor.
+			statuses = append(statuses, rt)
+			continue
+		}
+		statuses = append(statuses, t.base[id])
+	}
+	return wire.MonitorStatus{ConfigVersion: t.configVersion, PolicyHash: t.policyHash, Statuses: statuses}
+}
+
+// push writes the latest frame to the cap-1 channel, dropping any stale pending
+// frame (latest-wins).
+func (t *Tracker) push(frame wire.MonitorStatus) {
+	for {
+		select {
+		case t.updates <- frame:
+			return
+		default:
+			select {
+			case <-t.updates:
+			default:
+				return
+			}
+		}
+	}
+}
+
+// staticHost returns the destination host to statically check for a target, or
+// "" to skip (e.g. a DNS queried name is not itself dialed; the gateway is an
+// OS-supplied IP checked at runtime).
+func staticHost(tgt config.ProbeTarget) string {
+	switch tgt.Kind {
+	case "http":
+		if u, err := url.Parse(tgt.Target); err == nil && u.Hostname() != "" {
+			return u.Hostname()
+		}
+		return ""
+	case "icmp", "tcp":
+		return hostOnly(tgt.Target)
+	case "nat":
+		return hostOnly(tgt.Target)
+	case "dns":
+		// The queried name is not dialed by the DNS probe; a custom literal-IP
+		// resolver is what would be dialed.
+		if tgt.Params.ResolverServer != "" {
+			return hostOnly(tgt.Params.ResolverServer)
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+// hostOnly strips a :port suffix and any URL scheme from a target string.
+func hostOnly(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "://"); i >= 0 {
+		if u, err := url.Parse(s); err == nil && u.Hostname() != "" {
+			return u.Hostname()
+		}
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		return h
+	}
+	return s
+}

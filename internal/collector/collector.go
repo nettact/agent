@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nettact/protocol/capability"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -24,6 +23,17 @@ const (
 	TierBurst   Tier = "burst"   // event-driven diagnostic escalation
 )
 
+// BlockedProbe is one monitor whose probe was refused at runtime by the target-
+// access policy (e.g. a hostname that resolved to a denied address, a denied
+// redirect hop). It carries no metric/event — the runtime routes it to the
+// monitor-status tracker so the block surfaces as an operational issue, not a
+// synthetic probe failure.
+type BlockedProbe struct {
+	MonitorID string
+	Matched   string // matched selector (never a newly-resolved private address)
+	Reason    string // resolved_denied | redirect_denied | literal_denied
+}
+
 // Result is what one Collect run produces.
 type Result struct {
 	Metrics   []telemetry.Metric
@@ -33,12 +43,13 @@ type Result struct {
 	// (interface collector only; nil for other collectors). It replaces the old
 	// per-interface inventory delta.
 	InterfaceSnapshot *telemetry.InterfaceSnapshot
+	// Blocked lists monitors refused by target-access policy this round.
+	Blocked []BlockedProbe
 }
 
 // Collector is a single monitoring probe.
 type Collector interface {
 	Name() string
-	Capabilities() []capability.Capability
 	Tier() Tier
 	Collect(ctx context.Context) (Result, error)
 }
@@ -48,14 +59,22 @@ type Collector interface {
 // target sets no interval_seconds). Used by the self-scheduling collectors
 // (public ping / DNS / HTTP) which the agent drives on a fine-grained tick.
 type schedState struct {
-	mu       sync.Mutex
-	targets  []pcfg.ProbeTarget
-	nextDue  map[string]time.Time
-	fallback time.Duration
+	mu          sync.Mutex
+	targets     []pcfg.ProbeTarget
+	nextDue     map[string]time.Time
+	fallback    time.Duration
+	minInterval time.Duration // per-target interval floor (stability limit); 0 = no floor
 }
 
 func newSchedState(fallback time.Duration) *schedState {
 	return &schedState{nextDue: map[string]time.Time{}, fallback: fallback}
+}
+
+// SetMinInterval sets the per-target interval floor (a local stability limit).
+func (s *schedState) SetMinInterval(d time.Duration) {
+	s.mu.Lock()
+	s.minInterval = d
+	s.mu.Unlock()
 }
 
 // schedKey uniquely identifies a probe within a collector. The monitor id leads:
@@ -101,6 +120,9 @@ func (s *schedState) due(now time.Time) []pcfg.ProbeTarget {
 		iv := s.fallback
 		if t.Params.IntervalSeconds > 0 {
 			iv = time.Duration(t.Params.IntervalSeconds) * time.Second
+		}
+		if s.minInterval > 0 && iv < s.minInterval {
+			iv = s.minInterval
 		}
 		s.nextDue[k] = now.Add(iv)
 	}

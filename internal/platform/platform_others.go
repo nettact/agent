@@ -7,7 +7,7 @@ import (
 	"errors"
 	"net"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // genericPlatform is a stdlib-only fallback so the agent cross-compiles for
@@ -17,15 +17,18 @@ type genericPlatform struct{}
 
 func newPlatform() Platform { return genericPlatform{} }
 
-func (genericPlatform) Supports() []capability.Capability {
-	caps := []capability.Capability{capability.NetIfaceRead}
-	if c := wifiCapability(); c != "" {
-		caps = append(caps, c)
+func (genericPlatform) Supports() permission.Set {
+	s := permission.NewSet(
+		permission.NetIfaceStatusRead,
+		permission.NetIfaceAddressRead,
+	)
+	for _, id := range wifiPermissions() {
+		s.Add(id)
 	}
-	return caps
+	return s
 }
 
-func (genericPlatform) Interfaces() ([]IfaceInfo, error) {
+func (genericPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -39,9 +42,13 @@ func (genericPlatform) Interfaces() ([]IfaceInfo, error) {
 			IsLoopback: ifc.Flags&net.FlagLoopback != 0,
 			IsWireless: ifaceIsWireless(ifc.Name),
 		}
-		addrs, _ := ifc.Addrs()
-		for _, a := range addrs {
-			info.Addrs = append(info.Addrs, a.String())
+		// Read unicast addresses only when requested — otherwise the per-interface
+		// address syscall is never invoked for a denied scope.
+		if q.Addrs {
+			addrs, _ := ifc.Addrs()
+			for _, a := range addrs {
+				info.Addrs = append(info.Addrs, a.String())
+			}
 		}
 		out = append(out, info)
 	}

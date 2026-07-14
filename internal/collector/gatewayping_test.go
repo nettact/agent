@@ -5,9 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/agent/probepolicy"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
 
@@ -21,7 +23,9 @@ type gwTestPlatform struct {
 	recv   func(seq int) bool
 }
 
-func (p *gwTestPlatform) Interfaces() ([]platform.IfaceInfo, error) { return p.ifaces, nil }
+func (p *gwTestPlatform) Interfaces(platform.IfaceQuery) ([]platform.IfaceInfo, error) {
+	return p.ifaces, nil
+}
 func (p *gwTestPlatform) Ping(_ context.Context, target string, _ platform.PingOptions) (platform.PingResult, error) {
 	seq := p.pings
 	p.pings++
@@ -30,8 +34,8 @@ func (p *gwTestPlatform) Ping(_ context.Context, target string, _ platform.PingO
 	return platform.PingResult{Target: target, RTT: 3 * time.Millisecond, Received: received}, nil
 }
 func (p *gwTestPlatform) Neighbors() ([]platform.Neighbor, error) { return nil, nil }
-func (p *gwTestPlatform) WiFi() platform.WiFiResult               { return platform.WiFiResult{State: "ok"} }
-func (p *gwTestPlatform) Supports() []capability.Capability       { return nil }
+func (p *gwTestPlatform) WiFi(includeSSID bool) platform.WiFiResult { return platform.WiFiResult{State: "ok"} }
+func (p *gwTestPlatform) Supports() permission.Set                { return nil }
 
 func gwTestIfaces() []platform.IfaceInfo {
 	return []platform.IfaceInfo{
@@ -53,7 +57,7 @@ func lossPct(res Result) float64 {
 
 func TestGatewayCollectorNamedInterface(t *testing.T) {
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p)
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "wlan0"}},
 	})
@@ -80,7 +84,7 @@ func TestGatewayCollectorNamedInterface(t *testing.T) {
 
 func TestGatewayCollectorDefaultInterface(t *testing.T) {
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p)
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway"},
 	})
@@ -95,7 +99,7 @@ func TestGatewayCollectorDefaultInterface(t *testing.T) {
 
 func TestGatewayCollectorUnknownInterface(t *testing.T) {
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p)
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "does-not-exist"}},
 	})
@@ -117,7 +121,7 @@ func TestGatewayCollectorUnknownInterface(t *testing.T) {
 func TestGatewayCollectorHonorsPacketCount(t *testing.T) {
 	// 4 echoes, every other one lost → 2/4 received → 50% loss.
 	p := &gwTestPlatform{ifaces: gwTestIfaces(), recv: func(seq int) bool { return seq%2 == 0 }}
-	c := NewGatewayPingCollector(p)
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "eth0", PacketCount: 4}},
 	})
@@ -135,7 +139,7 @@ func TestGatewayCollectorHonorsPacketCount(t *testing.T) {
 
 func TestGatewayCollectorIgnoresNonGatewayKinds(t *testing.T) {
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p)
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "p1", Kind: "icmp", Target: "1.1.1.1"},
 	})

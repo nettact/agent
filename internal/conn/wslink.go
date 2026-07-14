@@ -107,7 +107,7 @@ func wsDialer(opts Options) (wire.Dialer, error) {
 	}, nil
 }
 
-// deriveWSURL maps the --server base URL onto the WebSocket endpoint.
+// deriveWSURL maps the configured server base URL onto the WebSocket endpoint.
 func deriveWSURL(server string) (string, error) {
 	u, err := url.Parse(server)
 	if err != nil {

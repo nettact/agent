@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nettact/protocol/capability"
 	"github.com/nettact/protocol/telemetry"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -18,39 +17,43 @@ import (
 
 // HostMetricsCollector reports this machine's own CPU / memory / disk / load /
 // uptime / network-I/O as ordinary time-series metrics (LayerLocal), modeled on
-// the NeoHtop dashboard. It is registered only when the agent is started with
-// --report-host; without that flag no host.* metric is ever produced, so the
-// server can never obtain host state from a non-opted-in agent.
+// the NeoHtop dashboard. Each metric family is gated on its own permission
+// (host.cpu.read, host.memory.read, …); a denied family invokes no gopsutil
+// operation and emits nothing.
 //
 // CPU utilization is measured as the delta since the previous Collect (interval
 // 0 in gopsutil), which fits the regular scheduler tier. Network rates are
 // computed from the byte-counter delta between successive Collects.
 type HostMetricsCollector struct {
+	cpu, mem, disk, load, uptime, netio bool
+
 	lastNetRx uint64
 	lastNetTx uint64
 	lastNetAt time.Time
 	primed    bool
 }
 
-func NewHostMetricsCollector() *HostMetricsCollector {
-	c := &HostMetricsCollector{}
+// NewHostMetricsCollector builds the collector with each metric family gated on
+// its permission. Only granted families are ever sampled.
+func NewHostMetricsCollector(cpuOn, memOn, diskOn, loadOn, uptimeOn, netioOn bool) *HostMetricsCollector {
+	c := &HostMetricsCollector{cpu: cpuOn, mem: memOn, disk: diskOn, load: loadOn, uptime: uptimeOn, netio: netioOn}
 	// Prime CPU baselines so the first real Collect reports a delta, not a
 	// since-boot average. Errors here are non-fatal.
-	_, _ = cpu.Percent(0, false)
-	_, _ = cpu.Percent(0, true)
-	if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
-		c.lastNetRx = io[0].BytesRecv
-		c.lastNetTx = io[0].BytesSent
-		c.lastNetAt = time.Now()
+	if cpuOn {
+		_, _ = cpu.Percent(0, false)
+		_, _ = cpu.Percent(0, true)
+	}
+	if netioOn {
+		if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
+			c.lastNetRx = io[0].BytesRecv
+			c.lastNetTx = io[0].BytesSent
+			c.lastNetAt = time.Now()
+		}
 	}
 	return c
 }
 
 func (c *HostMetricsCollector) Name() string { return "host" }
-
-func (c *HostMetricsCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.HostStatRead}
-}
 
 func (c *HostMetricsCollector) Tier() Tier { return TierRegular }
 
@@ -68,66 +71,78 @@ func (c *HostMetricsCollector) Collect(ctx context.Context) (Result, error) {
 	}
 
 	// CPU: overall (target "host") + per-core (target "core0", "core1", …).
-	if pcts, err := cpu.Percent(0, false); err == nil && len(pcts) > 0 {
-		add(telemetry.HostCPUPct, "host", pcts[0], telemetry.UnitPct)
-	}
-	if pcts, err := cpu.Percent(0, true); err == nil {
-		for i, p := range pcts {
-			add(telemetry.HostCPUCorePct, "core"+strconv.Itoa(i), p, telemetry.UnitPct)
+	if c.cpu {
+		if pcts, err := cpu.Percent(0, false); err == nil && len(pcts) > 0 {
+			add(telemetry.HostCPUPct, "host", pcts[0], telemetry.UnitPct)
+		}
+		if pcts, err := cpu.Percent(0, true); err == nil {
+			for i, p := range pcts {
+				add(telemetry.HostCPUCorePct, "core"+strconv.Itoa(i), p, telemetry.UnitPct)
+			}
 		}
 	}
 
 	// Memory.
-	if vm, err := mem.VirtualMemory(); err == nil {
-		add(telemetry.HostMemPct, "host", vm.UsedPercent, telemetry.UnitPct)
-		add(telemetry.HostMemTotal, "host", float64(vm.Total), telemetry.UnitBytes)
-		add(telemetry.HostMemUsed, "host", float64(vm.Used), telemetry.UnitBytes)
-		add(telemetry.HostMemFree, "host", float64(vm.Available), telemetry.UnitBytes)
+	if c.mem {
+		if vm, err := mem.VirtualMemory(); err == nil {
+			add(telemetry.HostMemPct, "host", vm.UsedPercent, telemetry.UnitPct)
+			add(telemetry.HostMemTotal, "host", float64(vm.Total), telemetry.UnitBytes)
+			add(telemetry.HostMemUsed, "host", float64(vm.Used), telemetry.UnitBytes)
+			add(telemetry.HostMemFree, "host", float64(vm.Available), telemetry.UnitBytes)
+		}
 	}
 
 	// Disk: one series per physical mount (Target = mountpoint).
-	if parts, err := disk.Partitions(false); err == nil {
-		for _, pt := range parts {
-			us, err := disk.Usage(pt.Mountpoint)
-			if err != nil || us.Total == 0 {
-				continue
+	if c.disk {
+		if parts, err := disk.Partitions(false); err == nil {
+			for _, pt := range parts {
+				us, err := disk.Usage(pt.Mountpoint)
+				if err != nil || us.Total == 0 {
+					continue
+				}
+				mp := pt.Mountpoint
+				add(telemetry.HostDiskPct, mp, us.UsedPercent, telemetry.UnitPct)
+				add(telemetry.HostDiskTotal, mp, float64(us.Total), telemetry.UnitBytes)
+				add(telemetry.HostDiskUsed, mp, float64(us.Used), telemetry.UnitBytes)
+				add(telemetry.HostDiskFree, mp, float64(us.Free), telemetry.UnitBytes)
 			}
-			mp := pt.Mountpoint
-			add(telemetry.HostDiskPct, mp, us.UsedPercent, telemetry.UnitPct)
-			add(telemetry.HostDiskTotal, mp, float64(us.Total), telemetry.UnitBytes)
-			add(telemetry.HostDiskUsed, mp, float64(us.Used), telemetry.UnitBytes)
-			add(telemetry.HostDiskFree, mp, float64(us.Free), telemetry.UnitBytes)
 		}
 	}
 
 	// Load average. On Windows gopsutil synthesizes this from the processor
 	// queue length and reads ~0 until it has samples; skip on error.
-	if avg, err := load.Avg(); err == nil {
-		add(telemetry.HostLoad1, "host", avg.Load1, telemetry.UnitLoad)
-		add(telemetry.HostLoad5, "host", avg.Load5, telemetry.UnitLoad)
-		add(telemetry.HostLoad15, "host", avg.Load15, telemetry.UnitLoad)
+	if c.load {
+		if avg, err := load.Avg(); err == nil {
+			add(telemetry.HostLoad1, "host", avg.Load1, telemetry.UnitLoad)
+			add(telemetry.HostLoad5, "host", avg.Load5, telemetry.UnitLoad)
+			add(telemetry.HostLoad15, "host", avg.Load15, telemetry.UnitLoad)
+		}
 	}
 
 	// Uptime.
-	if up, err := pshostUptime(ctx); err == nil {
-		add(telemetry.HostUptime, "host", float64(up), telemetry.UnitSec)
+	if c.uptime {
+		if up, err := pshostUptime(ctx); err == nil {
+			add(telemetry.HostUptime, "host", float64(up), telemetry.UnitSec)
+		}
 	}
 
 	// Network I/O rate (bytes/s) from the aggregate counter delta.
-	if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
-		if c.primed || !c.lastNetAt.IsZero() {
-			elapsed := time.Since(c.lastNetAt).Seconds()
-			if elapsed > 0 {
-				rx := deltaRate(io[0].BytesRecv, c.lastNetRx, elapsed)
-				tx := deltaRate(io[0].BytesSent, c.lastNetTx, elapsed)
-				add(telemetry.HostNetRxBps, "host", rx, telemetry.UnitBps)
-				add(telemetry.HostNetTxBps, "host", tx, telemetry.UnitBps)
+	if c.netio {
+		if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
+			if c.primed || !c.lastNetAt.IsZero() {
+				elapsed := time.Since(c.lastNetAt).Seconds()
+				if elapsed > 0 {
+					rx := deltaRate(io[0].BytesRecv, c.lastNetRx, elapsed)
+					tx := deltaRate(io[0].BytesSent, c.lastNetTx, elapsed)
+					add(telemetry.HostNetRxBps, "host", rx, telemetry.UnitBps)
+					add(telemetry.HostNetTxBps, "host", tx, telemetry.UnitBps)
+				}
 			}
+			c.lastNetRx = io[0].BytesRecv
+			c.lastNetTx = io[0].BytesSent
+			c.lastNetAt = time.Now()
+			c.primed = true
 		}
-		c.lastNetRx = io[0].BytesRecv
-		c.lastNetTx = io[0].BytesSent
-		c.lastNetAt = time.Now()
-		c.primed = true
 	}
 
 	return res, nil

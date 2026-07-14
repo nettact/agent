@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/agent/internal/netguard"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
 
@@ -32,6 +34,12 @@ var errTooManyRedirects = errors.New("too many redirects")
 // schedule via schedState.
 type HTTPCollector struct {
 	sched *schedState
+	guard *netguard.Guard
+
+	// allowExtended is whether probe.http.extended is effective, so a defensive
+	// re-check at request-build time never sends a non-basic request the monitor
+	// evaluator would have blocked.
+	allowExtended bool
 
 	// clients caches an *http.Client per (ignoreTLS, maxRedirects) policy so we do
 	// not build a new TLS transport on every probe. Access is guarded by mu.
@@ -39,10 +47,12 @@ type HTTPCollector struct {
 	clients map[string]*http.Client
 }
 
-func NewHTTPCollector() *HTTPCollector {
+func NewHTTPCollector(guard *netguard.Guard, allowExtended bool) *HTTPCollector {
 	return &HTTPCollector{
-		sched:   newSchedState(30 * time.Second),
-		clients: map[string]*http.Client{},
+		sched:         newSchedState(30 * time.Second),
+		guard:         guard,
+		allowExtended: allowExtended,
+		clients:       map[string]*http.Client{},
 	}
 }
 
@@ -58,10 +68,6 @@ func (c *HTTPCollector) SetTargets(targets []pcfg.ProbeTarget) {
 
 func (c *HTTPCollector) Name() string { return "http" }
 
-func (c *HTTPCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.ProbeHTTP}
-}
-
 func (c *HTTPCollector) Tier() Tier { return TierRegular }
 
 // clientFor returns a cached client honoring the target's TLS-verification and
@@ -74,35 +80,74 @@ func (c *HTTPCollector) clientFor(ignoreTLS bool, maxRedirects int) *http.Client
 	if cl, ok := c.clients[key]; ok {
 		return cl
 	}
-	// Clone the default transport so proxy support (ProxyFromEnvironment) and the
-	// stdlib dial/timeout defaults are preserved; only override TLS verification.
-	// No client-level Timeout: each request is bounded by its own per-target
-	// context timeout, so a configured TimeoutMs above the default is honored.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// Build a fresh transport with the environment proxy DISABLED and every dial
+	// routed through the guard, so a cloned default transport can never dial an
+	// allowed proxy that relays to a denied destination. The guard pins the vetted
+	// IP; SNI/verification stay against the original host (ServerName defaults to
+	// the request URL host). No client-level Timeout: each request is bounded by
+	// its own per-target context timeout.
+	tr := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           c.guard.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 	if ignoreTLS {
-		if tr.TLSClientConfig == nil {
-			tr.TLSClientConfig = &tls.Config{}
-		}
-		tr.TLSClientConfig.InsecureSkipVerify = true
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // opt-in via ignore_tls
 	}
 	cl := &http.Client{Transport: tr}
+	// CheckRedirect classifies every redirect hop's host through the guard (a
+	// denied hop is refused even though the dial would already block it) and keeps
+	// the max-redirects accounting. maxRedirects 0 means "library default": Go's
+	// stdlib caps an unconfigured chain at 10, so we reproduce that cap here (a
+	// custom CheckRedirect otherwise disables the stdlib default and would follow
+	// indefinitely until the context expires).
+	base := func(_ *http.Request, via []*http.Request) error {
+		limit := maxRedirects
+		if limit == 0 {
+			limit = 10
+		}
+		if len(via) > limit {
+			return errTooManyRedirects
+		}
+		return nil
+	}
 	switch {
 	case maxRedirects < 0:
 		cl.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	case maxRedirects > 0:
-		// via holds the requests already made; on the Nth redirect len(via)==N.
-		// Allow up to maxRedirects hops. Exceeding the limit is a real error (not
-		// ErrUseLastResponse) so Client.Do fails and the probe is marked down,
-		// rather than silently reporting the intermediate 3xx as success.
-		cl.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
-			if len(via) > maxRedirects {
-				return errTooManyRedirects
+	default:
+		cl.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if err := c.classifyRedirect(req); err != nil {
+				return err
 			}
-			return nil
+			return base(req, via)
 		}
 	}
 	c.clients[key] = cl
 	return cl
+}
+
+// classifyRedirect refuses a redirect whose host the policy denies, before the
+// transport dials it. Deny is conclusive; a resolvable-but-authorized host is
+// vetted at dial time by the guard.
+func (c *HTTPCollector) classifyRedirect(req *http.Request) error {
+	host := req.URL.Hostname()
+	if host == "" {
+		return nil
+	}
+	if a, err := netip.ParseAddr(host); err == nil {
+		if dec := c.guard.CheckAddr(a.Unmap()); !dec.Allowed {
+			return &netguard.BlockedError{Target: host, Matched: dec.Matched}
+		}
+		return nil
+	}
+	if hd := c.guard.CheckHost(host); hd.Denied {
+		return &netguard.BlockedError{Target: host, Matched: hd.Matched}
+	}
+	return nil
 }
 
 func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
@@ -114,6 +159,13 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
+		// Defensive re-check: a non-basic HTTP request requires probe.http.extended.
+		// The monitor evaluator already excludes such targets when the permission is
+		// absent, so this only fires on a policy/eval drift — skip silently, never a
+		// metric.
+		if !c.allowExtended && httpParamsNeedExtended(t.Params) {
+			continue
+		}
 		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
 		if timeout <= 0 {
 			timeout = 10 * time.Second
@@ -124,7 +176,11 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		}
 
 		var bodyReader io.Reader
-		if t.Params.Body != "" && method != http.MethodGet && method != http.MethodHead {
+		if t.Params.Body != "" {
+			// Any request body requires probe.http.extended, so reaching here means it
+			// is authorized (the defensive check above skips otherwise). Send it as
+			// configured for every method, including GET/HEAD, rather than silently
+			// dropping it.
 			bodyReader = strings.NewReader(t.Params.Body)
 		}
 
@@ -150,6 +206,14 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		lat := float64(time.Since(t0).Microseconds()) / 1000.0
 		if err != nil {
 			cancel()
+			// A policy block (denied target, denied redirect hop, or a hostname that
+			// resolved to a denied address) is NOT a probe failure: emit no metric or
+			// event, and route the block to the monitor-status tracker.
+			var be *netguard.BlockedError
+			if errors.As(err, &be) {
+				res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+				continue
+			}
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,
 				MonitorID: t.MonitorID,
@@ -191,6 +255,36 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 	return res, nil
 }
 
+// httpParamsNeedExtended mirrors permission.RequiredForTarget's HTTP rule: a
+// non-GET/HEAD method, a body, or any non-allowlisted header requires
+// probe.http.extended.
+func httpParamsNeedExtended(p pcfg.ProbeParams) bool {
+	switch strings.ToUpper(strings.TrimSpace(p.Method)) {
+	case "", "GET", "HEAD":
+	default:
+		return true
+	}
+	if p.Body != "" {
+		return true
+	}
+	for name := range p.Headers {
+		if !permission.BasicHTTPHeaderAllowed(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedFromErr builds a BlockedProbe from a policy block, choosing a reason
+// that distinguishes a resolved/redirect block from a literal-IP block.
+func blockedFromErr(monitorID string, be *netguard.BlockedError) BlockedProbe {
+	reason := "literal_denied"
+	if be.FromResolve {
+		reason = "resolved_denied"
+	}
+	return BlockedProbe{MonitorID: monitorID, Matched: be.Matched, Reason: reason}
+}
+
 // statusAccepted decides whether an HTTP status counts as up. Precedence:
 //  1. accepted (CSV of codes/ranges, e.g. "200-299,301") when non-empty;
 //  2. expected (legacy single exact code) when > 0;
@@ -222,3 +316,6 @@ func statusAccepted(status int, accepted string, expected int) bool {
 	}
 	return status >= 200 && status < 400
 }
+
+// SetMinInterval applies the local per-target probe-interval floor (stability limit).
+func (c *HTTPCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

@@ -12,7 +12,7 @@ import (
 	"github.com/ebitengine/purego"
 	"github.com/ebitengine/purego/objc"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/protocol/permission"
 )
 
 // macOS Wi-Fi status via a thin read-only CoreWLAN bridge over purego/objc
@@ -25,7 +25,9 @@ import (
 // withholds the SSID we report connected + reason=permission and keep every
 // other readable field.
 
-func wifiCapability() capability.Capability { return capability.NetWiFiRead }
+func wifiPermissions() []permission.ID {
+	return []permission.ID{permission.NetWiFiStatusRead, permission.NetWiFiSSIDRead}
+}
 
 // On macOS a netdev is marked wireless during snapshot assembly when a CoreWLAN
 // adapter name matches it (the join in the collector), not via a per-name hook.
@@ -50,20 +52,20 @@ type cwAdapter struct {
 
 // cwClient is the fake-able CoreWLAN seam.
 type cwClient interface {
-	adapters() ([]cwAdapter, error)
+	adapters(includeSSID bool) ([]cwAdapter, error)
 }
 
 // newCWClient is a package var so tests can substitute a fake without CoreWLAN.
 var newCWClient = func() (cwClient, error) { return openCoreWLAN() }
 
-func (genericPlatform) WiFi() WiFiResult {
+func (genericPlatform) WiFi(includeSSID bool) WiFiResult {
 	cl, err := newCWClient()
 	if err != nil {
 		// dlopen / class-resolution / shared-client failure — the subsystem is
 		// unreadable; never misreported as "no adapter".
 		return WiFiResult{State: "unreadable", Reason: "driver"}
 	}
-	ads, err := cl.adapters()
+	ads, err := cl.adapters(includeSSID)
 	if err != nil {
 		return WiFiResult{State: "unreadable", Reason: "driver"}
 	}
@@ -207,7 +209,7 @@ func openCoreWLAN() (cwClient, error) {
 // Results are copied into Go-owned values before the pool is drained, so nothing
 // dangles. Thread pinning keeps the pool push/pop on the same thread (pools are
 // thread-local) and the pop/unlock run on every return path via defer.
-func (c *coreWLANClient) adapters() ([]cwAdapter, error) {
+func (c *coreWLANClient) adapters(includeSSID bool) ([]cwAdapter, error) {
 	cw := c.cw
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -229,9 +231,14 @@ func (c *coreWLANClient) adapters() ([]cwAdapter, error) {
 			Name:      nsStringToGo(iface.Send(cw.sel.name), cw.sel.utf8),
 			PoweredOn: objc.Send[bool](iface, cw.sel.powerOn),
 		}
-		if ssid := iface.Send(cw.sel.ssid); ssid != 0 {
-			a.SSID = nsStringToGo(ssid, cw.sel.utf8)
-			a.SSIDKnown = true
+		// The SSID is read from the OS only when network.wifi.ssid.read is granted;
+		// otherwise it is never queried (no read-then-redact). SSIDKnown stays false,
+		// so normalizeCW reports the SSID as withheld.
+		if includeSSID {
+			if ssid := iface.Send(cw.sel.ssid); ssid != 0 {
+				a.SSID = nsStringToGo(ssid, cw.sel.utf8)
+				a.SSIDKnown = true
+			}
 		}
 		if ch := iface.Send(cw.sel.wlanChannel); ch != 0 {
 			a.HasChannel = true

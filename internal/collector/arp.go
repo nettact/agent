@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/nettact/agent/internal/platform"
-	"github.com/nettact/protocol/capability"
 	"github.com/nettact/protocol/telemetry"
 )
 
@@ -29,6 +28,9 @@ const (
 type ARPCollector struct {
 	p platform.Platform
 
+	// reportHostname gates reverse-DNS enrichment (network.neighbor.hostname.read).
+	reportHostname bool
+
 	// lookup resolves an IP to PTR names; seam for tests. Defaults to the
 	// system resolver.
 	lookup func(ctx context.Context, addr string) ([]string, error)
@@ -42,19 +44,16 @@ type hostEntry struct {
 	at   time.Time
 }
 
-func NewARPCollector(p platform.Platform) *ARPCollector {
+func NewARPCollector(p platform.Platform, reportHostname bool) *ARPCollector {
 	return &ARPCollector{
-		p:      p,
-		lookup: net.DefaultResolver.LookupAddr,
-		cache:  make(map[string]hostEntry),
+		p:              p,
+		reportHostname: reportHostname,
+		lookup:         net.DefaultResolver.LookupAddr,
+		cache:          make(map[string]hostEntry),
 	}
 }
 
 func (c *ARPCollector) Name() string { return "arp" }
-
-func (c *ARPCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.InventoryARP}
-}
 
 func (c *ARPCollector) Tier() Tier { return TierRegular }
 
@@ -75,7 +74,11 @@ func (c *ARPCollector) Collect(ctx context.Context) (Result, error) {
 		usable = append(usable, n)
 		ips = append(ips, n.IP)
 	}
-	hosts := c.resolveHostnames(ctx, ips)
+	// Reverse-DNS enrichment is gated on the hostname permission.
+	var hosts map[string]string
+	if c.reportHostname {
+		hosts = c.resolveHostnames(ctx, ips)
+	}
 
 	var res Result
 	for _, n := range usable {

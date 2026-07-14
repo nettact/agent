@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,7 +14,7 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 
-	"github.com/nettact/protocol/capability"
+	"github.com/nettact/agent/internal/netguard"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -24,17 +25,27 @@ import (
 // probed on its own schedule via schedState. Supported resolver protocols:
 // plain UDP/TCP (custom nameserver or system), DoT (DNS over TLS), and DoH
 // (DNS over HTTPS).
+//
+// The target-access policy governs the CUSTOM resolver/DoT/DoH endpoint that the
+// probe actually dials (never the queried name, which the DNS probe does not
+// itself dial). The system default resolver is OS-owned ambient config and is
+// exempt, like the agent's own control connection.
 type DNSCollector struct {
 	resolver   *net.Resolver
 	httpClient *http.Client // used for DoH queries
 	sched      *schedState
+	guard      *netguard.Guard
 }
 
-func NewDNSCollector() *DNSCollector {
+func NewDNSCollector(guard *netguard.Guard) *DNSCollector {
+	// DoH transport: environment proxy disabled, dials routed through the guard so
+	// the resolver endpoint (and any redirect) is policy-checked and IP-pinned.
+	doh := &http.Transport{Proxy: nil, DialContext: guard.DialContext, ForceAttemptHTTP2: true}
 	return &DNSCollector{
 		resolver:   net.DefaultResolver,
-		httpClient: &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()},
+		httpClient: &http.Client{Transport: doh},
 		sched:      newSchedState(30 * time.Second),
+		guard:      guard,
 	}
 }
 
@@ -49,10 +60,6 @@ func (c *DNSCollector) SetTargets(targets []pcfg.ProbeTarget) {
 }
 
 func (c *DNSCollector) Name() string { return "dns" }
-
-func (c *DNSCollector) Capabilities() []capability.Capability {
-	return []capability.Capability{capability.ProbeDNS}
-}
 
 func (c *DNSCollector) Tier() Tier { return TierRegular }
 
@@ -73,32 +80,42 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		t0 := time.Now()
 		var ok bool
+		var derr error
 		switch t.Params.ResolverProtocol {
 		case "doh":
 			// DNS over HTTPS: resolver_server is an https URL or a host we turn into
 			// the conventional /dns-query endpoint.
-			ok = c.lookupDoH(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
+			ok, derr = c.lookupDoH(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
 		case "dot":
 			// DNS over TLS on port 853 (default). Done explicitly over a TLS stream —
 			// net.Resolver cannot be forced onto TCP framing reliably.
-			ok = lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 853, t.Params.RecordType, t.Target, timeout, true, t.Params.IgnoreTLS)
+			ok, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 853, t.Params.RecordType, t.Target, timeout, true, t.Params.IgnoreTLS)
 		case "tcp":
 			// Plain DNS over TCP to a specific nameserver, likewise done explicitly.
 			if t.Params.ResolverServer != "" {
-				ok = lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 53, t.Params.RecordType, t.Target, timeout, false, false)
+				ok, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 53, t.Params.RecordType, t.Target, timeout, false, false)
 			} else {
 				ok = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
 			}
 		default:
 			// Plain UDP: a per-target resolver override sends the query to a specific
-			// nameserver; otherwise use the process default.
-			resolver := c.resolver
+			// nameserver (dialed through the guard, so a denied endpoint is returned as
+			// a *netguard.BlockedError, not a silent DNS failure); otherwise use the
+			// process default resolver (OS-owned ambient config, exempt from policy).
 			if t.Params.ResolverServer != "" {
-				resolver = customResolver(t.Params.ResolverServer, t.Params.ResolverPort, timeout)
+				ok, derr = c.lookupUDP(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target, timeout)
+			} else {
+				ok = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
 			}
-			ok = lookupRecord(cctx, resolver, t.Params.RecordType, t.Target)
 		}
 		cancel()
+
+		// A policy block on the custom resolver endpoint is not a DNS failure.
+		var be *netguard.BlockedError
+		if errors.As(derr, &be) {
+			res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+			continue
+		}
 
 		okv := 0.0
 		if ok {
@@ -124,49 +141,75 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 	return res, nil
 }
 
-// customResolver builds a net.Resolver that dials the given nameserver over UDP
-// (port defaults to 53) instead of the system resolver. PreferGo is required so
-// the Go resolver honors the custom Dial rather than delegating to libc/cgo.
-func customResolver(server string, port int, timeout time.Duration) *net.Resolver {
+// lookupUDP performs a DNS query over UDP to a specific nameserver, dialed
+// through the guard so the resolver endpoint is policy-checked and IP-pinned and
+// a denied endpoint is returned as a *netguard.BlockedError (net.Resolver cannot
+// be used here because it flattens the guard's typed dial error into an opaque
+// *net.DNSError, which would misreport a policy block as an ordinary DNS
+// failure). Returns true when the response is NOERROR with an answer of the
+// requested record type.
+func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, recordType, name string, timeout time.Duration) (bool, error) {
 	if port <= 0 {
 		port = 53
 	}
-	addr := net.JoinHostPort(server, strconv.Itoa(port))
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: timeout}
-			return d.DialContext(ctx, network, addr)
-		},
+	query, err := buildDNSQuery(name, recordType)
+	if err != nil {
+		return false, nil
 	}
+	addr := net.JoinHostPort(server, strconv.Itoa(port))
+	conn, err := c.guard.DialContext(ctx, "udp", addr)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+	}
+	if _, err := conn.Write(query); err != nil {
+		return false, nil
+	}
+	respb := make([]byte, 4096)
+	n, err := conn.Read(respb)
+	if err != nil {
+		return false, nil
+	}
+	var msg dnsmessage.Message
+	if err := msg.Unpack(respb[:n]); err != nil {
+		return false, nil
+	}
+	return dnsAnswerOK(&msg, recordType), nil
 }
 
 // lookupStream performs a DNS query over a TCP stream, optionally wrapped in TLS
-// (DoT). net.Resolver cannot be reliably forced onto TCP framing — returning an
-// error from its UDP dial aborts the whole exchange rather than falling back to
-// TCP — so plain-TCP and DoT are done explicitly here with the RFC 1035 2-byte
-// length prefix. Returns true when the response is NOERROR and contains at least
-// one answer of the requested record type.
-func lookupStream(ctx context.Context, server string, port, defaultPort int, recordType, name string, timeout time.Duration, useTLS, ignoreTLS bool) bool {
+// (DoT). The raw TCP connection is dialed through the guard (policy-checked,
+// IP-pinned); TLS uses ServerName=server so certificate verification stays
+// against the intended host. Returns true when the response is NOERROR and
+// contains at least one answer of the requested record type; a policy block is
+// returned as a *netguard.BlockedError.
+func (c *DNSCollector) lookupStream(ctx context.Context, server string, port, defaultPort int, recordType, name string, timeout time.Duration, useTLS, ignoreTLS bool) (bool, error) {
 	if port <= 0 {
 		port = defaultPort
 	}
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	addr := net.JoinHostPort(server, strconv.Itoa(port))
 
-	var conn net.Conn
-	if useTLS {
-		d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: timeout}, Config: &tls.Config{ServerName: server, InsecureSkipVerify: ignoreTLS}}
-		conn, err = d.DialContext(ctx, "tcp", addr)
-	} else {
-		d := net.Dialer{Timeout: timeout}
-		conn, err = d.DialContext(ctx, "tcp", addr)
-	}
+	raw, err := c.guard.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return false
+		return false, err
+	}
+	var conn net.Conn = raw
+	if useTLS {
+		tconn := tls.Client(raw, &tls.Config{ServerName: server, InsecureSkipVerify: ignoreTLS}) //nolint:gosec // opt-in via ignore_tls
+		if herr := tconn.HandshakeContext(ctx); herr != nil {
+			_ = raw.Close()
+			return false, nil
+		}
+		conn = tconn
 	}
 	defer conn.Close()
 	if dl, ok := ctx.Deadline(); ok {
@@ -181,26 +224,26 @@ func lookupStream(ctx context.Context, server string, port, defaultPort int, rec
 	framed[1] = byte(len(query))
 	copy(framed[2:], query)
 	if _, err := conn.Write(framed); err != nil {
-		return false
+		return false, nil
 	}
 
 	var lenb [2]byte
 	if _, err := io.ReadFull(conn, lenb[:]); err != nil {
-		return false
+		return false, nil
 	}
 	n := int(lenb[0])<<8 | int(lenb[1])
 	if n <= 0 || n > 65535 {
-		return false
+		return false, nil
 	}
 	respb := make([]byte, n)
 	if _, err := io.ReadFull(conn, respb); err != nil {
-		return false
+		return false, nil
 	}
 	var msg dnsmessage.Message
 	if err := msg.Unpack(respb); err != nil {
-		return false
+		return false, nil
 	}
-	return dnsAnswerOK(&msg, recordType)
+	return dnsAnswerOK(&msg, recordType), nil
 }
 
 // dnsAnswerOK reports whether a parsed DNS response is a successful answer for
@@ -222,35 +265,41 @@ func dnsAnswerOK(msg *dnsmessage.Message, recordType string) bool {
 
 // lookupDoH resolves name over DNS-over-HTTPS (RFC 8484). server may be a full
 // https URL or a bare host, in which case the conventional /dns-query endpoint is
-// used. Returns true when the response is NOERROR with at least one answer.
-func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, recordType, name string) bool {
+// used. The DoH transport dials through the guard, so a denied endpoint is
+// returned as a *netguard.BlockedError. Returns true when the response is NOERROR
+// with at least one answer.
+func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, recordType, name string) (bool, error) {
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL(server, port), bytes.NewReader(query))
 	if err != nil {
-		return false
+		return false, nil
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return false
+		var be *netguard.BlockedError
+		if errors.As(err, &be) {
+			return false, err
+		}
+		return false, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false
+		return false, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
 	if err != nil {
-		return false
+		return false, nil
 	}
 	var msg dnsmessage.Message
 	if err := msg.Unpack(body); err != nil {
-		return false
+		return false, nil
 	}
-	return dnsAnswerOK(&msg, recordType)
+	return dnsAnswerOK(&msg, recordType), nil
 }
 
 // dohURL normalizes a DoH server into a query URL. A value starting with http is
@@ -329,3 +378,6 @@ func lookupRecord(ctx context.Context, r *net.Resolver, recordType, name string)
 		return err == nil && len(addrs) > 0
 	}
 }
+
+// SetMinInterval applies the local per-target probe-interval floor (stability limit).
+func (c *DNSCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

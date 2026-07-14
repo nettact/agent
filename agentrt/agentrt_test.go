@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/nettact/agent/internal/identity"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/wire"
 )
 
@@ -99,6 +100,7 @@ func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 			defer cancel()
 			err := Run(ctx, Config{
 				ServerURL: srv.URL, DataDir: dataDir, WireFormat: "json", UploadInterval: time.Hour,
+				Policy: permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
 			})
 			select {
 			case <-mutated:
