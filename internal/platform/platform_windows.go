@@ -49,6 +49,33 @@ const (
 	ifTypeIEEE80211        = 71 // IF_TYPE_IEEE80211 (native Wi-Fi)
 )
 
+// msVirtualWirelessAdapterMarkers are the driver-description fragments of the
+// hidden virtual wireless adapters Windows spins up off a physical Wi-Fi NIC.
+// All three come from the same inbox miniport driver (netvwifimp.inf, the vwifi
+// bus): the base vwifimp device plus its SoftAP and Wi-Fi Direct children. These
+// strings are the driver device descriptions, not the localized connection name
+// ("本地连接* N"), so they are identical across OS display languages, and no real
+// Wi-Fi client adapter is described this way — filtering on them can never hide
+// genuine hardware.
+var msVirtualWirelessAdapterMarkers = []string{
+	"Wi-Fi Direct Virtual Adapter",   // vwifimp_wfd: mobile hotspot / Miracast P2P endpoint
+	"Hosted Network Virtual Adapter", // vwifimp_sap: legacy soft-AP (netsh wlan hostednetwork)
+	"Virtual WiFi Miniport Adapter",  // vwifimp: base bus-enumerated virtual miniport
+}
+
+// isHiddenVirtualWirelessAdapter reports whether an adapter description belongs
+// to one of the OS-synthesized hidden Wi-Fi virtual adapters. It is the
+// GetAdaptersAddresses-visible stand-in for the NDIS Hidden flag, which that API
+// does not surface.
+func isHiddenVirtualWirelessAdapter(desc string) bool {
+	for _, m := range msVirtualWirelessAdapterMarkers {
+		if strings.Contains(desc, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 	// Field-level no-read: tell the OS to omit the denied structures entirely
 	// rather than fetching them and skipping the iteration. A denied address or
@@ -82,6 +109,14 @@ func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 
 	var out []IfaceInfo
 	for aa := head; aa != nil; aa = aa.Next {
+		// Drop the OS-synthesized hidden virtual wireless adapters (Wi-Fi Direct /
+		// Hosted Network). Windows creates these off the physical Wi-Fi NIC for
+		// mobile hotspot / Miracast; they surface as IF_TYPE_IEEE80211 rows here
+		// (GetAdaptersAddresses does not expose the NDIS Hidden flag) yet never
+		// appear in the Network Connections panel and carry no user-facing link.
+		if isHiddenVirtualWirelessAdapter(windows.UTF16PtrToString(aa.Description)) {
+			continue
+		}
 		info := IfaceInfo{
 			ID:         strings.ToUpper(windows.BytePtrToString(aa.AdapterName)),
 			Name:       windows.UTF16PtrToString(aa.FriendlyName),
