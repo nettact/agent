@@ -68,20 +68,11 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			// would re-resolve it through the system resolver OUTSIDE the guard — a
 			// DNS-rebinding / policy-bypass hole (e.g. a dual-stack name whose AAAA
 			// fails but A resolves to a denied address).
-			res.Metrics = append(res.Metrics,
-				telemetry.Metric{TS: now, Kind: telemetry.ICMPLoss, Target: t.Target, Layer: telemetry.LayerInternet,
-					Value: 100, Unit: telemetry.UnitPct, Labels: labels, MonitorID: t.MonitorID})
+			appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerInternet, labels, pingCycleResult{Loss: 100})
 			continue
 		}
-		loss, avgMs, received := pingCycle(ctx, c.p, pingTarget, t.Params)
-		res.Metrics = append(res.Metrics,
-			telemetry.Metric{TS: now, Kind: telemetry.ICMPLoss, Target: t.Target, Layer: telemetry.LayerInternet,
-				Value: loss, Unit: telemetry.UnitPct, Labels: labels, MonitorID: t.MonitorID})
-		if received > 0 {
-			res.Metrics = append(res.Metrics,
-				telemetry.Metric{TS: now, Kind: telemetry.ICMPRTTms, Target: t.Target, Layer: telemetry.LayerInternet,
-					Value: avgMs, Unit: telemetry.UnitMs, Labels: labels, MonitorID: t.MonitorID})
-		}
+		r := pingCycle(ctx, c.p, pingTarget, t.Params)
+		appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerInternet, labels, r)
 	}
 	return res, nil
 }
@@ -130,24 +121,36 @@ func pickPingAddr(vetted []netip.Addr) netip.Addr {
 	return vetted[0].Unmap()
 }
 
+// pingSpacing is the fixed delay between echoes in a multi-packet cycle, so a
+// single cycle samples jitter over a short window (~1s for the default 5 packets)
+// rather than back-to-back. Not configurable in v1.
+const pingSpacing = 200 * time.Millisecond
+
 // pingCycle runs one ICMP probe cycle for target per its ProbeParams and returns
-// the loss percentage, the average RTT (ms) over received echoes, and the number
-// received. Shared by the public-ping and gateway collectors so both honor the
-// same per-target packet count, payload size, per-echo timeout and global
-// deadline semantics.
-func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams) (loss, avgMs float64, received int) {
-	// PacketCount supersedes the legacy Retries+1 count when set; both fall back
-	// to a single echo.
+// the loss percentage and the RTT distribution (avg/min/max/jitter) over the
+// received echoes. Shared by the public-ping and gateway collectors so both honor
+// the same per-target packet count, spacing, payload size, per-echo timeout and
+// global deadline semantics. Lost echoes contribute to loss only — never a
+// zero-latency sample — so the distribution is computed over received echoes.
+func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams) pingCycleResult {
+	// PacketCount takes precedence; failing that, the legacy Retries knob (count =
+	// retries+1) when a user set it; otherwise a short burst of 5 so jitter/min/max
+	// are meaningful by default. (Retries defaults to 0, so it must be gated on
+	// >0 — otherwise Retries+1 would pin the default to 1 and the burst never runs.)
 	count := params.PacketCount
 	if count < 1 {
-		count = params.Retries + 1
+		if params.Retries > 0 {
+			count = params.Retries + 1
+		} else {
+			count = 5
+		}
 	}
-	if count < 1 {
-		count = 1
-	}
+	// Default per-echo timeout is 1s: generous for real ICMP RTTs (<1s worldwide)
+	// yet keeps a fully-lost default cycle (5×1s + 4×200ms ≈ 5.8s) under the 10s
+	// interval so one dead target does not starve the self-loop.
 	timeout := time.Duration(params.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
-		timeout = 2 * time.Second
+		timeout = time.Second
 	}
 	// GlobalTimeoutMs bounds the whole cycle across all echoes, regardless of how
 	// many packets are configured. We enforce it with a wall-clock deadline and by
@@ -163,9 +166,12 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 		pctx, cancel = context.WithTimeout(ctx, d)
 	}
 
-	var rttSum time.Duration
+	rtts := make([]time.Duration, 0, count)
 	for i := 0; i < count; i++ {
 		if pctx.Err() != nil {
+			break
+		}
+		if i > 0 && !sleepCtx(pctx, pingSpacing) {
 			break
 		}
 		callTimeout := timeout
@@ -184,19 +190,21 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 			continue
 		}
 		if pr.Received {
-			received++
-			rttSum += pr.RTT
+			rtts = append(rtts, pr.RTT)
 		}
 	}
 	if cancel != nil {
 		cancel()
 	}
 
-	loss = float64(count-received) / float64(count) * 100.0
-	if received > 0 {
-		avgMs = float64(rttSum.Microseconds()) / float64(received) / 1000.0
+	received := len(rtts)
+	r := pingCycleResult{
+		Loss:     float64(count-received) / float64(count) * 100.0,
+		Sent:     count,
+		Received: received,
 	}
-	return loss, avgMs, received
+	r.AvgMs, r.MinMs, r.MaxMs, r.JitterMs, r.HaveJitter = pingStats(rtts)
+	return r
 }
 
 // SetMinInterval applies the local per-target probe-interval floor (stability limit).

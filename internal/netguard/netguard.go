@@ -192,6 +192,32 @@ func (g *Guard) DialContext(ctx context.Context, network, address string) (net.C
 	return nil, lastErr
 }
 
+// DialVettedAddrs dials already-vetted addresses in order and returns the first
+// successful connection, applying the SAME syscall backstop the resolution used:
+// deny-only when the hostname was authorized (a host:/name allow, or denylist
+// mode), full CheckAddr otherwise. It exists for probes that resolve a hostname
+// separately — e.g. to time DNS apart from the connect — yet must keep everything
+// DialContext gives a hostname dial: the per-address fallback AND the
+// name-authorization contract (so a host:-only allowlist entry is not rejected
+// when the resolved IP lacks an independent ip:/cidr: allow). addrs must already
+// be policy-vetted (from ResolveVetted); only the literal IPs are dialed, never
+// the raw name.
+func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []netip.Addr, port string, nameAuthorized bool) (net.Conn, error) {
+	d := &net.Dialer{Control: g.control(nameAuthorized)}
+	var lastErr error
+	for _, a := range addrs {
+		conn, err := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = &BlockedError{FromResolve: true}
+	}
+	return nil, lastErr
+}
+
 // checkHost applies the hostname pre-resolution check (bypass authorizes all).
 func (g *Guard) checkHost(host string) probepolicy.HostDecision {
 	if g.bypass {

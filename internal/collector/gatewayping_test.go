@@ -34,8 +34,10 @@ func (p *gwTestPlatform) Ping(_ context.Context, target string, _ platform.PingO
 	return platform.PingResult{Target: target, RTT: 3 * time.Millisecond, Received: received}, nil
 }
 func (p *gwTestPlatform) Neighbors() ([]platform.Neighbor, error) { return nil, nil }
-func (p *gwTestPlatform) WiFi(includeSSID bool) platform.WiFiResult { return platform.WiFiResult{State: "ok"} }
-func (p *gwTestPlatform) Supports() permission.Set                { return nil }
+func (p *gwTestPlatform) WiFi(includeSSID bool) platform.WiFiResult {
+	return platform.WiFiResult{State: "ok"}
+}
+func (p *gwTestPlatform) Supports() permission.Set { return nil }
 
 func gwTestIfaces() []platform.IfaceInfo {
 	return []platform.IfaceInfo{
@@ -115,6 +117,35 @@ func TestGatewayCollectorUnknownInterface(t *testing.T) {
 	}
 	if len(res.Events) != 1 || res.Events[0].Type != telemetry.EventGatewayUnreachable {
 		t.Fatalf("events=%+v want one gateway-unreachable", res.Events)
+	}
+}
+
+func TestGatewayCollectorDefaultPacketCount(t *testing.T) {
+	// No PacketCount/Retries set → the collector must send the default burst of 5
+	// echoes (not a single one), so the RTT distribution + jitter are produced.
+	p := &gwTestPlatform{ifaces: gwTestIfaces()}
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c.SetTargets([]pcfg.ProbeTarget{
+		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "eth0"}},
+	})
+	res, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if p.pings != 5 {
+		t.Fatalf("pings=%d want 5 (default burst)", p.pings)
+	}
+	got := map[telemetry.MetricKind]bool{}
+	for _, m := range res.Metrics {
+		got[m.Kind] = true
+	}
+	for _, want := range []telemetry.MetricKind{
+		telemetry.ICMPLoss, telemetry.ICMPSamples, telemetry.ICMPRTTms,
+		telemetry.ICMPRTTMin, telemetry.ICMPRTTMax, telemetry.ICMPJitter,
+	} {
+		if !got[want] {
+			t.Fatalf("missing metric %s (have %v)", want, got)
+		}
 	}
 }
 

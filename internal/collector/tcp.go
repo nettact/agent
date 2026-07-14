@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -49,63 +50,149 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
-		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
-		if timeout <= 0 {
-			timeout = 5 * time.Second
-		}
-		addr := net.JoinHostPort(t.Target, strconv.Itoa(t.Params.Port))
-
-		cctx, cancel := context.WithTimeout(ctx, timeout)
-		t0 := time.Now()
-		conn, err := c.guard.DialContext(cctx, "tcp", addr)
-		if err == nil && t.Params.TLS {
-			// Wrap the live connection in a TLS handshake so a mismatched cert or
-			// non-TLS port is reported as down (optional SSL/TLS check). ServerName
-			// stays the original host so verification is against the intended name
-			// even though the guard pinned the vetted IP.
-			tconn := tls.Client(conn, &tls.Config{
-				ServerName:         t.Target,
-				InsecureSkipVerify: t.Params.IgnoreTLS,
-			})
-			err = tconn.HandshakeContext(cctx)
-			conn = tconn
-		}
-		lat := float64(time.Since(t0).Microseconds()) / 1000.0
-		cancel()
-		if conn != nil {
-			_ = conn.Close()
-		}
-
-		// A policy block is not a connect failure.
-		var be *netguard.BlockedError
-		if errors.As(err, &be) {
-			res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
-			continue
-		}
-
-		ok := 0.0
-		if err == nil {
-			ok = 1.0
-		}
-		res.Metrics = append(res.Metrics, telemetry.Metric{
-			TS: now, Kind: telemetry.TCPOK, Target: t.Target, Layer: telemetry.LayerService,
-			Value: ok, Unit: telemetry.UnitBool, Labels: map[string]string{"port": strconv.Itoa(t.Params.Port)},
-			MonitorID: t.MonitorID,
-		})
-		if err == nil {
-			res.Metrics = append(res.Metrics, telemetry.Metric{
-				TS: now, Kind: telemetry.TCPConnectMs, Target: t.Target, Layer: telemetry.LayerService,
-				Value: lat, Unit: telemetry.UnitMs, Labels: map[string]string{"port": strconv.Itoa(t.Params.Port)},
-				MonitorID: t.MonitorID,
-			})
-		} else {
-			res.Events = append(res.Events, telemetry.Event{
-				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
-				Severity: telemetry.SeverityWarn, Message: "TCP connect failed: " + addr,
-			})
-		}
+		c.probe(ctx, now, t, &res)
 	}
 	return res, nil
+}
+
+// probe runs one TCP cycle: it times DNS resolution, the pure TCP connect, and
+// (when enabled) the TLS handshake as separate segments so a slow-DNS vs
+// slow-connect vs slow-TLS problem is separable, and classifies the failure. Each
+// segment's latency is emitted only when THAT segment succeeded — a failure is
+// never recorded as a zero-latency sample; probe.tcp.error_class carries the
+// reason and probe.tcp.ok the overall outcome (both every cycle).
+func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result) {
+	timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	port := strconv.Itoa(t.Params.Port)
+	labels := map[string]string{"port": port}
+	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
+		return telemetry.Metric{TS: now, Kind: kind, Target: t.Target, Layer: telemetry.LayerService,
+			Value: v, Unit: unit, Labels: labels, MonitorID: t.MonitorID}
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Phase 1 — resolution. A literal-IP target has no DNS segment (dns_ms is
+	// absent, not zero). A hostname is policy-checked before any query, then the
+	// vetted resolution is timed and the vetted literal IPs are dialed directly —
+	// the raw name never reaches the stdlib dialer (DNS-rebinding defense).
+	literal := false
+	var vetted []netip.Addr
+	nameAuthorized := false
+	var dnsMs float64
+	haveDNS := false
+	if _, perr := netip.ParseAddr(t.Target); perr == nil {
+		literal = true
+	} else {
+		hd := c.guard.CheckHost(t.Target)
+		if hd.Denied {
+			res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, Matched: hd.Matched, Reason: "resolved_denied"})
+			return
+		}
+		r0 := time.Now()
+		v, err := c.guard.ResolveVetted(cctx, t.Target, hd.NameAuthorized)
+		if err != nil {
+			var be *netguard.BlockedError
+			if errors.As(err, &be) {
+				res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+				return
+			}
+			// Plain resolution failure: down, classified as DNS. No dns_ms (the
+			// resolution did not produce a valid latency).
+			res.Metrics = append(res.Metrics, mk(telemetry.TCPOK, 0, telemetry.UnitBool),
+				mk(telemetry.TCPErrorClass, telemetry.TCPErrDNS, telemetry.UnitCode))
+			res.Events = append(res.Events, telemetry.Event{
+				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
+				Severity: telemetry.SeverityWarn, Message: "TCP DNS resolution failed: " + t.Target,
+			})
+			return
+		}
+		dnsMs = msSince(r0)
+		haveDNS = true
+		vetted = v
+		nameAuthorized = hd.NameAuthorized
+	}
+
+	// Phase 2 — pure TCP connect. Timed alone, so connect_ms excludes DNS and TLS.
+	// A literal-IP target dials directly (full CheckAddr); a resolved hostname dials
+	// its vetted addresses in order via DialVettedAddrs — preserving BOTH the
+	// per-address fallback and the hostname-authorization semantics that the guard's
+	// own DialContext applies (pinning one IP through DialContext would rerun the
+	// full allowlist and drop the fallback).
+	addr := net.JoinHostPort(t.Target, port)
+	c0 := time.Now()
+	var conn net.Conn
+	var dialErr error
+	if literal {
+		conn, dialErr = c.guard.DialContext(cctx, "tcp", addr)
+	} else {
+		conn, dialErr = c.guard.DialVettedAddrs(cctx, "tcp", vetted, port, nameAuthorized)
+	}
+	connectMs := msSince(c0)
+	connectOK := dialErr == nil
+
+	// Phase 3 — optional TLS handshake over the live connection, timed alone.
+	var tlsMs float64
+	haveTLS := false
+	var tlsErr error
+	if connectOK && t.Params.TLS {
+		tconn := tls.Client(conn, &tls.Config{
+			ServerName:         t.Target,
+			InsecureSkipVerify: t.Params.IgnoreTLS,
+		})
+		h0 := time.Now()
+		tlsErr = tconn.HandshakeContext(cctx)
+		tlsMs = msSince(h0)
+		conn = tconn
+		haveTLS = tlsErr == nil
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+
+	// A literal-IP connect can still hit a policy block (surfaced by the guard).
+	var be *netguard.BlockedError
+	if errors.As(dialErr, &be) {
+		res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+		return
+	}
+
+	overallOK := connectOK && tlsErr == nil
+	errClass := telemetry.TCPErrNone
+	switch {
+	case !connectOK:
+		errClass = classifyConnectError(dialErr)
+	case tlsErr != nil:
+		errClass = telemetry.TCPErrTLS
+	}
+
+	ok := 0.0
+	if overallOK {
+		ok = 1.0
+	}
+	res.Metrics = append(res.Metrics,
+		mk(telemetry.TCPOK, ok, telemetry.UnitBool),
+		mk(telemetry.TCPErrorClass, float64(errClass), telemetry.UnitCode),
+	)
+	if haveDNS {
+		res.Metrics = append(res.Metrics, mk(telemetry.TCPDNSms, dnsMs, telemetry.UnitMs))
+	}
+	if connectOK {
+		res.Metrics = append(res.Metrics, mk(telemetry.TCPConnectMs, connectMs, telemetry.UnitMs))
+	}
+	if haveTLS {
+		res.Metrics = append(res.Metrics, mk(telemetry.TCPTLSms, tlsMs, telemetry.UnitMs))
+	}
+	if !overallOK {
+		res.Events = append(res.Events, telemetry.Event{
+			ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
+			Severity: telemetry.SeverityWarn, Message: "TCP connect failed: " + addr,
+		})
+	}
 }
 
 // SetMinInterval applies the local per-target probe-interval floor (stability limit).

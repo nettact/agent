@@ -62,11 +62,8 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 		gw := c.gatewayFor(t.Params.Interface)
 		if gw == "" {
 			// No gateway found on the selected/default NIC: report LAN-layer down.
-			res.Metrics = append(res.Metrics, telemetry.Metric{
-				TS: now, Kind: telemetry.ICMPLoss, Target: t.Target,
-				Layer: telemetry.LayerLAN, Value: 100, Unit: telemetry.UnitPct,
-				Labels: gatewayLabels("", t.Params.Interface), MonitorID: t.MonitorID,
-			})
+			appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerLAN,
+				gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100})
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
 				Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
@@ -87,20 +84,10 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 			}
 		}
 
-		loss, avgMs, received := pingCycle(ctx, c.p, gw, t.Params)
+		r := pingCycle(ctx, c.p, gw, t.Params)
 		labels := gatewayLabels(gw, t.Params.Interface)
-		res.Metrics = append(res.Metrics,
-			telemetry.Metric{TS: now, Kind: telemetry.ICMPLoss, Target: t.Target,
-				Layer: telemetry.LayerLAN, Value: loss, Unit: telemetry.UnitPct,
-				Labels: labels, MonitorID: t.MonitorID},
-		)
-		if received > 0 {
-			res.Metrics = append(res.Metrics,
-				telemetry.Metric{TS: now, Kind: telemetry.ICMPRTTms, Target: t.Target,
-					Layer: telemetry.LayerLAN, Value: avgMs, Unit: telemetry.UnitMs,
-					Labels: labels, MonitorID: t.MonitorID},
-			)
-		} else {
+		appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerLAN, labels, r)
+		if r.Received == 0 {
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
 				Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
