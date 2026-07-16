@@ -31,6 +31,11 @@ func (winPlatform) Supports() permission.Set {
 		permission.ProbeICMP,
 		permission.NetNeighborRead,
 		permission.NetNeighborHostRead,
+		// ICMP traceroute uses the same iphlpapi TTL echo path as ProbeICMP and
+		// needs no Administrator, so it is a platform capability here. TCP
+		// traceroute needs a raw ICMP socket (Administrator) and is gated at runtime
+		// by the traceroute engine, not advertised as a static platform capability.
+		permission.DiagnosticTracerouteICMP,
 	)
 	for _, id := range wifiPermissions() {
 		s.Add(id)

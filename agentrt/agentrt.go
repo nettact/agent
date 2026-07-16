@@ -29,13 +29,16 @@ import (
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/enroll"
 	"github.com/nettact/agent/internal/identity"
+	"github.com/nettact/agent/internal/incidentscene"
 	"github.com/nettact/agent/internal/monitoreval"
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/internal/scheduler"
+	"github.com/nettact/agent/internal/traceroute"
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/agent/probepolicy"
 	"github.com/nettact/protocol"
+	pcfg "github.com/nettact/protocol/config"
 	protoenroll "github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
@@ -91,6 +94,10 @@ type Limits struct {
 	MaxProbeConcurrency int
 	SnapshotMinInterval time.Duration
 	SnapshotTimeout     time.Duration
+	// MaxTraceConcurrency bounds simultaneously executing incident traceroutes
+	// (distinct report ids) on this Agent; diagnostics use their own work channel,
+	// never the probe scheduler.
+	MaxTraceConcurrency int
 }
 
 // DefaultLimits are the spec §17.1 stability defaults.
@@ -100,6 +107,7 @@ func DefaultLimits() Limits {
 		MaxProbeConcurrency: 16,
 		SnapshotMinInterval: 3 * time.Second,
 		SnapshotTimeout:     10 * time.Second,
+		MaxTraceConcurrency: 4,
 	}
 }
 
@@ -189,6 +197,14 @@ func Run(ctx context.Context, cfg Config) error {
 	supported := platformIndependentSupported()
 	for id := range p.Supports() {
 		supported.Add(id)
+	}
+	// TCP traceroute needs a raw ICMP socket to observe intermediate Time-Exceeded
+	// responders (Administrator on Windows), so it is a runtime capability added to
+	// supported only when the engine can actually open one. ICMP traceroute is a
+	// static platform capability already advertised by p.Supports(). Effective
+	// stays supported∩granted, so desktop FullAccess remains capability-gated.
+	if _, tcpCap := traceroute.Supported(); tcpCap {
+		supported.Add(permission.DiagnosticTracerouteTCP)
 	}
 	granted := cfg.Policy.Granted
 	effective := permission.EffectiveFrom(granted, supported)
@@ -377,6 +393,27 @@ func Run(ctx context.Context, cfg Config) error {
 		cred.AgentID, hostname, runtime.GOOS, cfg.Policy.Source, effective.Strings())
 
 	agentID := cred.AgentID
+
+	// Incident-scene collector and traceroute engine (INCIDENT-002 / DIAG-001).
+	// Both reuse the existing effective permissions, platform HAL, and target-
+	// access guard; the engine owns the per-Agent traceroute concurrency limit.
+	// They are invoked off the session goroutine and their result Frames written
+	// by the single session writer, so normal collector cadence is untouched.
+	sceneDeps := incidentscene.Deps{
+		Platform:  p,
+		Guard:     guard,
+		Effective: effective,
+		Granted:   granted,
+		Supported: supported,
+		Identity: incidentscene.Identity{
+			AgentID:  cred.AgentID,
+			Hostname: hostname,
+			OS:       runtime.GOOS,
+			Version:  Version,
+		},
+	}
+	traceEngine := traceroute.New(guard, effective, granted, supported, cfg.Limits.MaxTraceConcurrency)
+
 	err = conn.Run(runCtx, conn.Options{
 		ServerURL: cfg.ServerURL,
 		Token:     cred.AgentToken,
@@ -410,6 +447,12 @@ func Run(ctx context.Context, cfg Config) error {
 		Supported:           supported,
 		SnapshotMinInterval: cfg.Limits.SnapshotMinInterval,
 		SnapshotTimeout:     cfg.Limits.SnapshotTimeout,
+		CollectIncidentSnapshot: func(ctx context.Context, req pcfg.IncidentSnapshotRequest) telemetry.IncidentSnapshot {
+			return incidentscene.Collect(ctx, req, sceneDeps)
+		},
+		RunTrace: func(ctx context.Context, req pcfg.TraceRequest) telemetry.TraceResult {
+			return traceEngine.Run(ctx, req)
+		},
 	})
 
 	// On revocation the credential is dead; delete it here so re-running enrolls
@@ -501,6 +544,9 @@ func fillLimits(l Limits) Limits {
 	if l.SnapshotTimeout <= 0 {
 		l.SnapshotTimeout = d.SnapshotTimeout
 	}
+	if l.MaxTraceConcurrency <= 0 {
+		l.MaxTraceConcurrency = d.MaxTraceConcurrency
+	}
 	return l
 }
 
@@ -525,7 +571,8 @@ func policyHash(cfg Config) string {
 		strconv.FormatInt(int64(limits.MinProbeInterval), 10) + "," +
 		strconv.Itoa(limits.MaxProbeConcurrency) + "," +
 		strconv.FormatInt(int64(limits.SnapshotMinInterval), 10) + "," +
-		strconv.FormatInt(int64(limits.SnapshotTimeout), 10) + "\n")
+		strconv.FormatInt(int64(limits.SnapshotTimeout), 10) + "," +
+		strconv.Itoa(limits.MaxTraceConcurrency) + "\n")
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
 }
