@@ -270,7 +270,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// never built, so its OS/gopsutil operations are never invoked.
 	var configurables []conn.Configurable
 	var selfSched []collector.Collector
-	tracker := monitoreval.New(effective, granted, supported, guard, hash)
+	tracker := monitoreval.New(effective, granted, supported, guard, hash, cfg.Limits.MinProbeInterval)
 
 	addProbe := func(c interface {
 		conn.Configurable
@@ -301,14 +301,16 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	// The runtime-block sink routes collector policy blocks to the tracker and a
-	// later clean metric back to active.
+	// later clean metric back to active. Each transition carries the originating
+	// target generation (ConfigSerial) so the tracker can ignore an obsolete
+	// in-flight result and never let it alter the current generation's status.
 	sink := func(res collector.Result) {
 		for _, b := range res.Blocked {
-			tracker.RuntimeBlocked(b.MonitorID, b.Matched, b.Reason)
+			tracker.RuntimeBlocked(b.MonitorID, b.ConfigSerial, b.Matched, b.Reason)
 		}
 		for _, m := range res.Metrics {
 			if m.MonitorID != "" {
-				tracker.RuntimeOK(m.MonitorID)
+				tracker.RuntimeOK(m.MonitorID, m.ConfigSerial)
 			}
 		}
 		var snaps []telemetry.InterfaceSnapshot

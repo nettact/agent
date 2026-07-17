@@ -7,6 +7,7 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"sync"
 	"time"
 
@@ -30,8 +31,13 @@ const (
 // synthetic probe failure.
 type BlockedProbe struct {
 	MonitorID string
-	Matched   string // matched selector (never a newly-resolved private address)
-	Reason    string // resolved_denied | redirect_denied | literal_denied
+	// ConfigSerial is the originating ProbeTarget's material config generation. It
+	// travels with the block so the runtime tracker can ignore an obsolete in-flight
+	// result: a block produced by a superseded generation must never override, clear,
+	// or relabel the current generation's status.
+	ConfigSerial int
+	Matched      string // matched selector (never a newly-resolved private address)
+	Reason       string // resolved_denied | redirect_denied | literal_denied
 }
 
 // Result is what one Collect run produces.
@@ -77,13 +83,17 @@ func (s *schedState) SetMinInterval(d time.Duration) {
 	s.mu.Unlock()
 }
 
-// schedKey uniquely identifies a probe within a collector. The monitor id leads:
-// two user-created monitors may share the same kind, target AND params, and each
-// must keep its own due-time slot so both run every interval. The kind/target/
-// params tail keeps distinct probes apart when ids are absent (older fixtures).
+// schedKey uniquely identifies a probe generation within a collector. The monitor
+// id leads: two user-created monitors may share the same kind, target AND params,
+// and each must keep its own due-time slot so both run every interval. The material
+// ConfigSerial is part of the key so every new target generation is a fresh slot
+// with no recorded due-time — it probes on the next collector tick instead of
+// inheriting the previous generation's schedule, including an edit-then-restore that
+// reproduces an earlier generation's kind/target/params. The kind/target/params tail
+// keeps distinct probes apart when ids are absent (older fixtures).
 func schedKey(t pcfg.ProbeTarget) string {
 	b, _ := json.Marshal(t.Params)
-	return t.MonitorID + "|" + t.Kind + "|" + t.Target + "|" + string(b)
+	return t.MonitorID + "|" + strconv.Itoa(t.ConfigSerial) + "|" + t.Kind + "|" + t.Target + "|" + string(b)
 }
 
 // set replaces the target list (from a DesiredState push) and prunes due-times

@@ -32,7 +32,7 @@ type GatewayPingCollector struct {
 func NewGatewayPingCollector(p platform.Platform, guard *netguard.Guard) *GatewayPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &GatewayPingCollector{p: p, guard: guard, sched: newSchedState(10 * time.Second)}
+	return &GatewayPingCollector{p: p, guard: guard, sched: newSchedState(pcfg.DefaultGatewayInterval)}
 }
 
 // SetTargets replaces the gateway target list from a DesiredState update.
@@ -62,7 +62,7 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 		gw := c.gatewayFor(t.Params.Interface)
 		if gw == "" {
 			// No gateway found on the selected/default NIC: report LAN-layer down.
-			appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerLAN,
+			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN,
 				gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100})
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
@@ -79,14 +79,14 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 		// fe80:: gateway). A block here is a target-policy block, not a ping failure.
 		if a, perr := netip.ParseAddr(gw); perr == nil {
 			if dec := c.guard.CheckGateway(a.Unmap(), c.osGateways()); !dec.Allowed {
-				res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, Matched: dec.Matched, Reason: "literal_denied"})
+				res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: dec.Matched, Reason: "literal_denied"})
 				continue
 			}
 		}
 
 		r := pingCycle(ctx, c.p, gw, t.Params)
 		labels := gatewayLabels(gw, t.Params.Interface)
-		appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerLAN, labels, r)
+		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN, labels, r)
 		if r.Received == 0 {
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,

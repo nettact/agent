@@ -589,15 +589,18 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		// Only the runnable subset reaches the collectors, so a permission/target
 		// blocked monitor is never scheduled and produces no synthetic failure.
 		runnable := ds.ProbeTargets
+		var frame *wire.MonitorStatus
 		if r.deps.Tracker != nil {
-			run, frame := r.deps.Tracker.ApplyDesired(ds.ConfigVersion, ds.ProbeTargets)
+			run, f := r.deps.Tracker.ApplyDesired(ds.ConfigVersion, ds.ProbeTargets)
 			runnable = run
-			// Emit the full-state MonitorStatus after applying config (covers the
-			// reconnect/restart reevaluation for free).
-			if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: &frame}); werr != nil {
-				return fmt.Errorf("write monitor status: %w", werr)
-			}
+			frame = &f
 		}
+		// Install this generation in the collectors and scheduler and advance the
+		// stale-version guard BEFORE attesting it: the full-state MonitorStatus frame
+		// must describe a generation the agent is actually running, never one that is
+		// merely evaluated. appliedConfigVersion moves in lockstep with the targets/
+		// intervals now in place, so a subsequent stale-config guard reflects what is
+		// truly installed.
 		for _, cfg := range r.deps.Configurables {
 			cfg.SetTargets(runnable)
 		}
@@ -606,6 +609,15 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 			time.Duration(ds.Intervals.RegularSeconds)*time.Second,
 		)
 		r.appliedConfigVersion = ds.ConfigVersion
+		// Emit the full-state MonitorStatus only after applying config (covers the
+		// reconnect/restart reevaluation for free). A write failure here is reported
+		// after the generation is fully installed, so a reconnect re-attests state
+		// consistent with what the agent is running.
+		if frame != nil {
+			if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: frame}); werr != nil {
+				return fmt.Errorf("write monitor status: %w", werr)
+			}
+		}
 		log.Printf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
 
 	case f.SnapshotRequest != nil:

@@ -41,7 +41,7 @@ type NATCollector struct {
 func NewNATCollector(guard *netguard.Guard) *NATCollector {
 	// 30-min fallback: NAT type changes rarely and a full run is multi-RTT, so we
 	// avoid probing every self-tick when a target sets no interval_seconds.
-	return &NATCollector{guard: guard, sched: newSchedState(30 * time.Minute), lastMapped: map[string]string{}}
+	return &NATCollector{guard: guard, sched: newSchedState(pcfg.DefaultNATInterval), lastMapped: map[string]string{}}
 }
 
 // SetTargets replaces the NAT target list from a DesiredState update.
@@ -116,11 +116,11 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 
 	perReq := time.Duration(t.Params.TimeoutMs) * time.Millisecond
 	if perReq <= 0 {
-		perReq = 3 * time.Second
+		perReq = pcfg.DefaultNATPerRequestTimeout
 	}
 	global := time.Duration(t.Params.GlobalTimeoutMs) * time.Millisecond
 	if global <= 0 {
-		global = 25 * time.Second // room for filtering + mapping with a couple of retries
+		global = pcfg.DefaultNATCycleDeadline // room for filtering + mapping with a couple of retries
 	}
 	rctx, cancel := context.WithTimeout(ctx, global)
 	defer cancel()
@@ -169,7 +169,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// them and report unknown rather than misleading data.
 	if !hasOther {
 		mapping, merr := mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
-		if be := asBlockedProbe(t.MonitorID, merr); be != nil {
+		if be := asBlockedProbe(t, merr); be != nil {
 			// A denied second STUN server is a target-policy block for the monitor;
 			// emit no synthetic NAT metric, route it to the status tracker.
 			res.Blocked = append(res.Blocked, *be)
@@ -197,7 +197,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// endpoint-independent (full cone). At this point only the primary server has
 	// been contacted (by the binding test), so the filtering test is uncontaminated.
 	filtering, ferr := filteringBehavior(rctx, c.guard, server, perReq)
-	if be := asBlockedProbe(t.MonitorID, ferr); be != nil {
+	if be := asBlockedProbe(t, ferr); be != nil {
 		res.Blocked = append(res.Blocked, *be)
 		return
 	}
@@ -214,7 +214,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		}
 		mapping, merr = mappingBehavior(rctx, rt, server, xor, other, hasOther, t.Params.STUNServer2, perReq)
 	}
-	if be := asBlockedProbe(t.MonitorID, merr); be != nil {
+	if be := asBlockedProbe(t, merr); be != nil {
 		res.Blocked = append(res.Blocked, *be)
 		return
 	}
@@ -232,11 +232,12 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 }
 
 // asBlockedProbe converts a policy-block error from a NAT sub-probe into a
-// BlockedProbe for the monitor, or nil for any non-block error.
-func asBlockedProbe(monitorID string, err error) *BlockedProbe {
+// BlockedProbe for the monitor (carrying the target's generation), or nil for any
+// non-block error.
+func asBlockedProbe(t pcfg.ProbeTarget, err error) *BlockedProbe {
 	var be *netguard.BlockedError
 	if errors.As(err, &be) {
-		bp := blockedFromErr(monitorID, be)
+		bp := blockedFromErr(t, be)
 		return &bp
 	}
 	return nil
@@ -253,12 +254,12 @@ func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Resul
 		// failure: emit no metric/event, route it to the monitor-status tracker.
 		var be *netguard.BlockedError
 		if errors.As(err, &be) {
-			res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+			res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 			return
 		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,
-			Value: 0, Unit: telemetry.UnitBool, Labels: base, MonitorID: t.MonitorID,
+			Value: 0, Unit: telemetry.UnitBool, Labels: base, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 		})
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerWAN,
@@ -271,11 +272,11 @@ func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Resul
 	okLabels := map[string]string{"transport": base["transport"], "server": base["server"], "mapped_addr": reflexive}
 	res.Metrics = append(res.Metrics,
 		telemetry.Metric{TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,
-			Value: 1, Unit: telemetry.UnitBool, Labels: okLabels, MonitorID: t.MonitorID})
+			Value: 1, Unit: telemetry.UnitBool, Labels: okLabels, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial})
 	if rtt > 0 {
 		res.Metrics = append(res.Metrics,
 			telemetry.Metric{TS: now, Kind: telemetry.NATRTTms, Target: t.Target, Layer: telemetry.LayerWAN,
-				Value: rtt, Unit: telemetry.UnitMs, Labels: base, MonitorID: t.MonitorID})
+				Value: rtt, Unit: telemetry.UnitMs, Labels: base, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial})
 	}
 
 	// The change-gate is per monitor: two monitors probing the same server must
@@ -298,7 +299,7 @@ func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Resul
 func natMetric(now time.Time, t pcfg.ProbeTarget, kind telemetry.MetricKind, code int, labels map[string]string) telemetry.Metric {
 	return telemetry.Metric{
 		TS: now, Kind: kind, Target: t.Target, Layer: telemetry.LayerWAN,
-		Value: float64(code), Unit: telemetry.UnitCode, Labels: labels, MonitorID: t.MonitorID,
+		Value: float64(code), Unit: telemetry.UnitCode, Labels: labels, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 	}
 }
 

@@ -24,7 +24,7 @@ type TCPCollector struct {
 }
 
 func NewTCPCollector(guard *netguard.Guard) *TCPCollector {
-	return &TCPCollector{sched: newSchedState(30 * time.Second), guard: guard}
+	return &TCPCollector{sched: newSchedState(pcfg.DefaultTCPInterval), guard: guard}
 }
 
 func (c *TCPCollector) SetTargets(targets []pcfg.ProbeTarget) {
@@ -64,13 +64,13 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result) {
 	timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = pcfg.DefaultTCPTimeout
 	}
 	port := strconv.Itoa(t.Params.Port)
 	labels := map[string]string{"port": port}
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
 		return telemetry.Metric{TS: now, Kind: kind, Target: t.Target, Layer: telemetry.LayerService,
-			Value: v, Unit: unit, Labels: labels, MonitorID: t.MonitorID}
+			Value: v, Unit: unit, Labels: labels, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial}
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -90,7 +90,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	} else {
 		hd := c.guard.CheckHost(t.Target)
 		if hd.Denied {
-			res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, Matched: hd.Matched, Reason: "resolved_denied"})
+			res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: hd.Matched, Reason: "resolved_denied"})
 			return
 		}
 		r0 := time.Now()
@@ -98,7 +98,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		if err != nil {
 			var be *netguard.BlockedError
 			if errors.As(err, &be) {
-				res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+				res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 				return
 			}
 			// Plain resolution failure: down, classified as DNS. No dns_ms (the
@@ -157,7 +157,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	// A literal-IP connect can still hit a policy block (surfaced by the guard).
 	var be *netguard.BlockedError
 	if errors.As(dialErr, &be) {
-		res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+		res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 		return
 	}
 

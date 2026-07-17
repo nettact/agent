@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/protocol/config"
@@ -30,6 +31,10 @@ type Tracker struct {
 	supported  permission.Set
 	guard      *netguard.Guard
 	policyHash string
+	// minProbeInterval is the agent-local per-target interval floor (the same
+	// stability limit the collectors apply). It raises the reported effective
+	// interval so the server's freshness window matches what the agent runs.
+	minProbeInterval time.Duration
 
 	mu            sync.Mutex
 	configVersion int
@@ -40,17 +45,19 @@ type Tracker struct {
 	updates chan wire.MonitorStatus // cap-1 latest-wins
 }
 
-// New builds a Tracker.
-func New(effective, granted, supported permission.Set, guard *netguard.Guard, policyHash string) *Tracker {
+// New builds a Tracker. minProbeInterval is the agent-local probe-interval floor
+// (0 = none) that the reported effective per-target interval is floored by.
+func New(effective, granted, supported permission.Set, guard *netguard.Guard, policyHash string, minProbeInterval time.Duration) *Tracker {
 	return &Tracker{
-		effective:  effective,
-		granted:    granted,
-		supported:  supported,
-		guard:      guard,
-		policyHash: policyHash,
-		base:       map[string]wire.MonitorStatusEntry{},
-		runtime:    map[string]wire.MonitorStatusEntry{},
-		updates:    make(chan wire.MonitorStatus, 1),
+		effective:        effective,
+		granted:          granted,
+		supported:        supported,
+		guard:            guard,
+		policyHash:       policyHash,
+		minProbeInterval: minProbeInterval,
+		base:             map[string]wire.MonitorStatusEntry{},
+		runtime:          map[string]wire.MonitorStatusEntry{},
+		updates:          make(chan wire.MonitorStatus, 1),
 	}
 }
 
@@ -79,6 +86,7 @@ func (t *Tracker) ApplyDesired(configVersion int, targets []config.ProbeTarget) 
 			continue
 		}
 		entry := t.evaluate(tgt)
+		t.stampSchedule(&entry, tgt)
 		t.base[tgt.MonitorID] = entry
 		t.order = append(t.order, tgt.MonitorID)
 		if entry.Status == wire.MonitorStatusActive {
@@ -86,6 +94,20 @@ func (t *Tracker) ApplyDesired(configVersion int, targets []config.ProbeTarget) 
 		}
 	}
 	return runnable, t.frameLocked()
+}
+
+// stampSchedule fills the per-entry material generation and the actual effective
+// per-target schedule (interval floored by the agent-local MinProbeInterval,
+// whole-cycle deadline) from the applied ProbeTarget. Stamped on every entry —
+// active or blocked — so the server reads a consistent generation/freshness echo.
+func (t *Tracker) stampSchedule(entry *wire.MonitorStatusEntry, tgt config.ProbeTarget) {
+	entry.TargetConfigSerial = tgt.ConfigSerial
+	iv := config.EffectiveInterval(tgt.Kind, tgt.Params)
+	if t.minProbeInterval > 0 && iv < t.minProbeInterval {
+		iv = t.minProbeInterval
+	}
+	entry.EffectiveIntervalSeconds = int(iv / time.Second)
+	entry.CycleDeadlineMs = int(config.CycleDeadline(tgt.Kind, tgt.Params) / time.Millisecond)
 }
 
 // evaluate computes a monitor's static status: permission first, then target
@@ -142,11 +164,21 @@ func (t *Tracker) evaluate(tgt config.ProbeTarget) wire.MonitorStatusEntry {
 }
 
 // RuntimeBlocked records a runtime target-policy block for a monitor and pushes
-// an updated full-state frame. A monitor already statically blocked is left as
-// is (the static block is authoritative for scheduling).
-func (t *Tracker) RuntimeBlocked(monitorID, matched, reason string) {
+// an updated full-state frame. The transition is attributed to the generation that
+// produced it (configSerial): it is ignored unless it exactly matches the currently
+// tracked base entry's TargetConfigSerial, so an obsolete in-flight probe can never
+// block, relabel, or otherwise alter the current generation. A monitor already
+// statically blocked is left as is (the static block is authoritative for
+// scheduling).
+func (t *Tracker) RuntimeBlocked(monitorID string, configSerial int, matched, reason string) {
 	t.mu.Lock()
-	if _, tracked := t.base[monitorID]; !tracked {
+	base, tracked := t.base[monitorID]
+	if !tracked {
+		t.mu.Unlock()
+		return
+	}
+	if configSerial != base.TargetConfigSerial {
+		// Obsolete in-flight result from a superseded generation — drop it.
 		t.mu.Unlock()
 		return
 	}
@@ -158,6 +190,11 @@ func (t *Tracker) RuntimeBlocked(monitorID, matched, reason string) {
 	t.runtime[monitorID] = wire.MonitorStatusEntry{
 		MonitorID: monitorID, Status: wire.MonitorStatusTargetBlocked,
 		MatchedSelector: matched, Reason: reason,
+		// Retain the current base entry's generation echo + effective schedule so a
+		// runtime override reports the same per-target facts as its static counterpart.
+		EffectiveIntervalSeconds: base.EffectiveIntervalSeconds,
+		CycleDeadlineMs:          base.CycleDeadlineMs,
+		TargetConfigSerial:       base.TargetConfigSerial,
 	}
 	frame := t.frameLocked()
 	t.mu.Unlock()
@@ -165,10 +202,17 @@ func (t *Tracker) RuntimeBlocked(monitorID, matched, reason string) {
 }
 
 // RuntimeOK clears a runtime block for a monitor (a later clean dial) and pushes
-// an updated frame if the state changed.
-func (t *Tracker) RuntimeOK(monitorID string) {
+// an updated frame if the state changed. Like RuntimeBlocked it is attributed to
+// the originating generation (configSerial): a recovery from a superseded generation
+// is ignored so an obsolete in-flight result can never clear the current status.
+func (t *Tracker) RuntimeOK(monitorID string, configSerial int) {
 	t.mu.Lock()
 	if _, had := t.runtime[monitorID]; !had {
+		t.mu.Unlock()
+		return
+	}
+	if configSerial != t.base[monitorID].TargetConfigSerial {
+		// Obsolete in-flight recovery from a superseded generation — drop it.
 		t.mu.Unlock()
 		return
 	}

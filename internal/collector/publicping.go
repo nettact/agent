@@ -25,7 +25,7 @@ type PublicPingCollector struct {
 func NewPublicPingCollector(p platform.Platform, guard *netguard.Guard) *PublicPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &PublicPingCollector{p: p, guard: guard, sched: newSchedState(10 * time.Second)}
+	return &PublicPingCollector{p: p, guard: guard, sched: newSchedState(pcfg.DefaultICMPInterval)}
 }
 
 // SetTargets replaces the ICMP target list from a DesiredState update.
@@ -58,6 +58,7 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 		pingTarget, blocked, unresolved := c.vet(ctx, t)
 		if blocked != nil {
 			blocked.MonitorID = t.MonitorID
+			blocked.ConfigSerial = t.ConfigSerial
 			res.Blocked = append(res.Blocked, *blocked)
 			continue
 		}
@@ -68,11 +69,11 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			// would re-resolve it through the system resolver OUTSIDE the guard — a
 			// DNS-rebinding / policy-bypass hole (e.g. a dual-stack name whose AAAA
 			// fails but A resolves to a denied address).
-			appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerInternet, labels, pingCycleResult{Loss: 100})
+			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels, pingCycleResult{Loss: 100})
 			continue
 		}
 		r := pingCycle(ctx, c.p, pingTarget, t.Params)
-		appendICMPMetrics(&res, now, t.MonitorID, t.Target, telemetry.LayerInternet, labels, r)
+		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels, r)
 	}
 	return res, nil
 }
@@ -123,8 +124,9 @@ func pickPingAddr(vetted []netip.Addr) netip.Addr {
 
 // pingSpacing is the fixed delay between echoes in a multi-packet cycle, so a
 // single cycle samples jitter over a short window (~1s for the default 5 packets)
-// rather than back-to-back. Not configurable in v1.
-const pingSpacing = 200 * time.Millisecond
+// rather than back-to-back. Sourced from the shared schedule helpers (not
+// configurable in v1) so the collector and the server's cycle-deadline math agree.
+const pingSpacing = pcfg.PingSpacing
 
 // pingCycle runs one ICMP probe cycle for target per its ProbeParams and returns
 // the loss percentage and the RTT distribution (avg/min/max/jitter) over the
@@ -132,26 +134,19 @@ const pingSpacing = 200 * time.Millisecond
 // the same per-target packet count, spacing, payload size, per-echo timeout and
 // global deadline semantics. Lost echoes contribute to loss only — never a
 // zero-latency sample — so the distribution is computed over received echoes.
+//
+// The packet count, per-echo timeout, and inter-echo spacing come from the shared
+// protocol/config schedule helpers, so a probe's real cycle timing can never
+// drift from the whole-cycle deadline the server derives (pcfg.CycleDeadline).
 func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams) pingCycleResult {
 	// PacketCount takes precedence; failing that, the legacy Retries knob (count =
-	// retries+1) when a user set it; otherwise a short burst of 5 so jitter/min/max
-	// are meaningful by default. (Retries defaults to 0, so it must be gated on
-	// >0 — otherwise Retries+1 would pin the default to 1 and the burst never runs.)
-	count := params.PacketCount
-	if count < 1 {
-		if params.Retries > 0 {
-			count = params.Retries + 1
-		} else {
-			count = 5
-		}
-	}
+	// retries+1) when a user set it; otherwise a short burst so jitter/min/max are
+	// meaningful by default.
+	count := pcfg.PingCount(params)
 	// Default per-echo timeout is 1s: generous for real ICMP RTTs (<1s worldwide)
 	// yet keeps a fully-lost default cycle (5×1s + 4×200ms ≈ 5.8s) under the 10s
 	// interval so one dead target does not starve the self-loop.
-	timeout := time.Duration(params.TimeoutMs) * time.Millisecond
-	if timeout <= 0 {
-		timeout = time.Second
-	}
+	timeout := pcfg.PingEchoTimeout(params)
 	// GlobalTimeoutMs bounds the whole cycle across all echoes, regardless of how
 	// many packets are configured. We enforce it with a wall-clock deadline and by
 	// capping each ping's own timeout to the time remaining — context cancellation

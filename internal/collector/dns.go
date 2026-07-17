@@ -44,7 +44,7 @@ func NewDNSCollector(guard *netguard.Guard) *DNSCollector {
 	return &DNSCollector{
 		resolver:   net.DefaultResolver,
 		httpClient: &http.Client{Transport: doh},
-		sched:      newSchedState(30 * time.Second),
+		sched:      newSchedState(pcfg.DefaultDNSInterval),
 		guard:      guard,
 	}
 }
@@ -74,7 +74,7 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 	for _, t := range targets {
 		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
 		if timeout <= 0 {
-			timeout = 3 * time.Second
+			timeout = pcfg.DefaultDNSTimeout
 		}
 
 		cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -113,7 +113,7 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		// A policy block on the custom resolver endpoint is not a DNS failure.
 		var be *netguard.BlockedError
 		if errors.As(derr, &be) {
-			res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+			res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 			continue
 		}
 
@@ -123,13 +123,13 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.DNSOK, Target: t.Target, Layer: telemetry.LayerDNS, Value: okv, Unit: telemetry.UnitBool,
-			MonitorID: t.MonitorID,
+			MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 		})
 		if ok {
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.DNSResolve, Target: t.Target, Layer: telemetry.LayerDNS,
 				Value: float64(time.Since(t0).Microseconds()) / 1000.0, Unit: telemetry.UnitMs,
-				MonitorID: t.MonitorID,
+				MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 			})
 		} else {
 			res.Events = append(res.Events, telemetry.Event{

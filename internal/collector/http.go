@@ -49,7 +49,7 @@ type HTTPCollector struct {
 
 func NewHTTPCollector(guard *netguard.Guard, allowExtended bool) *HTTPCollector {
 	return &HTTPCollector{
-		sched:         newSchedState(30 * time.Second),
+		sched:         newSchedState(pcfg.DefaultHTTPInterval),
 		guard:         guard,
 		allowExtended: allowExtended,
 		clients:       map[string]*http.Client{},
@@ -168,7 +168,7 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		}
 		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
 		if timeout <= 0 {
-			timeout = 10 * time.Second
+			timeout = pcfg.DefaultHTTPTimeout
 		}
 		method := t.Params.Method
 		if method == "" {
@@ -211,12 +211,12 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 			// event, and route the block to the monitor-status tracker.
 			var be *netguard.BlockedError
 			if errors.As(err, &be) {
-				res.Blocked = append(res.Blocked, blockedFromErr(t.MonitorID, be))
+				res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 				continue
 			}
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,
-				MonitorID: t.MonitorID,
+				MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 			})
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
@@ -247,9 +247,9 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 			ok = 1.0
 		}
 		res.Metrics = append(res.Metrics,
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(status), Unit: telemetry.UnitCode, MonitorID: t.MonitorID},
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: lat, Unit: telemetry.UnitMs, MonitorID: t.MonitorID},
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool, MonitorID: t.MonitorID},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(status), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: lat, Unit: telemetry.UnitMs, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 		)
 	}
 	return res, nil
@@ -276,13 +276,15 @@ func httpParamsNeedExtended(p pcfg.ProbeParams) bool {
 }
 
 // blockedFromErr builds a BlockedProbe from a policy block, choosing a reason
-// that distinguishes a resolved/redirect block from a literal-IP block.
-func blockedFromErr(monitorID string, be *netguard.BlockedError) BlockedProbe {
+// that distinguishes a resolved/redirect block from a literal-IP block. It carries
+// the originating target's MonitorID and ConfigSerial so the block is attributable
+// to the exact generation that produced it.
+func blockedFromErr(t pcfg.ProbeTarget, be *netguard.BlockedError) BlockedProbe {
 	reason := "literal_denied"
 	if be.FromResolve {
 		reason = "resolved_denied"
 	}
-	return BlockedProbe{MonitorID: monitorID, Matched: be.Matched, Reason: reason}
+	return BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: be.Matched, Reason: reason}
 }
 
 // statusAccepted decides whether an HTTP status counts as up. Precedence:

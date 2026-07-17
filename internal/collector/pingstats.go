@@ -122,9 +122,9 @@ type pingCycleResult struct {
 // and samples are always emitted (samples=0 is an honest "0 of N received", not a
 // fake latency); avg/min/max only when at least one echo returned; jitter only
 // when the distribution has >=2 samples.
-func appendICMPMetrics(res *Result, now time.Time, monitorID, target string, layer telemetry.HealthLayer, labels map[string]string, r pingCycleResult) {
+func appendICMPMetrics(res *Result, now time.Time, monitorID string, configSerial int, target string, layer telemetry.HealthLayer, labels map[string]string, r pingCycleResult) {
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
-		return telemetry.Metric{TS: now, Kind: kind, Target: target, Layer: layer, Value: v, Unit: unit, Labels: labels, MonitorID: monitorID}
+		return telemetry.Metric{TS: now, Kind: kind, Target: target, Layer: layer, Value: v, Unit: unit, Labels: labels, MonitorID: monitorID, ConfigSerial: configSerial}
 	}
 	res.Metrics = append(res.Metrics,
 		mk(telemetry.ICMPLoss, r.Loss, telemetry.UnitPct),
