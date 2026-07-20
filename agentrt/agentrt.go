@@ -46,7 +46,10 @@ import (
 )
 
 // Version is the agent version reported at enrollment and in the Hello frame.
-const Version = "0.3.0-m3"
+// A var so release builds stamp the real tag via
+// -ldflags "-X github.com/nettact/agent/agentrt.Version=vX.Y.Z"; unstamped
+// local/dev builds report "dev".
+var Version = "dev"
 
 // Terminal outcomes. Run returns one of these (wrapped) when re-running the same
 // process cannot help without intervention; a supervisor uses errors.Is to pick
