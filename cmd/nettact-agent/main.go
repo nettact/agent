@@ -24,7 +24,7 @@ const usage = `nettact-agent — NetTact monitoring agent
 
 Configuration is via environment variables (no flags):
 
-  NETTACT_AGENT_SERVER_URL          server base URL, e.g. http://host:8080 (required)
+  NETTACT_AGENT_SERVER_URL          server base URL, e.g. http://host:12450 (required)
   NETTACT_AGENT_DATA_DIR            agent state directory (default ./agent-data)
   NETTACT_AGENT_ENROLL_TOKEN        one-time enrollment token (first run only)
   NETTACT_AGENT_ENROLL_TOKEN_FILE   path to the enrollment token (preferred; mutually exclusive)

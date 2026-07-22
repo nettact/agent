@@ -11,7 +11,7 @@ M1 已实现：
 近零配置运行（配置全部来自 `NETTACT_AGENT_*` 环境变量，**不再有命令行参数**；仅保留 `--help` / `--version`）：
 
 ```powershell
-$env:NETTACT_AGENT_SERVER_URL   = "http://localhost:8080"
+$env:NETTACT_AGENT_SERVER_URL   = "http://localhost:12450"
 $env:NETTACT_AGENT_ENROLL_TOKEN_FILE = "C:\nettact\agent.token"   # 首次注册，优先用文件
 go run ./cmd/nettact-agent
 ```
