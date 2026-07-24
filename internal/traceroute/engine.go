@@ -24,7 +24,7 @@ const (
 
 	defaultMaxHops      = 30
 	defaultAttempts     = 3
-	defaultTotalTimeout = 120 * time.Second
+	defaultTotalTimeout = 90 * time.Second
 
 	// Per-attempt probe budget bounds, derived from the total timeout and hop
 	// count and then clamped into this window so one slow hop cannot starve the
