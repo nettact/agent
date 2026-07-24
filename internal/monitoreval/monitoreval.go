@@ -35,6 +35,10 @@ type Tracker struct {
 	// stability limit the collectors apply). It raises the reported effective
 	// interval so the server's freshness window matches what the agent runs.
 	minProbeInterval time.Duration
+	// uploadIntervalSeconds is the agent's global WAL batch-upload cadence rounded
+	// up to whole seconds. Reported frame-level so the server folds the agent's
+	// batching + drain latency into the freshness window.
+	uploadIntervalSeconds int
 
 	mu            sync.Mutex
 	configVersion int
@@ -47,18 +51,30 @@ type Tracker struct {
 
 // New builds a Tracker. minProbeInterval is the agent-local probe-interval floor
 // (0 = none) that the reported effective per-target interval is floored by.
-func New(effective, granted, supported permission.Set, guard *netguard.Guard, policyHash string, minProbeInterval time.Duration) *Tracker {
+// uploadInterval is the agent's global WAL batch-upload cadence, reported at the
+// frame level rounded up to whole seconds (a sub-second interval becomes 1).
+func New(effective, granted, supported permission.Set, guard *netguard.Guard, policyHash string, minProbeInterval, uploadInterval time.Duration) *Tracker {
 	return &Tracker{
-		effective:        effective,
-		granted:          granted,
-		supported:        supported,
-		guard:            guard,
-		policyHash:       policyHash,
-		minProbeInterval: minProbeInterval,
-		base:             map[string]wire.MonitorStatusEntry{},
-		runtime:          map[string]wire.MonitorStatusEntry{},
-		updates:          make(chan wire.MonitorStatus, 1),
+		effective:             effective,
+		granted:               granted,
+		supported:             supported,
+		guard:                 guard,
+		policyHash:            policyHash,
+		minProbeInterval:      minProbeInterval,
+		uploadIntervalSeconds: ceilSeconds(uploadInterval),
+		base:                  map[string]wire.MonitorStatusEntry{},
+		runtime:               map[string]wire.MonitorStatusEntry{},
+		updates:               make(chan wire.MonitorStatus, 1),
 	}
+}
+
+// ceilSeconds rounds a positive duration up to whole seconds (500ms → 1). A
+// non-positive duration yields 0.
+func ceilSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	return int((d + time.Second - 1) / time.Second)
 }
 
 // Updates is the cap-1 latest-wins channel the session goroutine selects on to
@@ -233,7 +249,12 @@ func (t *Tracker) frameLocked() wire.MonitorStatus {
 		}
 		statuses = append(statuses, t.base[id])
 	}
-	return wire.MonitorStatus{ConfigVersion: t.configVersion, PolicyHash: t.policyHash, Statuses: statuses}
+	return wire.MonitorStatus{
+		ConfigVersion:         t.configVersion,
+		PolicyHash:            t.policyHash,
+		UploadIntervalSeconds: t.uploadIntervalSeconds,
+		Statuses:              statuses,
+	}
 }
 
 // push writes the latest frame to the cap-1 channel, dropping any stale pending

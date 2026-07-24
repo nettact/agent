@@ -298,7 +298,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// never built, so its OS/gopsutil operations are never invoked.
 	var configurables []conn.Configurable
 	var selfSched []collector.Collector
-	tracker := monitoreval.New(effective, granted, supported, guard, hash, cfg.Limits.MinProbeInterval)
+	tracker := monitoreval.New(effective, granted, supported, guard, hash, cfg.Limits.MinProbeInterval, cfg.UploadInterval)
 
 	addProbe := func(c interface {
 		conn.Configurable

@@ -50,7 +50,7 @@ func TestDesiredStateIsAppliedBeforeGenerationIsAttested(t *testing.T) {
 	configurable := &fakeConfigurable{}
 	scheduler := &fakeScheduler{}
 	tracker := monitoreval.New(permission.All(), permission.All(), permission.All(),
-		netguard.New(probepolicy.Policy{}, true), "policy", 0)
+		netguard.New(probepolicy.Policy{}, true), "policy", 0, 5*time.Second)
 	r := &runner{
 		deps: Deps{
 			Configurables: []Configurable{configurable}, Scheduler: scheduler, Tracker: tracker,

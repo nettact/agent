@@ -13,12 +13,15 @@ import (
 
 func TestRuntimeTransitionsRequireCurrentTargetGeneration(t *testing.T) {
 	tracker := New(permission.All(), permission.All(), permission.All(),
-		netguard.New(probepolicy.Policy{}, true), "policy", 45*time.Second)
+		netguard.New(probepolicy.Policy{}, true), "policy", 45*time.Second, 5*time.Second)
 	target := config.ProbeTarget{
 		MonitorID: "monitor-a", Kind: "http", Target: "https://example.test",
 		Params: config.ProbeParams{IntervalSeconds: 10, TimeoutMs: 2_000}, ConfigSerial: 7,
 	}
 	_, frame := tracker.ApplyDesired(3, []config.ProbeTarget{target})
+	if frame.UploadIntervalSeconds != 5 {
+		t.Fatalf("UploadIntervalSeconds = %d, want 5", frame.UploadIntervalSeconds)
+	}
 	entry := frame.Statuses[0]
 	if entry.TargetConfigSerial != 7 || entry.EffectiveIntervalSeconds != 45 || entry.CycleDeadlineMs != 2_000 {
 		t.Fatalf("schedule/generation = %+v", entry)
@@ -28,6 +31,9 @@ func TestRuntimeTransitionsRequireCurrentTargetGeneration(t *testing.T) {
 	assertNoUpdate(t, tracker)
 	tracker.RuntimeBlocked("monitor-a", 7, "scope:private", "resolved_denied")
 	blocked := receiveUpdate(t, tracker)
+	if blocked.UploadIntervalSeconds != 5 {
+		t.Fatalf("runtime frame UploadIntervalSeconds = %d, want 5", blocked.UploadIntervalSeconds)
+	}
 	if got := blocked.Statuses[0]; got.Status != wire.MonitorStatusTargetBlocked || got.TargetConfigSerial != 7 {
 		t.Fatalf("current block = %+v", got)
 	}
@@ -47,6 +53,29 @@ func TestRuntimeTransitionsRequireCurrentTargetGeneration(t *testing.T) {
 	recovered := receiveUpdate(t, tracker)
 	if got := recovered.Statuses[0]; got.Status != wire.MonitorStatusActive || got.TargetConfigSerial != 8 {
 		t.Fatalf("current recovery = %+v", got)
+	}
+}
+
+func TestUploadIntervalSecondsRoundsUp(t *testing.T) {
+	cases := []struct {
+		name   string
+		upload time.Duration
+		want   int
+	}{
+		{"subsecond rounds up to 1", 500 * time.Millisecond, 1},
+		{"whole second", 5 * time.Second, 5},
+		{"fractional rounds up", 5001 * time.Millisecond, 6},
+		{"zero stays zero", 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker := New(permission.All(), permission.All(), permission.All(),
+				netguard.New(probepolicy.Policy{}, true), "policy", 0, tc.upload)
+			_, frame := tracker.ApplyDesired(1, nil)
+			if frame.UploadIntervalSeconds != tc.want {
+				t.Fatalf("UploadIntervalSeconds = %d, want %d", frame.UploadIntervalSeconds, tc.want)
+			}
+		})
 	}
 }
 
