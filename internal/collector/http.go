@@ -224,14 +224,16 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 				break // the request was aborted by the cancelled run, not the service
 			}
 			// Classify the transport failure (DNS/refused/timeout/unreachable/TLS) so a
-			// fired alert records WHY, not just "unavailable". No status/latency metric —
-			// the request never completed.
+			// fired alert records WHY, not just "unavailable", with the raw transport
+			// error as the detail behind the code. No status/latency metric — the
+			// request never completed.
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,
 				MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 			}, telemetry.Metric{
 				TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService,
 				Value: float64(classifyNetError(err)), Unit: telemetry.UnitCode,
+				Labels:    withDetail(nil, errText(err)),
 				MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 			})
 			res.Events = append(res.Events, telemetry.Event{
@@ -245,12 +247,18 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		// Read the body only when a keyword match is configured, bounded so a large
 		// response can't blow up agent memory. Otherwise drain a little and close.
 		bodyMatch := true
+		// bodyErr is kept so a body cut short by a reset/truncation is not mistaken
+		// for a content mismatch: reading only part of the body proves nothing about
+		// what the rest contained. Hitting the LimitReader cap is not an error
+		// (ReadAll swallows the EOF), so a legitimately large body stays unaffected.
+		var bodyErr error
 		if t.Params.Keyword != "" {
 			limit := t.Params.MaxResponseBytes
 			if limit <= 0 {
 				limit = defaultMaxResponseBytes
 			}
-			buf, _ := io.ReadAll(io.LimitReader(resp.Body, int64(limit)))
+			var buf []byte
+			buf, bodyErr = io.ReadAll(io.LimitReader(resp.Body, int64(limit)))
 			found := strings.Contains(string(buf), t.Params.Keyword)
 			bodyMatch = found != t.Params.KeywordInvert // invert flips the required condition
 		}
@@ -262,13 +270,41 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		if statusOK && bodyMatch {
 			ok = 1.0
 		}
-		// The request completed (transport OK), so error_class is None even on a bad
-		// status — the rejected status/keyword is the "why", carried by HTTPStatus/HTTPOK.
+		// The headers arrived, so a failure here is normally an acceptance failure:
+		// the rejected status or keyword IS the reason, carried as its own refined
+		// code (a status rejection outranks a keyword miss — the body of an
+		// unaccepted response proves nothing) with the concrete rejection as the
+		// detail. The exception is a keyword miss on a body that failed to read
+		// through: that is a transport fault, not bad content, so it classifies by
+		// the read error. None only when the probe fully passed.
+		errClass := telemetry.ProbeReasonNone
+		detail := ""
+		switch {
+		case !statusOK:
+			errClass = telemetry.ProbeReasonHTTPStatus
+			detail = "HTTP " + strconv.Itoa(status)
+		case !bodyMatch && bodyErr != nil:
+			errClass = classifyNetError(bodyErr)
+			detail = errText(bodyErr)
+		case !bodyMatch:
+			// State the configured check that failed: without invert the keyword was
+			// required and missing; with invert it was forbidden and present.
+			errClass = telemetry.ProbeReasonHTTPKeyword
+			if t.Params.KeywordInvert {
+				detail = "keyword " + strconv.Quote(t.Params.Keyword) + " unexpectedly present"
+			} else {
+				detail = "keyword " + strconv.Quote(t.Params.Keyword) + " not found"
+			}
+		}
+		ec := telemetry.Metric{TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService, Value: float64(errClass), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial}
+		if errClass != telemetry.ProbeReasonNone {
+			ec.Labels = withDetail(nil, detail)
+		}
 		res.Metrics = append(res.Metrics,
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(status), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: lat, Unit: telemetry.UnitMs, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
-			telemetry.Metric{TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService, Value: float64(telemetry.ProbeReasonNone), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+			ec,
 		)
 	}
 	return res, nil

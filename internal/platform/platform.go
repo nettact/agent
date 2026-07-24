@@ -66,6 +66,10 @@ type PingResult struct {
 	// (Timeout / Unreachable / Other); 0 (ProbeReasonNone) when Received or when the
 	// platform cannot classify (the non-Windows stub never sets it).
 	Reason int
+	// Detail is the OS's raw cause behind Reason (e.g. the IP_STATUS name on
+	// Windows), human-readable and never localized; empty when Received or when the
+	// platform cannot classify.
+	Detail string
 }
 
 // PingOptions tunes a single ICMP echo. Zero values mean "use defaults", so an

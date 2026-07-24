@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -283,21 +284,24 @@ func (winPlatform) Ping(ctx context.Context, target string, opts PingOptions) (P
 	if ret == 0 {
 		// No reply. GetLastError carries the extended IP_STATUS (timeout / unreachable);
 		// classify it so a fully-lost cycle records WHY (an unclassifiable send defaults
-		// to timeout — the echo got no answer within the deadline).
+		// to timeout — the echo got no answer within the deadline), and keep the raw
+		// IP_STATUS name as the detail behind the classification.
 		res.Reason = telemetry.ProbeReasonTimeout
-		if errno, ok := callErr.(syscall.Errno); ok {
+		if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
 			if r := mapWinIPStatus(uint32(errno)); r != telemetry.ProbeReasonNone {
 				res.Reason = r
 			}
+			res.Detail = winIPStatusName(uint32(errno))
 		}
 		return res, nil
 	}
 	reply := (*icmpEchoReply)(unsafe.Pointer(&replyBuf[0]))
 	if reply.Status != 0 { // IP_SUCCESS == 0
-		res.Reason = mapWinIPStatus(uint32(reply.Status))
+		res.Reason = mapWinIPStatus(reply.Status)
 		if res.Reason == telemetry.ProbeReasonNone {
 			res.Reason = telemetry.ProbeReasonTimeout
 		}
+		res.Detail = winIPStatusName(reply.Status)
 		return res, nil
 	}
 	res.Received = true
@@ -309,6 +313,8 @@ func (winPlatform) Ping(ctx context.Context, target string, opts PingOptions) (P
 const (
 	ipDestNetUnreachable  = 11002
 	ipDestHostUnreachable = 11003
+	ipDestProtUnreachable = 11004
+	ipDestPortUnreachable = 11005
 	ipReqTimedOut         = 11010
 )
 
@@ -317,11 +323,47 @@ func mapWinIPStatus(status uint32) int {
 	switch status {
 	case ipReqTimedOut:
 		return telemetry.ProbeReasonTimeout
-	case ipDestNetUnreachable, ipDestHostUnreachable:
+	case ipDestNetUnreachable, ipDestHostUnreachable, ipDestProtUnreachable, ipDestPortUnreachable:
 		return telemetry.ProbeReasonUnreachable
 	case 0: // IP_SUCCESS
 		return telemetry.ProbeReasonNone
 	default:
 		return telemetry.ProbeReasonOther
 	}
+}
+
+// winIPStatusNames are the ipexport.h identifiers for the IP_STATUS codes an
+// IcmpSendEcho failure can surface, so the detail label states the OS's own name
+// rather than a bare number.
+var winIPStatusNames = map[uint32]string{
+	11001: "IP_BUF_TOO_SMALL",
+	11002: "IP_DEST_NET_UNREACHABLE",
+	11003: "IP_DEST_HOST_UNREACHABLE",
+	11004: "IP_DEST_PROT_UNREACHABLE",
+	11005: "IP_DEST_PORT_UNREACHABLE",
+	11006: "IP_NO_RESOURCES",
+	11007: "IP_BAD_OPTION",
+	11008: "IP_HW_ERROR",
+	11009: "IP_PACKET_TOO_BIG",
+	11010: "IP_REQ_TIMED_OUT",
+	11011: "IP_BAD_REQ",
+	11012: "IP_BAD_ROUTE",
+	11013: "IP_TTL_EXPIRED_TRANSIT",
+	11014: "IP_TTL_EXPIRED_REASSEM",
+	11015: "IP_PARAM_PROBLEM",
+	11016: "IP_SOURCE_QUENCH",
+	11017: "IP_OPTION_TOO_BIG",
+	11018: "IP_BAD_DESTINATION",
+	11050: "IP_GENERAL_FAILURE",
+}
+
+// winIPStatusName renders an IP_STATUS for the error_class detail label:
+// "IP_DEST_HOST_UNREACHABLE (11003)" for a known code, the bare "IP_STATUS <n>"
+// otherwise — the number alone is still the machine truth.
+func winIPStatusName(status uint32) string {
+	n := strconv.FormatUint(uint64(status), 10)
+	if name, ok := winIPStatusNames[status]; ok {
+		return name + " (" + n + ")"
+	}
+	return "IP_STATUS " + n
 }

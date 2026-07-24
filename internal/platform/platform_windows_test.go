@@ -2,7 +2,11 @@
 
 package platform
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/nettact/protocol/telemetry"
+)
 
 func TestIsHiddenVirtualWirelessAdapter(t *testing.T) {
 	cases := []struct {
@@ -26,6 +30,46 @@ func TestIsHiddenVirtualWirelessAdapter(t *testing.T) {
 	for _, c := range cases {
 		if got := isHiddenVirtualWirelessAdapter(c.desc); got != c.want {
 			t.Errorf("isHiddenVirtualWirelessAdapter(%q) = %v, want %v", c.desc, got, c.want)
+		}
+	}
+}
+
+func TestMapWinIPStatus(t *testing.T) {
+	cases := []struct {
+		status uint32
+		want   int
+	}{
+		{0, telemetry.ProbeReasonNone}, // IP_SUCCESS
+		{ipReqTimedOut, telemetry.ProbeReasonTimeout},
+		{ipDestNetUnreachable, telemetry.ProbeReasonUnreachable},
+		{ipDestHostUnreachable, telemetry.ProbeReasonUnreachable},
+		{ipDestProtUnreachable, telemetry.ProbeReasonUnreachable},
+		{ipDestPortUnreachable, telemetry.ProbeReasonUnreachable},
+		{11013, telemetry.ProbeReasonOther}, // IP_TTL_EXPIRED_TRANSIT
+		{11050, telemetry.ProbeReasonOther}, // IP_GENERAL_FAILURE
+	}
+	for _, c := range cases {
+		if got := mapWinIPStatus(c.status); got != c.want {
+			t.Errorf("mapWinIPStatus(%d) = %d, want %d", c.status, got, c.want)
+		}
+	}
+}
+
+func TestWinIPStatusName(t *testing.T) {
+	cases := []struct {
+		status uint32
+		want   string
+	}{
+		{ipDestHostUnreachable, "IP_DEST_HOST_UNREACHABLE (11003)"},
+		{ipDestProtUnreachable, "IP_DEST_PROT_UNREACHABLE (11004)"},
+		{ipDestPortUnreachable, "IP_DEST_PORT_UNREACHABLE (11005)"},
+		{ipReqTimedOut, "IP_REQ_TIMED_OUT (11010)"},
+		// Outside the named set the bare number is still the machine truth.
+		{12345, "IP_STATUS 12345"},
+	}
+	for _, c := range cases {
+		if got := winIPStatusName(c.status); got != c.want {
+			t.Errorf("winIPStatusName(%d) = %q, want %q", c.status, got, c.want)
 		}
 	}
 }

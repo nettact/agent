@@ -63,7 +63,7 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 		// Vet the destination before dialing: a literal IP is checked directly; a
 		// hostname is resolved once through the guard and the vetted IP is pinned to
 		// the ping. A policy block is a target-policy block, not a loss sample.
-		pingTarget, blocked, unresolved := c.vet(ctx, t)
+		pingTarget, blocked, resolveErr := c.vet(ctx, t)
 		if blocked != nil {
 			blocked.MonitorID = t.MonitorID
 			blocked.ConfigSerial = t.ConfigSerial
@@ -71,7 +71,7 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			continue
 		}
 		labels := map[string]string{"ip": t.Target}
-		if unresolved {
+		if resolveErr != nil {
 			// Resolution failed AFTER policy vetting. Record a probe failure (100%
 			// loss) rather than handing the raw name to the platform pinger, which
 			// would re-resolve it through the system resolver OUTSIDE the guard — a
@@ -80,8 +80,14 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			if ctx.Err() != nil {
 				break // resolution failed because the run was cancelled, not the network
 			}
+			// The failing phase IS resolution, so an error the classifier cannot place
+			// still lands in the DNS family rather than a meaningless "other".
+			reason := classifyNetError(resolveErr)
+			if reason == telemetry.ProbeReasonOther {
+				reason = telemetry.ProbeReasonDNS
+			}
 			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels,
-				pingCycleResult{Loss: 100, Reason: telemetry.ProbeReasonDNS})
+				pingCycleResult{Loss: 100, Reason: reason, Detail: errText(resolveErr)})
 			continue
 		}
 		r := pingCycle(ctx, c.p, pingTarget, t.Params)
@@ -95,31 +101,31 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 
 // vet resolves and policy-checks an ICMP target, returning the literal IP to
 // ping. A policy block is returned as a BlockedProbe (MonitorID filled by the
-// caller). A plain resolution failure returns unresolved=true so the caller
-// records a loss sample WITHOUT pinging the raw name (which the platform pinger
-// would re-resolve outside the guard).
-func (c *PublicPingCollector) vet(ctx context.Context, t pcfg.ProbeTarget) (pingTarget string, blocked *BlockedProbe, unresolved bool) {
+// caller). A plain resolution failure returns the resolver's error so the caller
+// records a classified loss sample WITHOUT pinging the raw name (which the
+// platform pinger would re-resolve outside the guard).
+func (c *PublicPingCollector) vet(ctx context.Context, t pcfg.ProbeTarget) (pingTarget string, blocked *BlockedProbe, resolveErr error) {
 	if a, err := netip.ParseAddr(t.Target); err == nil {
 		if dec := c.guard.CheckAddr(a.Unmap()); !dec.Allowed {
-			return "", &BlockedProbe{Matched: dec.Matched, Reason: "literal_denied"}, false
+			return "", &BlockedProbe{Matched: dec.Matched, Reason: "literal_denied"}, nil
 		}
-		return t.Target, nil, false
+		return t.Target, nil, nil
 	}
 	hd := c.guard.CheckHost(t.Target)
 	if hd.Denied {
-		return "", &BlockedProbe{Matched: hd.Matched, Reason: "resolved_denied"}, false
+		return "", &BlockedProbe{Matched: hd.Matched, Reason: "resolved_denied"}, nil
 	}
 	vetted, err := c.guard.ResolveVetted(ctx, t.Target, hd.NameAuthorized)
 	if err != nil {
 		var be *netguard.BlockedError
 		if errors.As(err, &be) {
-			return "", &BlockedProbe{Matched: be.Matched, Reason: "resolved_denied"}, false
+			return "", &BlockedProbe{Matched: be.Matched, Reason: "resolved_denied"}, nil
 		}
 		// A plain resolution failure is a probe failure, not a block — but the raw
 		// name must NEVER reach the pinger (it would re-resolve outside the guard).
-		return "", nil, true
+		return "", nil, err
 	}
-	return pickPingAddr(vetted).String(), nil, false
+	return pickPingAddr(vetted).String(), nil, nil
 }
 
 // pickPingAddr chooses a vetted address the ICMP path can actually use. The
@@ -177,7 +183,8 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 	}
 
 	rtts := make([]time.Duration, 0, count)
-	reasons := make([]int, 0, count) // per-echo failure reasons (lost echoes only)
+	reasons := make([]int, 0, count)    // per-echo failure reasons (lost echoes only)
+	details := make([]string, 0, count) // parallel raw causes behind those reasons
 	for i := 0; i < count; i++ {
 		if pctx.Err() != nil {
 			break
@@ -204,6 +211,7 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 			rtts = append(rtts, pr.RTT)
 		} else {
 			reasons = append(reasons, pr.Reason)
+			details = append(details, pr.Detail)
 		}
 	}
 	if cancel != nil {
@@ -215,8 +223,8 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 		Loss:     float64(count-received) / float64(count) * 100.0,
 		Sent:     count,
 		Received: received,
-		Reason:   cycleReason(received, reasons),
 	}
+	r.Reason, r.Detail = cycleReason(received, reasons, details)
 	r.AvgMs, r.MinMs, r.MaxMs, r.JitterMs, r.HaveJitter = pingStats(rtts)
 	return r
 }

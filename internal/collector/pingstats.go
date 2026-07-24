@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"strings"
 	"syscall"
 	"time"
 
@@ -72,12 +73,30 @@ func pingStats(rtts []time.Duration) (avgMs, minMs, maxMs, jitterMs float64, hav
 	return
 }
 
+// Winsock error codes (WSAE*). On Windows the portable syscall.E* constants are
+// invented APPLICATION_ERROR-range values that never appear in a real error
+// chain — the OS reports these Winsock codes instead — so the classifier must
+// match both or every refused/unreachable/reset dial on Windows would land in
+// "other". syscall.Errno exists on every platform and no Unix errno reaches the
+// 10000 range, so the extra comparisons are safe without build tags.
+const (
+	wsaeNetUnreach  = syscall.Errno(10051) // WSAENETUNREACH
+	wsaeConnAborted = syscall.Errno(10053) // WSAECONNABORTED (aborted mid-exchange)
+	wsaeConnReset   = syscall.Errno(10054) // WSAECONNRESET
+	wsaeTimedOut    = syscall.Errno(10060) // WSAETIMEDOUT
+	wsaeConnRefused = syscall.Errno(10061) // WSAECONNREFUSED
+	wsaeHostUnreach = syscall.Errno(10065) // WSAEHOSTUNREACH
+)
+
 // classifyNetError maps a network-level error (TCP connect, HTTP transport, or a
 // DNS system-resolver failure) to a stable telemetry.ProbeReason* code, shared by
 // the tcp / http / dns collectors so the meaning never drifts. The order separates
-// a fast active refusal ("port closed", host up) from a deadline ("no answer",
-// host/network down), from no-route, from a TLS-handshake/certificate failure, so
-// the code tells the operator which failure they have.
+// a fast active refusal ("port closed", host up) from a mid-exchange reset, from a
+// deadline ("no answer", host/network down), from no-route, from a
+// TLS-handshake/certificate failure, so the code tells the operator which failure
+// they have. Where the error type discriminates finer (NXDOMAIN, an expired
+// certificate) the refined family-member code is returned; consumers must treat an
+// unknown code as at least its code/10 family.
 func classifyNetError(err error) int {
 	if err == nil {
 		return telemetry.ProbeReasonNone
@@ -85,6 +104,12 @@ func classifyNetError(err error) int {
 	// A resolution failure classifies as DNS (an https transport surfaces this as a
 	// wrapped *net.DNSError; a literal-IP dial the guard could not honor can too).
 	// A lookup that TIMED OUT is a timeout, not a name failure — check that first.
+	// It stays the DNS FAMILY code even for IsNotFound: the stdlib collapses
+	// NXDOMAIN and NODATA (name exists, no record of the queried type) into the
+	// same "no such host" / IsNotFound error, so claiming ProbeReasonDNSNXDomain
+	// here would tell an operator the domain is gone when only a record is
+	// missing. NXDOMAIN is asserted only where the rcode is readable (dnsResult).
+	// The raw resolver text still rides along as the detail label.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		if dnsErr.IsTimeout {
@@ -93,17 +118,22 @@ func classifyNetError(err error) int {
 		return telemetry.ProbeReasonDNS
 	}
 	switch {
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, wsaeConnRefused):
 		return telemetry.ProbeReasonRefused
-	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH),
+		errors.Is(err, wsaeHostUnreach), errors.Is(err, wsaeNetUnreach):
 		return telemetry.ProbeReasonUnreachable
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, syscall.ETIMEDOUT):
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE),
+		errors.Is(err, wsaeConnReset), errors.Is(err, wsaeConnAborted):
+		return telemetry.ProbeReasonReset
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, syscall.ETIMEDOUT),
+		errors.Is(err, wsaeTimedOut):
 		return telemetry.ProbeReasonTimeout
 	}
 	// A TLS handshake / certificate failure (the https transport merges all phases
 	// into one error, so unlike the TCP collector we detect TLS by error type here).
-	if isTLSError(err) {
-		return telemetry.ProbeReasonTLS
+	if code, ok := classifyTLSError(err); ok {
+		return code
 	}
 	// Any net timeout that did not match a concrete errno above (e.g. the dialer's
 	// own deadline) is still a timeout.
@@ -114,20 +144,37 @@ func classifyNetError(err error) int {
 	return telemetry.ProbeReasonOther
 }
 
-// isTLSError reports whether err is a TLS-handshake or certificate-verification
-// failure (the reasons an https request fails after the TCP connect succeeds).
-func isTLSError(err error) bool {
+// classifyTLSError maps a TLS-handshake or certificate-verification failure (the
+// reasons an https request fails after the TCP connect succeeds) to the finest
+// telemetry.ProbeReason* TLS code; ok is false when err is not TLS-shaped at all.
+// The concrete x509 types must be checked before the tls wrappers: errors.As
+// unwraps *tls.CertificateVerificationError to reach them, and matching the
+// wrapper first would flatten every certificate failure to the family code.
+func classifyTLSError(err error) (int, bool) {
+	var certInvalid x509.CertificateInvalidError
+	if errors.As(err, &certInvalid) {
+		// Only Expired has a dedicated code; the other invalidity reasons (bad
+		// constraints, too many intermediates, …) stay the family code rather than
+		// borrowing a wrong refined meaning.
+		if certInvalid.Reason == x509.Expired {
+			return telemetry.ProbeReasonTLSExpired, true
+		}
+		return telemetry.ProbeReasonTLS, true
+	}
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return telemetry.ProbeReasonTLSHostname, true
+	}
+	var unknownAuth x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuth) {
+		return telemetry.ProbeReasonTLSUntrusted, true
+	}
 	var (
-		certInvalid   x509.CertificateInvalidError
-		unknownAuth   x509.UnknownAuthorityError
-		hostnameErr   x509.HostnameError
 		recordHdr     tls.RecordHeaderError
 		certVerifyErr *tls.CertificateVerificationError
 	)
-	if errors.As(err, &certInvalid) || errors.As(err, &unknownAuth) ||
-		errors.As(err, &hostnameErr) || errors.As(err, &recordHdr) ||
-		errors.As(err, &certVerifyErr) {
-		return true
+	if errors.As(err, &recordHdr) || errors.As(err, &certVerifyErr) {
+		return telemetry.ProbeReasonTLS, true
 	}
 	// A handshake rejected via a TLS alert (unsupported protocol/cipher, required
 	// client cert, …) surfaces as a *net.OpError whose Op is "remote error" (peer
@@ -135,19 +182,60 @@ func isTLSError(err error) bool {
 	// the wrapped alert type itself is unexported, so match on the Op.
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && (opErr.Op == "remote error" || opErr.Op == "local error") {
-		return true
+		return telemetry.ProbeReasonTLS, true
 	}
-	return false
+	return telemetry.ProbeReasonNone, false
+}
+
+// truncDetail normalizes a raw failure cause for the error_class detail label:
+// runs of whitespace (including newlines a multi-line OS error may carry)
+// collapse to single spaces and the result is capped at 256 runes, so a label
+// value stays a bounded single line. The text is never localized — the code
+// carries the translated meaning, the detail carries the machine truth.
+func truncDetail(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > 256 {
+		return string(r[:256])
+	}
+	return s
+}
+
+// errText renders err for the detail label (nil → "").
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return truncDetail(err.Error())
+}
+
+// withDetail returns a copy of labels carrying the normalized raw cause under
+// telemetry.ProbeReasonDetailLabel. Collectors share one label map across a
+// cycle's metrics, so the copy keeps the detail on ONLY the error_class sample.
+// An empty detail returns labels unchanged: no cause is never an empty label.
+func withDetail(labels map[string]string, detail string) map[string]string {
+	detail = truncDetail(detail)
+	if detail == "" {
+		return labels
+	}
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	out[telemetry.ProbeReasonDetailLabel] = detail
+	return out
 }
 
 // cycleReason folds the per-echo failure reasons of one ping cycle into a single
-// cycle reason. Any received echo means there is no hard failure (None). With no
-// echo received, the most diagnostic reason wins — Unreachable > Other > Timeout —
-// so a concrete no-route beats a bare deadline. Empty reasons (e.g. a platform
-// that cannot classify) stay None: we never fabricate a class the OS didn't give.
-func cycleReason(received int, reasons []int) int {
+// cycle reason plus that reason's raw cause. Any received echo means there is no
+// hard failure (None, no detail). With no echo received, the most diagnostic
+// reason wins — Unreachable > any other classified failure > bare Timeout — so a
+// concrete no-route beats a bare deadline. reasons and details are parallel (one
+// entry per lost echo); the detail returned is the one attached to the first echo
+// that failed with the winning code. Empty reasons (e.g. a platform that cannot
+// classify) stay None: we never fabricate a class the OS didn't give.
+func cycleReason(received int, reasons []int, details []string) (int, string) {
 	if received > 0 {
-		return telemetry.ProbeReasonNone
+		return telemetry.ProbeReasonNone, ""
 	}
 	best := telemetry.ProbeReasonNone
 	for _, r := range reasons {
@@ -155,19 +243,29 @@ func cycleReason(received int, reasons []int) int {
 			best = r
 		}
 	}
-	return best
+	if best == telemetry.ProbeReasonNone {
+		return best, ""
+	}
+	for i, r := range reasons {
+		if r == best && i < len(details) {
+			return best, details[i]
+		}
+	}
+	return best, ""
 }
 
 func pingReasonRank(code int) int {
 	switch code {
 	case telemetry.ProbeReasonUnreachable:
 		return 3
-	case telemetry.ProbeReasonOther:
-		return 2
 	case telemetry.ProbeReasonTimeout:
 		return 1
-	default: // None and anything a raw echo can't produce
+	case telemetry.ProbeReasonNone:
 		return 0
+	default:
+		// Any classified failure that is not a bare deadline (Other, a refined
+		// platform code, …) is more diagnostic than a timeout, less than no-route.
+		return 2
 	}
 }
 
@@ -187,6 +285,9 @@ type pingCycleResult struct {
 	// Reason classifies a fully-failed cycle (Received==0) into a
 	// telemetry.ProbeReason* code; ProbeReasonNone whenever any echo returned.
 	Reason int
+	// Detail is the raw underlying cause behind Reason (OS error text, IP_STATUS
+	// name); empty when Reason is None or the platform could not say more.
+	Detail string
 }
 
 // appendICMPMetrics emits the shared ICMP metric set for one cycle result. loss
@@ -197,12 +298,18 @@ func appendICMPMetrics(res *Result, now time.Time, monitorID string, configSeria
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
 		return telemetry.Metric{TS: now, Kind: kind, Target: target, Layer: layer, Value: v, Unit: unit, Labels: labels, MonitorID: monitorID, ConfigSerial: configSerial}
 	}
+	// error_class every cycle (ProbeReasonNone when any echo returned), mirroring
+	// the TCP collector — the server freezes this onto a fired alert's evidence.
+	// The raw cause rides only on this sample, on its own label map: the shared
+	// labels the other cycle metrics alias must never carry a failure detail.
+	ec := mk(telemetry.ICMPErrorClass, float64(r.Reason), telemetry.UnitCode)
+	if r.Reason != telemetry.ProbeReasonNone {
+		ec.Labels = withDetail(labels, r.Detail)
+	}
 	res.Metrics = append(res.Metrics,
 		mk(telemetry.ICMPLoss, r.Loss, telemetry.UnitPct),
 		mk(telemetry.ICMPSamples, float64(r.Received), telemetry.UnitCount),
-		// error_class every cycle (ProbeReasonNone when any echo returned), mirroring
-		// the TCP collector — the server freezes this onto a fired alert's evidence.
-		mk(telemetry.ICMPErrorClass, float64(r.Reason), telemetry.UnitCode),
+		ec,
 	)
 	if r.Received > 0 {
 		res.Metrics = append(res.Metrics,

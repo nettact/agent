@@ -110,10 +110,17 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 			if ctx.Err() != nil {
 				return // resolution aborted by the cancelled run, not a DNS fault
 			}
-			// Plain resolution failure: down, classified as DNS. No dns_ms (the
+			// Plain resolution failure: down, classified as finely as the resolver
+			// error allows — the failing phase IS resolution, so an error the
+			// classifier cannot place still lands in the DNS family. No dns_ms (the
 			// resolution did not produce a valid latency).
-			res.Metrics = append(res.Metrics, mk(telemetry.TCPOK, 0, telemetry.UnitBool),
-				mk(telemetry.TCPErrorClass, telemetry.ProbeReasonDNS, telemetry.UnitCode))
+			reason := classifyNetError(err)
+			if reason == telemetry.ProbeReasonOther {
+				reason = telemetry.ProbeReasonDNS
+			}
+			ec := mk(telemetry.TCPErrorClass, float64(reason), telemetry.UnitCode)
+			ec.Labels = withDetail(labels, errText(err))
+			res.Metrics = append(res.Metrics, mk(telemetry.TCPOK, 0, telemetry.UnitBool), ec)
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
 				Severity: telemetry.SeverityWarn, Message: "TCP DNS resolution failed: " + t.Target,
@@ -175,20 +182,34 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		return // connect/handshake aborted by the cancelled run, not the service
 	}
 	errClass := telemetry.ProbeReasonNone
+	detail := ""
 	switch {
 	case !connectOK:
 		errClass = classifyNetError(dialErr)
+		detail = errText(dialErr)
 	case tlsErr != nil:
+		// The failing phase IS the handshake, so a TLS error the classifier cannot
+		// refine still lands in the TLS family (expired/untrusted/hostname otherwise).
 		errClass = telemetry.ProbeReasonTLS
+		if code, tlsShaped := classifyTLSError(tlsErr); tlsShaped {
+			errClass = code
+		}
+		detail = errText(tlsErr)
 	}
 
 	ok := 0.0
 	if overallOK {
 		ok = 1.0
 	}
+	// The raw cause rides only on the error_class sample, on its own copied label
+	// map — mk aliases one shared map across the cycle's metrics.
+	ec := mk(telemetry.TCPErrorClass, float64(errClass), telemetry.UnitCode)
+	if errClass != telemetry.ProbeReasonNone {
+		ec.Labels = withDetail(labels, detail)
+	}
 	res.Metrics = append(res.Metrics,
 		mk(telemetry.TCPOK, ok, telemetry.UnitBool),
-		mk(telemetry.TCPErrorClass, float64(errClass), telemetry.UnitCode),
+		ec,
 	)
 	if haveDNS {
 		res.Metrics = append(res.Metrics, mk(telemetry.TCPDNSms, dnsMs, telemetry.UnitMs))
