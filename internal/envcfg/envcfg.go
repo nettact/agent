@@ -222,6 +222,7 @@ func loadLimits(lookup Lookup, errs *[]error) agentrt.Limits {
 	l.SnapshotMinInterval = durVar(lookup, "NETTACT_AGENT_SNAPSHOT_MIN_INTERVAL", l.SnapshotMinInterval, time.Second, 10*time.Minute, errs)
 	l.SnapshotTimeout = durVar(lookup, "NETTACT_AGENT_SNAPSHOT_TIMEOUT", l.SnapshotTimeout, time.Second, 60*time.Second, errs)
 	l.MaxProbeConcurrency = intVar(lookup, "NETTACT_AGENT_MAX_PROBE_CONCURRENCY", l.MaxProbeConcurrency, 1, 256, errs)
+	l.MaxTraceConcurrency = intVar(lookup, "NETTACT_AGENT_MAX_TRACE_CONCURRENCY", l.MaxTraceConcurrency, 1, 64, errs)
 	return l
 }
 

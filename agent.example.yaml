@@ -1,0 +1,93 @@
+# nettact-agent — example configuration file.
+#
+# Precedence (highest first): config file > environment > built-in defaults.
+# Every key below corresponds 1:1 to a NETTACT_AGENT_* environment variable, and
+# a file value overrides that variable per key (unset keys fall through to the
+# environment). Validation, ranges, and error messages are shared with the
+# environment path, so an error still names the NETTACT_AGENT_* variable.
+#
+# Loading this file (first match wins):
+#   --config <path>                              (CLI flag)
+#   NETTACT_AGENT_CONFIG_FILE=<path>             (environment)
+#   ./nettact-agent.yaml                         (working directory)
+#   %ProgramData%\NetTact\agent.yaml (Windows) | /etc/nettact/agent.yaml (other)
+# A path named via the flag/env must exist; the auto-discovered defaults are
+# skipped silently when absent (the agent then runs from the environment alone).
+#
+# This file may hold the enrollment token — keep it private (chmod 600).
+# Changes take effect on the next agent start (no hot reload). Omit any key to
+# accept its default; an explicit empty value ("") is rejected, same as an empty
+# environment variable — omit the key instead.
+
+# --- Server connection ------------------------------------------------------
+
+# Server base URL. Required (no default). Must be http(s).
+server_url: http://host:12450
+
+# Agent state directory (holds agent.key, agent.json, wal.db). Default ./agent-data.
+#data_dir: ./agent-data
+
+# Skip TLS verification — LAN self-signed servers only. Default false.
+#tls_insecure: false
+
+# WAL drain cadence — how often buffered telemetry is uploaded. Default 5s.
+#upload_interval: 5s
+
+# Telemetry wire format: protobuf (default) or json.
+#wire_format: protobuf
+
+# --- Enrollment token (first run only; the two keys are mutually exclusive) --
+# After first run the saved credential in data_dir is reused and neither is read.
+
+# Inline one-time enrollment token. Prefer enroll_token_file over this.
+#enroll_token: "paste-one-time-token-here"
+
+# Path to a file holding the one-time enrollment token (preferred).
+#enroll_token_file: /run/secrets/agent_enroll_token
+
+# --- Local permission policy ------------------------------------------------
+
+# Complete replacement of the default permission grant (this is NOT merged with
+# the default). A YAML list of permission ids, or the literal "none" to grant
+# only what is strictly required. Wildcards ("*"/"all") are never accepted.
+# Omit the key entirely to keep the built-in standalone default set.
+#permissions:
+#  - probe.icmp
+#  - probe.dns
+#  - probe.http
+#  - probe.tcp
+#  - probe.nat
+#  - network.gateway.probe
+#permissions: none
+
+# --- Probe target-access policy ---------------------------------------------
+# Governs which targets probes may reach (deny always wins). Omit the whole
+# group to keep the default (allowlist of private/LAN scopes).
+
+#probe_access:
+#  # allowlist (default-deny; allowlist must be non-empty) or denylist
+#  # (default-allow; denylist must be non-empty or the literal "none").
+#  mode: allowlist
+#  # Selector list. Kinds: scope:<loopback|lan|link-local|public|metadata|any>,
+#  # cidr:<prefix>, ip:<addr>, host:<name>.
+#  allowlist:
+#    - scope:lan
+#  # A list, or the literal "none" to deny nothing.
+#  denylist: none
+
+# --- Stability limits -------------------------------------------------------
+
+# Minimum interval between probes of one monitor. Default 1s. Range [200ms,10m].
+#min_probe_interval: 1s
+
+# Maximum simultaneously executing probes. Default 16. Range [1,256].
+#max_probe_concurrency: 16
+
+# Minimum interval between incident interface snapshots. Default 3s. Range [1s,10m].
+#snapshot_min_interval: 3s
+
+# Timeout for an incident snapshot collection. Default 10s. Range [1s,60s].
+#snapshot_timeout: 10s
+
+# Maximum simultaneously executing incident traceroutes. Default 4. Range [1,64].
+#max_trace_concurrency: 4
