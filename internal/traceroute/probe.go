@@ -5,9 +5,12 @@
 // netguard target-access policy the live probes use, clamps its own inputs, and
 // obeys the absolute request deadline as its only validity window. ICMP and TCP
 // are executed by dedicated TTL-aware platform paths (real on Windows/IPv4,
-// precise-unsupported stubs elsewhere); there is never an automatic fallback
-// between the two modes, and no queue grace, freshness, cooldown, or cross-
-// request report reuse. Nothing here is persisted.
+// precise-unsupported stubs elsewhere); at the agent level there is never an
+// automatic fallback between the two modes — mode fallback (TCP to ICMP) is
+// done by the server before dispatch, based on the agent's reported effective
+// permissions (see server-core incidentops.deriveTrace) — and there is no
+// queue grace, freshness, cooldown, or cross-request report reuse. Nothing
+// here is persisted.
 package traceroute
 
 import (
@@ -34,9 +37,14 @@ type probeOutcome struct {
 type prober func(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.Duration) (probeOutcome, error)
 
 // capabilities reports which diagnostic modes this build+runtime can actually
-// execute. ICMP is a platform fact (Windows IPv4 iphlpapi TTL echo, no admin);
-// TCP additionally needs a raw ICMP socket to observe intermediate TTL-exceeded
-// responders, so it is a runtime capability (admin) probed at startup.
+// execute. ICMP is a platform fact (Windows IPv4 iphlpapi TTL echo, no admin
+// needed). TCP additionally needs to observe intermediate TTL-exceeded
+// responders on a raw ICMP socket, which on Windows only an elevated process
+// (or a service running as SYSTEM) can actually receive — a non-elevated
+// process can open the same raw socket but only ever sees echo replies from
+// the final destination, never intermediate Time-Exceeded/Unreachable
+// messages. So TCP is a runtime capability gated on process elevation,
+// determined at startup by checking the process token.
 type capabilities struct {
 	ICMP bool
 	TCP  bool

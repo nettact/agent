@@ -16,15 +16,35 @@ import (
 
 // detectCapabilities reports the real Windows traceroute capability. ICMP TTL
 // echo via iphlpapi (IcmpSendEcho with a per-request TTL) needs no Administrator,
-// so it is always available. TCP additionally needs a raw ICMP socket to observe
-// intermediate Time-Exceeded responders; opening one requires Administrator, so
-// it is probed at startup and gates the dedicated TCP permission's supported view.
+// so it is always available. TCP additionally needs a raw ICMP socket that can
+// actually receive intermediate Time-Exceeded responses; see
+// icmpErrorCaptureCapable for why that is a process-elevation check, not a
+// socket-creation check. It is probed at startup and gates the dedicated TCP
+// permission's supported view.
 func detectCapabilities() capabilities {
-	return capabilities{ICMP: true, TCP: rawICMPCapable()}
+	return capabilities{ICMP: true, TCP: icmpErrorCaptureCapable()}
 }
 
-// rawICMPCapable reports whether a raw ICMP socket can be opened (Administrator).
-func rawICMPCapable() bool {
+// icmpErrorCaptureCapable reports whether this process can receive ICMP error
+// messages (Time-Exceeded, Destination-Unreachable) on a raw ICMP socket, which
+// TCP traceroute needs to see intermediate routers. Two conditions must both
+// hold, and neither implies the other:
+//
+//   - The process token must be elevated. Windows specially permits
+//     socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) for non-elevated processes too,
+//     but a non-elevated process's raw ICMP socket only ever receives echo
+//     replies (type 0) — never Time-Exceeded/Unreachable from intermediate
+//     hops — while the identical code in an elevated process (or a Windows
+//     service running as SYSTEM, which counts as elevated) receives them
+//     normally (measured behavior). Socket creation succeeding is therefore
+//     not a usable capability signal on its own.
+//   - The raw socket must actually be creatable: an elevated process can still
+//     be denied raw sockets by host security policy, and tcpProbe cannot
+//     observe intermediate responders without one.
+func icmpErrorCaptureCapable() bool {
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		return false
+	}
 	s, err := windows.Socket(windows.AF_INET, windows.SOCK_RAW, windows.IPPROTO_ICMP)
 	if err != nil {
 		return false
