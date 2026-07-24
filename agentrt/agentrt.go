@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	pshost "github.com/shirou/gopsutil/v3/host"
+
 	"github.com/nettact/agent/internal/collector"
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/enroll"
@@ -50,6 +52,28 @@ import (
 // -ldflags "-X github.com/nettact/agent/agentrt.Version=vX.Y.Z"; unstamped
 // local/dev builds report "dev".
 var Version = "dev"
+
+// reportedPlatform returns the OS identifier sent in the enrollment request and
+// every Hello, used by the console to pick a per-OS icon. On Linux it prefers the
+// distribution id (from /etc/os-release: "ubuntu", "debian", "arch", …) so the
+// console can distinguish distros; on every other OS, and when the distro cannot
+// be read, it falls back to the Go runtime OS ("windows", "darwin", "linux", …).
+//
+// It uses PlatformInformation (which reads only OS-release metadata) rather than
+// host.Info: the latter also collects uptime, boot time, process counts, host id
+// and virtualization, which the agent's permission model gates behind host.*
+// families. Distro identification is OS metadata (already exposed via GOOS), not
+// gated host telemetry, so PlatformInformation keeps the no-call boundary intact.
+func reportedPlatform() string {
+	if runtime.GOOS == "linux" {
+		if platform, _, _, err := pshost.PlatformInformation(); err == nil {
+			if id := strings.ToLower(strings.TrimSpace(platform)); id != "" {
+				return id
+			}
+		}
+	}
+	return runtime.GOOS
+}
 
 // Terminal outcomes. Run returns one of these (wrapped) when re-running the same
 // process cannot help without intervention; a supervisor uses errors.Is to pick
@@ -192,6 +216,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("identity: %w", err)
 	}
 	hostname, _ := os.Hostname()
+	platformID := reportedPlatform()
 	p := platform.New()
 
 	// The three permission views: supported (platform-independent probes plus what
@@ -236,7 +261,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		// Build+sign the request, then run it through the injected Enroller (direct
 		// registry call in desktop) or the default HTTP POST (standalone).
-		req := enroll.BuildRequest(priv, token, hostname, runtime.GOOS, Version, report)
+		req := enroll.BuildRequest(priv, token, hostname, platformID, Version, report)
 		exchange := cfg.Enroller
 		if exchange == nil {
 			exchange = func(ctx context.Context, r protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
@@ -430,7 +455,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Hello: wire.Hello{
 			SchemaVersion: protocol.SchemaVersion,
 			Hostname:      hostname,
-			Platform:      runtime.GOOS,
+			Platform:      platformID,
 			AgentVersion:  Version,
 			Permissions:   report,
 		},
