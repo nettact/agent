@@ -86,22 +86,23 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		t0 := time.Now()
 		var ok bool
+		var reason int
 		var derr error
 		switch t.Params.ResolverProtocol {
 		case "doh":
 			// DNS over HTTPS: resolver_server is an https URL or a host we turn into
 			// the conventional /dns-query endpoint.
-			ok, derr = c.lookupDoH(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
+			ok, reason, derr = c.lookupDoH(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
 		case "dot":
 			// DNS over TLS on port 853 (default). Done explicitly over a TLS stream —
 			// net.Resolver cannot be forced onto TCP framing reliably.
-			ok, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 853, t.Params.RecordType, t.Target, timeout, true, t.Params.IgnoreTLS)
+			ok, reason, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 853, t.Params.RecordType, t.Target, timeout, true, t.Params.IgnoreTLS)
 		case "tcp":
 			// Plain DNS over TCP to a specific nameserver, likewise done explicitly.
 			if t.Params.ResolverServer != "" {
-				ok, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 53, t.Params.RecordType, t.Target, timeout, false, false)
+				ok, reason, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 53, t.Params.RecordType, t.Target, timeout, false, false)
 			} else {
-				ok = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
+				ok, reason = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
 			}
 		default:
 			// Plain UDP: a per-target resolver override sends the query to a specific
@@ -109,9 +110,9 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 			// a *netguard.BlockedError, not a silent DNS failure); otherwise use the
 			// process default resolver (OS-owned ambient config, exempt from policy).
 			if t.Params.ResolverServer != "" {
-				ok, derr = c.lookupUDP(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target, timeout)
+				ok, reason, derr = c.lookupUDP(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target, timeout)
 			} else {
-				ok = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
+				ok, reason = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
 			}
 		}
 		cancel()
@@ -132,6 +133,13 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.DNSOK, Target: t.Target, Layer: telemetry.LayerDNS, Value: okv, Unit: telemetry.UnitBool,
+			MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
+		}, telemetry.Metric{
+			// error_class every cycle (ProbeReasonNone on success): NXDOMAIN→dns,
+			// SERVFAIL→other, REFUSED→refused, deadline→timeout. The server freezes this
+			// onto a fired alert's evidence so the notice states WHY, not just "解析失败".
+			TS: now, Kind: telemetry.DNSErrorClass, Target: t.Target, Layer: telemetry.LayerDNS,
+			Value: float64(reason), Unit: telemetry.UnitCode,
 			MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 		})
 		if ok {
@@ -157,18 +165,18 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 // *net.DNSError, which would misreport a policy block as an ordinary DNS
 // failure). Returns true when the response is NOERROR with an answer of the
 // requested record type.
-func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, recordType, name string, timeout time.Duration) (bool, error) {
+func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, recordType, name string, timeout time.Duration) (bool, int, error) {
 	if port <= 0 {
 		port = 53
 	}
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
 	addr := net.JoinHostPort(server, strconv.Itoa(port))
 	conn, err := c.guard.DialContext(ctx, "udp", addr)
 	if err != nil {
-		return false, err
+		return false, classifyNetError(err), err
 	}
 	defer conn.Close()
 	if dl, ok := ctx.Deadline(); ok {
@@ -177,18 +185,19 @@ func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, r
 		_ = conn.SetDeadline(time.Now().Add(timeout))
 	}
 	if _, err := conn.Write(query); err != nil {
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 	respb := make([]byte, 4096)
 	n, err := conn.Read(respb)
 	if err != nil {
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 	var msg dnsmessage.Message
 	if err := msg.Unpack(respb[:n]); err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
-	return dnsAnswerOK(&msg, recordType), nil
+	ok, reason := dnsResult(&msg, recordType)
+	return ok, reason, nil
 }
 
 // lookupStream performs a DNS query over a TCP stream, optionally wrapped in TLS
@@ -197,26 +206,26 @@ func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, r
 // against the intended host. Returns true when the response is NOERROR and
 // contains at least one answer of the requested record type; a policy block is
 // returned as a *netguard.BlockedError.
-func (c *DNSCollector) lookupStream(ctx context.Context, server string, port, defaultPort int, recordType, name string, timeout time.Duration, useTLS, ignoreTLS bool) (bool, error) {
+func (c *DNSCollector) lookupStream(ctx context.Context, server string, port, defaultPort int, recordType, name string, timeout time.Duration, useTLS, ignoreTLS bool) (bool, int, error) {
 	if port <= 0 {
 		port = defaultPort
 	}
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
 	addr := net.JoinHostPort(server, strconv.Itoa(port))
 
 	raw, err := c.guard.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return false, err
+		return false, classifyNetError(err), err
 	}
 	var conn net.Conn = raw
 	if useTLS {
 		tconn := tls.Client(raw, &tls.Config{ServerName: server, InsecureSkipVerify: ignoreTLS}) //nolint:gosec // opt-in via ignore_tls
 		if herr := tconn.HandshakeContext(ctx); herr != nil {
 			_ = raw.Close()
-			return false, nil
+			return false, telemetry.ProbeReasonTLS, nil
 		}
 		conn = tconn
 	}
@@ -233,43 +242,67 @@ func (c *DNSCollector) lookupStream(ctx context.Context, server string, port, de
 	framed[1] = byte(len(query))
 	copy(framed[2:], query)
 	if _, err := conn.Write(framed); err != nil {
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 
 	var lenb [2]byte
 	if _, err := io.ReadFull(conn, lenb[:]); err != nil {
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 	n := int(lenb[0])<<8 | int(lenb[1])
 	if n <= 0 || n > 65535 {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
 	respb := make([]byte, n)
 	if _, err := io.ReadFull(conn, respb); err != nil {
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 	var msg dnsmessage.Message
 	if err := msg.Unpack(respb); err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
-	return dnsAnswerOK(&msg, recordType), nil
+	ok, reason := dnsResult(&msg, recordType)
+	return ok, reason, nil
 }
 
-// dnsAnswerOK reports whether a parsed DNS response is a successful answer for
-// the requested record type. Checking the type (not just answer count) means a
-// response carrying only a CNAME for an A/AAAA query is correctly treated as a
-// failure, matching the plain-resolver LookupIP path.
-func dnsAnswerOK(msg *dnsmessage.Message, recordType string) bool {
+// dnsResult reports whether a parsed DNS response is a successful answer for the
+// requested record type, plus a telemetry.ProbeReason* code for a failure. Checking
+// the type (not just answer count) means a response carrying only a CNAME for an
+// A/AAAA query is correctly treated as a failure, matching the plain-resolver
+// LookupIP path. A non-NOERROR rcode maps to its reason (NXDOMAIN→dns, REFUSED→
+// refused, else other); NOERROR with no matching record is a dns-layer failure.
+func dnsResult(msg *dnsmessage.Message, recordType string) (bool, int) {
 	if msg.Header.RCode != dnsmessage.RCodeSuccess {
-		return false
+		switch msg.Header.RCode {
+		case dnsmessage.RCodeNameError:
+			return false, telemetry.ProbeReasonDNS
+		case dnsmessage.RCodeRefused:
+			return false, telemetry.ProbeReasonRefused
+		default: // SERVFAIL, FORMERR, NOTIMP, …
+			return false, telemetry.ProbeReasonOther
+		}
 	}
 	want := dohType(recordType)
 	for _, a := range msg.Answers {
 		if a.Header.Type == want {
-			return true
+			return true, telemetry.ProbeReasonNone
 		}
 	}
-	return false
+	return false, telemetry.ProbeReasonDNS
+}
+
+// dnsRecordResult turns a (hasMatchingRecord, err) pair from the system resolver
+// into an (ok, ProbeReason*) pair: an error classifies via classifyNetError (a
+// resolver timeout stays a timeout, any other *net.DNSError is a dns-layer
+// failure); a clean lookup with no record is a dns-layer failure (no such record).
+func dnsRecordResult(has bool, err error) (bool, int) {
+	if err != nil {
+		return false, classifyNetError(err)
+	}
+	if !has {
+		return false, telemetry.ProbeReasonDNS
+	}
+	return true, telemetry.ProbeReasonNone
 }
 
 // lookupDoH resolves name over DNS-over-HTTPS (RFC 8484). server may be a full
@@ -277,14 +310,14 @@ func dnsAnswerOK(msg *dnsmessage.Message, recordType string) bool {
 // used. The DoH transport dials through the guard, so a denied endpoint is
 // returned as a *netguard.BlockedError. Returns true when the response is NOERROR
 // with at least one answer.
-func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, recordType, name string) (bool, error) {
+func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, recordType, name string) (bool, int, error) {
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL(server, port), bytes.NewReader(query))
 	if err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
@@ -292,23 +325,24 @@ func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, r
 	if err != nil {
 		var be *netguard.BlockedError
 		if errors.As(err, &be) {
-			return false, err
+			return false, telemetry.ProbeReasonOther, err
 		}
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
 	if err != nil {
-		return false, nil
+		return false, classifyNetError(err), nil
 	}
 	var msg dnsmessage.Message
 	if err := msg.Unpack(body); err != nil {
-		return false, nil
+		return false, telemetry.ProbeReasonOther, nil
 	}
-	return dnsAnswerOK(&msg, recordType), nil
+	ok, reason := dnsResult(&msg, recordType)
+	return ok, reason, nil
 }
 
 // dohURL normalizes a DoH server into a query URL. A value starting with http is
@@ -359,22 +393,23 @@ func dohType(recordType string) dnsmessage.Type {
 }
 
 // lookupRecord issues the appropriate lookup for the requested record type and
-// reports whether at least one record came back. A/AAAA (and empty = either) go
-// through LookupIP; CNAME/MX/TXT/NS use their dedicated lookups.
-func lookupRecord(ctx context.Context, r *net.Resolver, recordType, name string) bool {
+// reports whether at least one record came back, plus a telemetry.ProbeReason* code
+// for a failure. A/AAAA (and empty = either) go through LookupIP; CNAME/MX/TXT/NS
+// use their dedicated lookups.
+func lookupRecord(ctx context.Context, r *net.Resolver, recordType, name string) (bool, int) {
 	switch recordType {
 	case "CNAME":
 		cname, err := r.LookupCNAME(ctx, name)
-		return err == nil && cname != ""
+		return dnsRecordResult(cname != "", err)
 	case "MX":
 		mx, err := r.LookupMX(ctx, name)
-		return err == nil && len(mx) > 0
+		return dnsRecordResult(len(mx) > 0, err)
 	case "TXT":
 		txt, err := r.LookupTXT(ctx, name)
-		return err == nil && len(txt) > 0
+		return dnsRecordResult(len(txt) > 0, err)
 	case "NS":
 		ns, err := r.LookupNS(ctx, name)
-		return err == nil && len(ns) > 0
+		return dnsRecordResult(len(ns) > 0, err)
 	default:
 		network := "ip"
 		switch recordType {
@@ -384,7 +419,7 @@ func lookupRecord(ctx context.Context, r *net.Resolver, recordType, name string)
 			network = "ip6"
 		}
 		addrs, err := r.LookupIP(ctx, network, name)
-		return err == nil && len(addrs) > 0
+		return dnsRecordResult(len(addrs) > 0, err)
 	}
 }
 

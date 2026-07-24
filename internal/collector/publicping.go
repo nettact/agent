@@ -80,7 +80,8 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			if ctx.Err() != nil {
 				break // resolution failed because the run was cancelled, not the network
 			}
-			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels, pingCycleResult{Loss: 100})
+			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels,
+				pingCycleResult{Loss: 100, Reason: telemetry.ProbeReasonDNS})
 			continue
 		}
 		r := pingCycle(ctx, c.p, pingTarget, t.Params)
@@ -176,6 +177,7 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 	}
 
 	rtts := make([]time.Duration, 0, count)
+	reasons := make([]int, 0, count) // per-echo failure reasons (lost echoes only)
 	for i := 0; i < count; i++ {
 		if pctx.Err() != nil {
 			break
@@ -200,6 +202,8 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 		}
 		if pr.Received {
 			rtts = append(rtts, pr.RTT)
+		} else {
+			reasons = append(reasons, pr.Reason)
 		}
 	}
 	if cancel != nil {
@@ -211,6 +215,7 @@ func pingCycle(ctx context.Context, p platform.Platform, target string, params p
 		Loss:     float64(count-received) / float64(count) * 100.0,
 		Sent:     count,
 		Received: received,
+		Reason:   cycleReason(received, reasons),
 	}
 	r.AvgMs, r.MinMs, r.MaxMs, r.JitterMs, r.HaveJitter = pingStats(rtts)
 	return r

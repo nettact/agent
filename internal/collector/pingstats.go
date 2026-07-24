@@ -2,6 +2,8 @@ package collector
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
 	"syscall"
@@ -70,37 +72,103 @@ func pingStats(rtts []time.Duration) (avgMs, minMs, maxMs, jitterMs float64, hav
 	return
 }
 
-// classifyConnectError maps a TCP connect-phase error to a stable
-// telemetry.TCPErr* code. It is only called for the raw connect (DNS and TLS
-// failures are classified by phase at the call site, so they never reach here).
-// The order separates a fast active refusal ("port closed", host up) from a
-// deadline ("no answer", host/network down) and from no-route, so the code tells
-// the operator which failure they have.
-func classifyConnectError(err error) int {
+// classifyNetError maps a network-level error (TCP connect, HTTP transport, or a
+// DNS system-resolver failure) to a stable telemetry.ProbeReason* code, shared by
+// the tcp / http / dns collectors so the meaning never drifts. The order separates
+// a fast active refusal ("port closed", host up) from a deadline ("no answer",
+// host/network down), from no-route, from a TLS-handshake/certificate failure, so
+// the code tells the operator which failure they have.
+func classifyNetError(err error) int {
 	if err == nil {
-		return telemetry.TCPErrNone
+		return telemetry.ProbeReasonNone
 	}
-	// A resolution failure can still surface here defensively (e.g. a literal-IP
-	// dial that the guard could not honor); classify it as DNS.
+	// A resolution failure classifies as DNS (an https transport surfaces this as a
+	// wrapped *net.DNSError; a literal-IP dial the guard could not honor can too).
+	// A lookup that TIMED OUT is a timeout, not a name failure — check that first.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
-		return telemetry.TCPErrDNS
+		if dnsErr.IsTimeout {
+			return telemetry.ProbeReasonTimeout
+		}
+		return telemetry.ProbeReasonDNS
 	}
 	switch {
 	case errors.Is(err, syscall.ECONNREFUSED):
-		return telemetry.TCPErrRefused
+		return telemetry.ProbeReasonRefused
 	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
-		return telemetry.TCPErrUnreachable
+		return telemetry.ProbeReasonUnreachable
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, syscall.ETIMEDOUT):
-		return telemetry.TCPErrTimeout
+		return telemetry.ProbeReasonTimeout
+	}
+	// A TLS handshake / certificate failure (the https transport merges all phases
+	// into one error, so unlike the TCP collector we detect TLS by error type here).
+	if isTLSError(err) {
+		return telemetry.ProbeReasonTLS
 	}
 	// Any net timeout that did not match a concrete errno above (e.g. the dialer's
 	// own deadline) is still a timeout.
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
-		return telemetry.TCPErrTimeout
+		return telemetry.ProbeReasonTimeout
 	}
-	return telemetry.TCPErrOther
+	return telemetry.ProbeReasonOther
+}
+
+// isTLSError reports whether err is a TLS-handshake or certificate-verification
+// failure (the reasons an https request fails after the TCP connect succeeds).
+func isTLSError(err error) bool {
+	var (
+		certInvalid   x509.CertificateInvalidError
+		unknownAuth   x509.UnknownAuthorityError
+		hostnameErr   x509.HostnameError
+		recordHdr     tls.RecordHeaderError
+		certVerifyErr *tls.CertificateVerificationError
+	)
+	if errors.As(err, &certInvalid) || errors.As(err, &unknownAuth) ||
+		errors.As(err, &hostnameErr) || errors.As(err, &recordHdr) ||
+		errors.As(err, &certVerifyErr) {
+		return true
+	}
+	// A handshake rejected via a TLS alert (unsupported protocol/cipher, required
+	// client cert, …) surfaces as a *net.OpError whose Op is "remote error" (peer
+	// alert) or "local error" (our side aborting) — both minted only by crypto/tls;
+	// the wrapped alert type itself is unexported, so match on the Op.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && (opErr.Op == "remote error" || opErr.Op == "local error") {
+		return true
+	}
+	return false
+}
+
+// cycleReason folds the per-echo failure reasons of one ping cycle into a single
+// cycle reason. Any received echo means there is no hard failure (None). With no
+// echo received, the most diagnostic reason wins — Unreachable > Other > Timeout —
+// so a concrete no-route beats a bare deadline. Empty reasons (e.g. a platform
+// that cannot classify) stay None: we never fabricate a class the OS didn't give.
+func cycleReason(received int, reasons []int) int {
+	if received > 0 {
+		return telemetry.ProbeReasonNone
+	}
+	best := telemetry.ProbeReasonNone
+	for _, r := range reasons {
+		if pingReasonRank(r) > pingReasonRank(best) {
+			best = r
+		}
+	}
+	return best
+}
+
+func pingReasonRank(code int) int {
+	switch code {
+	case telemetry.ProbeReasonUnreachable:
+		return 3
+	case telemetry.ProbeReasonOther:
+		return 2
+	case telemetry.ProbeReasonTimeout:
+		return 1
+	default: // None and anything a raw echo can't produce
+		return 0
+	}
 }
 
 // pingCycleResult is one ICMP probe cycle summarized: the loss and the RTT
@@ -116,6 +184,9 @@ type pingCycleResult struct {
 	MaxMs      float64
 	JitterMs   float64
 	HaveJitter bool
+	// Reason classifies a fully-failed cycle (Received==0) into a
+	// telemetry.ProbeReason* code; ProbeReasonNone whenever any echo returned.
+	Reason int
 }
 
 // appendICMPMetrics emits the shared ICMP metric set for one cycle result. loss
@@ -129,6 +200,9 @@ func appendICMPMetrics(res *Result, now time.Time, monitorID string, configSeria
 	res.Metrics = append(res.Metrics,
 		mk(telemetry.ICMPLoss, r.Loss, telemetry.UnitPct),
 		mk(telemetry.ICMPSamples, float64(r.Received), telemetry.UnitCount),
+		// error_class every cycle (ProbeReasonNone when any echo returned), mirroring
+		// the TCP collector — the server freezes this onto a fired alert's evidence.
+		mk(telemetry.ICMPErrorClass, float64(r.Reason), telemetry.UnitCode),
 	)
 	if r.Received > 0 {
 		res.Metrics = append(res.Metrics,

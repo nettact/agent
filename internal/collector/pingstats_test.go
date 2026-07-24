@@ -49,27 +49,27 @@ func (fakeTimeout) Error() string   { return "i/o timeout" }
 func (fakeTimeout) Timeout() bool   { return true }
 func (fakeTimeout) Temporary() bool { return true }
 
-func TestClassifyConnectError(t *testing.T) {
+func TestClassifyNetError(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
 		want int
 	}{
-		{"nil", nil, telemetry.TCPErrNone},
-		{"refused", syscall.ECONNREFUSED, telemetry.TCPErrRefused},
-		{"host unreachable", syscall.EHOSTUNREACH, telemetry.TCPErrUnreachable},
-		{"net unreachable", syscall.ENETUNREACH, telemetry.TCPErrUnreachable},
-		{"deadline", context.DeadlineExceeded, telemetry.TCPErrTimeout},
-		{"errno timeout", syscall.ETIMEDOUT, telemetry.TCPErrTimeout},
-		{"net timeout", fakeTimeout{}, telemetry.TCPErrTimeout},
-		{"dns", &net.DNSError{Err: "no such host", IsNotFound: true}, telemetry.TCPErrDNS},
-		{"wrapped refused", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, telemetry.TCPErrRefused},
-		{"other", errors.New("boom"), telemetry.TCPErrOther},
+		{"nil", nil, telemetry.ProbeReasonNone},
+		{"refused", syscall.ECONNREFUSED, telemetry.ProbeReasonRefused},
+		{"host unreachable", syscall.EHOSTUNREACH, telemetry.ProbeReasonUnreachable},
+		{"net unreachable", syscall.ENETUNREACH, telemetry.ProbeReasonUnreachable},
+		{"deadline", context.DeadlineExceeded, telemetry.ProbeReasonTimeout},
+		{"errno timeout", syscall.ETIMEDOUT, telemetry.ProbeReasonTimeout},
+		{"net timeout", fakeTimeout{}, telemetry.ProbeReasonTimeout},
+		{"dns", &net.DNSError{Err: "no such host", IsNotFound: true}, telemetry.ProbeReasonDNS},
+		{"wrapped refused", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, telemetry.ProbeReasonRefused},
+		{"other", errors.New("boom"), telemetry.ProbeReasonOther},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyConnectError(c.err); got != c.want {
-				t.Fatalf("classifyConnectError(%v) = %d, want %d", c.err, got, c.want)
+			if got := classifyNetError(c.err); got != c.want {
+				t.Fatalf("classifyNetError(%v) = %d, want %d", c.err, got, c.want)
 			}
 		})
 	}

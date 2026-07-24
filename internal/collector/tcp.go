@@ -113,7 +113,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 			// Plain resolution failure: down, classified as DNS. No dns_ms (the
 			// resolution did not produce a valid latency).
 			res.Metrics = append(res.Metrics, mk(telemetry.TCPOK, 0, telemetry.UnitBool),
-				mk(telemetry.TCPErrorClass, telemetry.TCPErrDNS, telemetry.UnitCode))
+				mk(telemetry.TCPErrorClass, telemetry.ProbeReasonDNS, telemetry.UnitCode))
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
 				Severity: telemetry.SeverityWarn, Message: "TCP DNS resolution failed: " + t.Target,
@@ -174,12 +174,12 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	if !overallOK && ctx.Err() != nil {
 		return // connect/handshake aborted by the cancelled run, not the service
 	}
-	errClass := telemetry.TCPErrNone
+	errClass := telemetry.ProbeReasonNone
 	switch {
 	case !connectOK:
-		errClass = classifyConnectError(dialErr)
+		errClass = classifyNetError(dialErr)
 	case tlsErr != nil:
-		errClass = telemetry.TCPErrTLS
+		errClass = telemetry.ProbeReasonTLS
 	}
 
 	ok := 0.0

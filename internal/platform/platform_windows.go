@@ -8,12 +8,14 @@ import (
 	"net"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 
 	"github.com/nettact/protocol/permission"
+	"github.com/nettact/protocol/telemetry"
 )
 
 // winPlatform implements Platform using CGO-free Windows syscalls (iphlpapi):
@@ -267,7 +269,7 @@ func (winPlatform) Ping(ctx context.Context, target string, opts PingOptions) (P
 		to = 1000
 	}
 
-	ret, _, _ := procIcmpSendEcho.Call(
+	ret, _, callErr := procIcmpSendEcho.Call(
 		handle,
 		uintptr(dest),
 		uintptr(unsafe.Pointer(&reqData[0])),
@@ -279,13 +281,47 @@ func (winPlatform) Ping(ctx context.Context, target string, opts PingOptions) (P
 	)
 	runtime.KeepAlive(reqData)
 	if ret == 0 {
-		return res, nil // no reply: timeout or unreachable (Received=false)
+		// No reply. GetLastError carries the extended IP_STATUS (timeout / unreachable);
+		// classify it so a fully-lost cycle records WHY (an unclassifiable send defaults
+		// to timeout — the echo got no answer within the deadline).
+		res.Reason = telemetry.ProbeReasonTimeout
+		if errno, ok := callErr.(syscall.Errno); ok {
+			if r := mapWinIPStatus(uint32(errno)); r != telemetry.ProbeReasonNone {
+				res.Reason = r
+			}
+		}
+		return res, nil
 	}
 	reply := (*icmpEchoReply)(unsafe.Pointer(&replyBuf[0]))
 	if reply.Status != 0 { // IP_SUCCESS == 0
+		res.Reason = mapWinIPStatus(uint32(reply.Status))
+		if res.Reason == telemetry.ProbeReasonNone {
+			res.Reason = telemetry.ProbeReasonTimeout
+		}
 		return res, nil
 	}
 	res.Received = true
 	res.RTT = time.Duration(reply.RoundTripTime) * time.Millisecond
 	return res, nil
+}
+
+// Win32 IP_STATUS codes (iphlpapi) for a failed ICMP echo.
+const (
+	ipDestNetUnreachable  = 11002
+	ipDestHostUnreachable = 11003
+	ipReqTimedOut         = 11010
+)
+
+// mapWinIPStatus maps a Win32 IP_STATUS to a telemetry.ProbeReason* code.
+func mapWinIPStatus(status uint32) int {
+	switch status {
+	case ipReqTimedOut:
+		return telemetry.ProbeReasonTimeout
+	case ipDestNetUnreachable, ipDestHostUnreachable:
+		return telemetry.ProbeReasonUnreachable
+	case 0: // IP_SUCCESS
+		return telemetry.ProbeReasonNone
+	default:
+		return telemetry.ProbeReasonOther
+	}
 }

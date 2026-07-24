@@ -223,8 +223,15 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 			if ctx.Err() != nil {
 				break // the request was aborted by the cancelled run, not the service
 			}
+			// Classify the transport failure (DNS/refused/timeout/unreachable/TLS) so a
+			// fired alert records WHY, not just "unavailable". No status/latency metric —
+			// the request never completed.
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,
+				MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
+			}, telemetry.Metric{
+				TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService,
+				Value: float64(classifyNetError(err)), Unit: telemetry.UnitCode,
 				MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 			})
 			res.Events = append(res.Events, telemetry.Event{
@@ -255,10 +262,13 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		if statusOK && bodyMatch {
 			ok = 1.0
 		}
+		// The request completed (transport OK), so error_class is None even on a bad
+		// status — the rejected status/keyword is the "why", carried by HTTPStatus/HTTPOK.
 		res.Metrics = append(res.Metrics,
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(status), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: lat, Unit: telemetry.UnitMs, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService, Value: float64(telemetry.ProbeReasonNone), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 		)
 	}
 	return res, nil

@@ -62,6 +62,10 @@ type PingResult struct {
 	Target   string
 	RTT      time.Duration
 	Received bool
+	// Reason classifies a non-received echo into a telemetry.ProbeReason* code
+	// (Timeout / Unreachable / Other); 0 (ProbeReasonNone) when Received or when the
+	// platform cannot classify (the non-Windows stub never sets it).
+	Reason int
 }
 
 // PingOptions tunes a single ICMP echo. Zero values mean "use defaults", so an

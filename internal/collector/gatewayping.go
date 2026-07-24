@@ -69,7 +69,7 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 		if gw == "" {
 			// No gateway found on the selected/default NIC: report LAN-layer down.
 			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN,
-				gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100})
+				gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100, Reason: telemetry.ProbeReasonUnreachable})
 			res.Events = append(res.Events, telemetry.Event{
 				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
 				Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
