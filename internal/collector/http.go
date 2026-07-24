@@ -159,6 +159,12 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
+		// A pass aborted by run cancellation (agent shutdown) must not fabricate
+		// request failures — they would replay from the WAL as a false service
+		// outage on the next start.
+		if ctx.Err() != nil {
+			break
+		}
 		// Defensive re-check: a non-basic HTTP request requires probe.http.extended.
 		// The monitor evaluator already excludes such targets when the permission is
 		// absent, so this only fires on a policy/eval drift — skip silently, never a
@@ -213,6 +219,9 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 			if errors.As(err, &be) {
 				res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 				continue
+			}
+			if ctx.Err() != nil {
+				break // the request was aborted by the cancelled run, not the service
 			}
 			res.Metrics = append(res.Metrics, telemetry.Metric{
 				TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool,

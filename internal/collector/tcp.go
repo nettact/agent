@@ -50,6 +50,12 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
+		// A pass aborted by run cancellation (agent shutdown) must not fabricate
+		// connect failures — they would replay from the WAL as a false service
+		// outage on the next start (probe drops its own aborted result too).
+		if ctx.Err() != nil {
+			break
+		}
 		c.probe(ctx, now, t, &res)
 	}
 	return res, nil
@@ -100,6 +106,9 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 			if errors.As(err, &be) {
 				res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 				return
+			}
+			if ctx.Err() != nil {
+				return // resolution aborted by the cancelled run, not a DNS fault
 			}
 			// Plain resolution failure: down, classified as DNS. No dns_ms (the
 			// resolution did not produce a valid latency).
@@ -162,6 +171,9 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	}
 
 	overallOK := connectOK && tlsErr == nil
+	if !overallOK && ctx.Err() != nil {
+		return // connect/handshake aborted by the cancelled run, not the service
+	}
 	errClass := telemetry.TCPErrNone
 	switch {
 	case !connectOK:

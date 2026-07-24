@@ -52,6 +52,14 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
+		// A pass aborted by run cancellation (agent shutdown) must not fabricate
+		// loss: under a cancelled context resolution and every remaining echo fail
+		// instantly, which the emitted sample cannot distinguish from a real
+		// outage — it would sit in the WAL and raise a false alert on the next
+		// start. Keep what was measured before the cancel; drop the rest.
+		if ctx.Err() != nil {
+			break
+		}
 		// Vet the destination before dialing: a literal IP is checked directly; a
 		// hostname is resolved once through the guard and the vetted IP is pinned to
 		// the ping. A policy block is a target-policy block, not a loss sample.
@@ -69,10 +77,16 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			// would re-resolve it through the system resolver OUTSIDE the guard — a
 			// DNS-rebinding / policy-bypass hole (e.g. a dual-stack name whose AAAA
 			// fails but A resolves to a denied address).
+			if ctx.Err() != nil {
+				break // resolution failed because the run was cancelled, not the network
+			}
 			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels, pingCycleResult{Loss: 100})
 			continue
 		}
 		r := pingCycle(ctx, c.p, pingTarget, t.Params)
+		if ctx.Err() != nil {
+			break // cycle aborted mid-flight: unsent echoes are not lost echoes
+		}
 		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels, r)
 	}
 	return res, nil

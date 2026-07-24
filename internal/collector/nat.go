@@ -67,6 +67,12 @@ func (c *NATCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
+		// A pass aborted by run cancellation (agent shutdown) must not fabricate
+		// binding failures — they would replay from the WAL as a false WAN outage
+		// on the next start (probeNAT drops its own aborted results too).
+		if ctx.Err() != nil {
+			break
+		}
 		c.probeNAT(ctx, now, t, &res)
 	}
 	return res, nil
@@ -130,7 +136,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	if transport != "udp" {
 		// tcp/tls/dtls: binding test only.
 		reflexive, rtt, err := streamBinding(rctx, c.guard, transport, server, t.Params.IgnoreTLS, perReq)
-		c.emitBinding(now, t, res, base, reflexive, rtt, err)
+		c.emitBinding(ctx, now, t, res, base, reflexive, rtt, err)
 		return
 	}
 
@@ -138,7 +144,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// leaves from the same local port (required for mapping/filtering).
 	rt, err := newUDPRoundTripper(c.guard)
 	if err != nil {
-		c.emitBinding(now, t, res, base, "", 0, err)
+		c.emitBinding(ctx, now, t, res, base, "", 0, err)
 		return
 	}
 	defer rt.close()
@@ -148,14 +154,14 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	resp, _, err := rt.do(rctx, server, perReq, 0)
 	if err != nil {
 		// emitBinding routes a *netguard.BlockedError to res.Blocked (no metric).
-		c.emitBinding(now, t, res, base, "", 0, err)
+		c.emitBinding(ctx, now, t, res, base, "", 0, err)
 		return
 	}
 	rtt := float64(time.Since(t0).Microseconds()) / 1000.0
 
 	var xor stun.XORMappedAddress
 	if xor.GetFrom(resp) != nil {
-		c.emitBinding(now, t, res, base, "", rtt, errors.New("no XOR-MAPPED-ADDRESS in response"))
+		c.emitBinding(ctx, now, t, res, base, "", rtt, errors.New("no XOR-MAPPED-ADDRESS in response"))
 		return
 	}
 	reflexive := net.JoinHostPort(xor.IP.String(), strconv.Itoa(xor.Port))
@@ -175,7 +181,10 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 			res.Blocked = append(res.Blocked, *be)
 			return
 		}
-		c.emitBinding(now, t, res, base, reflexive, rtt, nil)
+		if ctx.Err() != nil {
+			return // discovery aborted by the cancelled run: not an "unknown" verdict
+		}
+		c.emitBinding(ctx, now, t, res, base, reflexive, rtt, nil)
 		res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 			map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 		res.Events = append(res.Events, telemetry.Event{
@@ -219,8 +228,11 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		return
 	}
 
+	if ctx.Err() != nil {
+		return // discovery aborted by the cancelled run: not an "unknown" verdict
+	}
 	// No block anywhere in the discovery: emit the binding + behavior metrics.
-	c.emitBinding(now, t, res, base, reflexive, rtt, nil)
+	c.emitBinding(ctx, now, t, res, base, reflexive, rtt, nil)
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 		map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATFiltering, filtering,
@@ -248,7 +260,7 @@ func asBlockedProbe(t pcfg.ProbeTarget, err error) *BlockedProbe {
 // address differs from the last one seen for this target — the metrics store does
 // not persist sample labels, so this event is how the mapped address surfaces, and
 // gating on change keeps it from spamming the timeline every run.
-func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Result, base map[string]string, reflexive string, rtt float64, err error) {
+func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result, base map[string]string, reflexive string, rtt float64, err error) {
 	if err != nil {
 		// A policy block on the STUN server is a target-policy block, not a binding
 		// failure: emit no metric/event, route it to the monitor-status tracker.
@@ -256,6 +268,9 @@ func (c *NATCollector) emitBinding(now time.Time, t pcfg.ProbeTarget, res *Resul
 		if errors.As(err, &be) {
 			res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 			return
+		}
+		if ctx.Err() != nil {
+			return // the exchange was aborted by the cancelled run, not the NAT
 		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,

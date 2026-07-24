@@ -58,6 +58,12 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 
 	var res Result
 	for _, t := range targets {
+		// A pass aborted by run cancellation (agent shutdown) must not fabricate
+		// loss samples or unreachable events — they would replay from the WAL as a
+		// false LAN outage on the next start.
+		if ctx.Err() != nil {
+			break
+		}
 		now := time.Now().UTC()
 		gw := c.gatewayFor(t.Params.Interface)
 		if gw == "" {
@@ -85,6 +91,9 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 		}
 
 		r := pingCycle(ctx, c.p, gw, t.Params)
+		if ctx.Err() != nil {
+			break // cycle aborted mid-flight: unsent echoes are not lost echoes
+		}
 		labels := gatewayLabels(gw, t.Params.Interface)
 		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN, labels, r)
 		if r.Received == 0 {

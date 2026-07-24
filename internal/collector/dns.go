@@ -72,6 +72,12 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 	now := time.Now().UTC()
 	var res Result
 	for _, t := range targets {
+		// A pass aborted by run cancellation (agent shutdown) must not fabricate
+		// resolve failures — they would replay from the WAL as a false DNS outage
+		// on the next start.
+		if ctx.Err() != nil {
+			break
+		}
 		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
 		if timeout <= 0 {
 			timeout = pcfg.DefaultDNSTimeout
@@ -115,6 +121,9 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		if errors.As(derr, &be) {
 			res.Blocked = append(res.Blocked, blockedFromErr(t, be))
 			continue
+		}
+		if !ok && ctx.Err() != nil {
+			break // the lookup was aborted by the cancelled run, not by the resolver
 		}
 
 		okv := 0.0
