@@ -34,6 +34,8 @@ jobs:
     name: Test · build · publish
     runs-on: ubuntu-latest
     environment: release          # manual-approval gate
+    outputs:
+      is_latest: ${{ steps.rel.outputs.is_latest }}
     permissions:
       contents: write             # GitHub Release
       packages: write             # push to GHCR
@@ -107,7 +109,7 @@ jobs:
           VERSION="${{ inputs.tag || github.ref_name }}"
           LDFLAGS="-s -w -X github.com/nettact/agent/agentrt.Version=${VERSION}"
           mkdir -p dist-bins
-          for target in linux/amd64 linux/arm64 windows/amd64; do
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
             os="${target%/*}"; arch="${target#*/}"
             ext=""; [ "$os" = "windows" ] && ext=".exe"
             ( cd agent && CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
@@ -173,8 +175,12 @@ jobs:
           files: |
             dist-bins/nettact-agent-linux-amd64
             dist-bins/nettact-agent-linux-arm64
+            dist-bins/nettact-agent-darwin-amd64
+            dist-bins/nettact-agent-darwin-arm64
             dist-bins/nettact-agent-windows-amd64.exe
             dist-bins/SHA256SUMS
+            agent/install.sh
+            agent/install.ps1
           body: |
             ## nettact-agent ${{ inputs.tag || github.ref_name }}
 
@@ -185,3 +191,75 @@ jobs:
             docker pull ghcr.io/${{ github.repository_owner }}/nettact-agent:${{ inputs.tag || github.ref_name }}
             ```
             Verify binary integrity with `sha256sum -c SHA256SUMS`.
+
+  publish-r2:
+    name: Publish Agent assets to R2
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      PUBLIC_BASE_URL: https://d.nettact.org/agent
+      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate R2 configuration
+        run: |
+          set -euo pipefail
+          : "${R2_ACCOUNT_ID:?Set the R2_ACCOUNT_ID repository variable}"
+          : "${R2_BUCKET:?Set the R2_BUCKET repository variable}"
+          : "${AWS_ACCESS_KEY_ID:?Set the R2_ACCESS_KEY_ID repository secret}"
+          : "${AWS_SECRET_ACCESS_KEY:?Set the R2_SECRET_ACCESS_KEY repository secret}"
+
+      - name: Download and verify Release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist-out
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist-out --pattern 'nettact-agent-*' --pattern 'SHA256SUMS' --pattern 'install.sh' --pattern 'install.ps1'
+          expected=(
+            nettact-agent-linux-amd64
+            nettact-agent-linux-arm64
+            nettact-agent-darwin-amd64
+            nettact-agent-darwin-arm64
+            nettact-agent-windows-amd64.exe
+            SHA256SUMS
+            install.sh
+            install.ps1
+          )
+          for asset in "${expected[@]}"; do
+            [[ -f "dist-out/$asset" ]] || {
+              echo "Missing required Release asset: $asset" >&2
+              exit 1
+            }
+          done
+          (cd dist-out && sha256sum --check SHA256SUMS)
+          ! grep -R 'github.com/nettact/agent/releases' dist-out/install.sh dist-out/install.ps1
+
+      - name: Publish immutable version path
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 sync dist-out/ "s3://${R2_BUCKET}/agent/$TAG/" --endpoint-url "$endpoint" --delete --no-progress --only-show-errors --cache-control 'public, max-age=31536000, immutable'
+
+      - name: Publish latest Agent assets
+        if: needs.release.outputs.is_latest == 'true'
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 sync dist-out/ "s3://${R2_BUCKET}/agent/" --endpoint-url "$endpoint" --no-progress --only-show-errors --cache-control 'public, max-age=300'
+
+      - name: Publish download summary
+        run: |
+          {
+            echo "## R2 Agent downloads"
+            echo
+            echo "- Version: $TAG"
+            echo "- Merged Linux/macOS/Docker installer: $PUBLIC_BASE_URL/install.sh"
+            echo "- Windows installer: $PUBLIC_BASE_URL/install.ps1"
+            echo "- Versioned assets: $PUBLIC_BASE_URL/$TAG/"
+          } >> "$GITHUB_STEP_SUMMARY"
