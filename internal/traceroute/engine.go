@@ -105,10 +105,11 @@ func Supported() (icmp bool, tcp bool) {
 
 // Run executes one trace and returns its terminal result. ctx is the session
 // context: cancellation (reconnect/shutdown) aborts the trace with a canceled
-// status. The request deadline and clamped total timeout bound the run; the
-// destination is resolved once through the guard and the actual destination IP
-// is reported.
-func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest) telemetry.TraceResult {
+// status. The request budget — anchored at receivedAt, the caller's arrival
+// instant, so worker scheduling delay is not handed back as extra window — and
+// the clamped total timeout bound the run; the destination is resolved once
+// through the guard and the actual destination IP is reported.
+func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult {
 	res := telemetry.TraceResult{ReportID: req.ReportID, Mode: req.Mode}
 
 	// Validate + clamp locally. Invalid mode/port/destination send no probes.
@@ -138,9 +139,11 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest) telemetry.Trace
 		return terminal(res, telemetry.TraceStatusUnsupported, e.capabilityReason(permID, mode))
 	}
 
-	// Absolute deadline is the only validity window. Past it, do not start.
-	now := time.Now()
-	if !req.Deadline.IsZero() && !now.Before(req.Deadline) {
+	// The request budget is the only validity window. It arrives as a duration and
+	// is anchored to this agent's own clock — never to a server timestamp, so clock
+	// skew between server and agent cannot shrink the window. Spent, do not start.
+	deadline, ok := pcfg.BudgetWindow(req.BudgetMs, receivedAt, time.Now())
+	if !ok {
 		return terminal(res, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
 	}
 	if ctx.Err() != nil {
@@ -158,16 +161,16 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest) telemetry.Trace
 	// Acquire a per-Agent slot; distinct reports run concurrently up to the limit.
 	// A waiter that loses its whole budget/deadline before a slot frees returns a
 	// clean terminal state rather than blocking forever.
-	if st, rsn, ok := e.acquire(ctx, req.Deadline); !ok {
+	if st, rsn, ok := e.acquire(ctx, deadline); !ok {
 		res.CompletedAt = time.Now().UTC()
 		return terminal(res, st, rsn)
 	}
 	defer func() { <-e.sem }()
 
-	// Run window = earliest of the request deadline and now+totalTimeout.
+	// Run window = earliest of the request's budget deadline and now+totalTimeout.
 	runDeadline := time.Now().Add(totalTimeout)
-	if !req.Deadline.IsZero() && req.Deadline.Before(runDeadline) {
-		runDeadline = req.Deadline
+	if deadline.Before(runDeadline) {
+		runDeadline = deadline
 	}
 	runCtx, cancel := context.WithDeadline(ctx, runDeadline)
 	defer cancel()
@@ -270,22 +273,17 @@ sweep:
 }
 
 // acquire waits for a per-Agent concurrency slot, honoring session cancellation
-// and the request deadline. It returns ok=false with the terminal status/reason
-// to use when the slot never frees in time.
+// and the request's budget deadline. It returns ok=false with the terminal
+// status/reason to use when the slot never frees in time.
 func (e *Engine) acquire(ctx context.Context, deadline time.Time) (status, reason string, ok bool) {
-	var timer *time.Timer
-	var wait <-chan time.Time
-	if !deadline.IsZero() {
-		timer = time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
-		wait = timer.C
-	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case e.sem <- struct{}{}:
 		return "", "", true
 	case <-ctx.Done():
 		return telemetry.TraceStatusCanceled, reasonCanceled, false
-	case <-wait:
+	case <-timer.C:
 		return telemetry.TraceStatusTimedOut, reasonDeadlineExceeded, false
 	}
 }

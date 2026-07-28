@@ -480,8 +480,8 @@ func Run(ctx context.Context, cfg Config) error {
 		CollectIncidentSnapshot: func(ctx context.Context, req pcfg.IncidentSnapshotRequest) telemetry.IncidentSnapshot {
 			return incidentscene.Collect(ctx, req, sceneDeps)
 		},
-		RunTrace: func(ctx context.Context, req pcfg.TraceRequest) telemetry.TraceResult {
-			return traceEngine.Run(ctx, req)
+		RunTrace: func(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult {
+			return traceEngine.Run(ctx, req, receivedAt)
 		},
 	})
 

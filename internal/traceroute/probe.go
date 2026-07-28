@@ -3,7 +3,7 @@
 // collectors. Distinct requests execute concurrently up to a bounded per-Agent
 // limit; each request resolves its destination exactly once through the same
 // netguard target-access policy the live probes use, clamps its own inputs, and
-// obeys the absolute request deadline as its only validity window. ICMP and TCP
+// obeys the request's budget as its only validity window. ICMP and TCP
 // are executed by dedicated TTL-aware platform paths (real on Windows/IPv4,
 // precise-unsupported stubs elsewhere); at the agent level there is never an
 // automatic fallback between the two modes — mode fallback (TCP to ICMP) is

@@ -153,9 +153,11 @@ type Deps struct {
 
 	// RunTrace executes one config.TraceRequest (DIAG-001) and returns its terminal
 	// telemetry.TraceResult. Like CollectIncidentSnapshot it runs off the session
-	// goroutine; the engine it wraps owns the per-Agent concurrency limit. Nil
-	// disables the feature.
-	RunTrace func(ctx context.Context, req pcfg.TraceRequest) telemetry.TraceResult
+	// goroutine; the engine it wraps owns the per-Agent concurrency limit.
+	// receivedAt is the request's arrival instant, captured on the session
+	// goroutine, so the engine anchors the request budget there instead of
+	// wherever the worker happened to be scheduled. Nil disables the feature.
+	RunTrace func(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult
 }
 
 // Run dials the server and keeps a session alive until ctx is cancelled,
@@ -644,8 +646,8 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 // one request (INCIDENT-002). It is a no-op-with-dedupe on the session goroutine:
 // a duplicate in-flight RequestID is ignored (the server re-push is idempotent),
 // and the actual collection runs on a background goroutine bounded by the request
-// Deadline and canceled with the session. The collector always answers by the
-// deadline, so the worker always produces exactly one result Frame.
+// budget and canceled with the session. The collector always answers within the
+// budget, so the worker always produces exactly one result Frame.
 func (r *runner) dispatchIncidentSnapshot(sessionCtx context.Context, aw *asyncWork, req pcfg.IncidentSnapshotRequest) {
 	if r.deps.CollectIncidentSnapshot == nil {
 		log.Printf("ignoring incident snapshot req=%s: collector not wired", req.RequestID)
@@ -656,11 +658,13 @@ func (r *runner) dispatchIncidentSnapshot(sessionCtx context.Context, aw *asyncW
 		return
 	}
 	aw.inflightSnap[req.RequestID] = struct{}{}
+	// Anchor the budget here, on the session goroutine, rather than inside the
+	// worker: the budget is defined as running from the request's arrival, and
+	// scheduling the goroutine first would silently hand back whatever the delay
+	// was. The collector answers every group within it; a worker that finishes
+	// after the session ended drops its result (server reconnect re-push retries).
+	ctx := budgetCtx(sessionCtx, req.BudgetMs)
 	go func() {
-		// Bound the whole collection by the request deadline; the collector answers
-		// every group by then. A worker that finishes after the session ended drops
-		// its result (server reconnect re-push retries).
-		ctx := deadlineCtx(sessionCtx, req.Deadline)
 		snap := r.deps.CollectIncidentSnapshot(ctx.ctx, req)
 		ctx.cancel()
 		r.deliver(sessionCtx, aw, wire.Frame{IncidentSnapshot: &snap})
@@ -682,11 +686,14 @@ func (r *runner) dispatchTrace(sessionCtx context.Context, aw *asyncWork, req pc
 		return
 	}
 	aw.inflightTrace[req.ReportID] = struct{}{}
+	// Arrival instant for the request budget, taken here rather than in the worker
+	// for the same reason as the incident snapshot above.
+	receivedAt := time.Now()
 	go func() {
-		// The engine owns the request deadline and total-timeout budget (so it can
-		// tell an expired deadline apart from a session cancel); it is given the raw
+		// The engine owns the request budget and total-timeout window (so it can tell
+		// an exhausted budget apart from a session cancel); it is given the raw
 		// session context, which cancels the trace on reconnect/shutdown.
-		res := r.deps.RunTrace(sessionCtx, req)
+		res := r.deps.RunTrace(sessionCtx, req, receivedAt)
 		r.deliver(sessionCtx, aw, wire.Frame{TraceResult: &res})
 	}()
 }
@@ -709,14 +716,18 @@ type boundedCtx struct {
 	cancel context.CancelFunc
 }
 
-// deadlineCtx derives a worker context from the session context, additionally
-// bounded by the absolute request deadline when one is set. Session cancellation
-// (reconnect/shutdown) still cancels the work; the deadline is the request's own
-// validity window.
-func deadlineCtx(sessionCtx context.Context, deadline time.Time) boundedCtx {
-	if deadline.IsZero() {
-		ctx, cancel := context.WithCancel(sessionCtx)
-		return boundedCtx{ctx: ctx, cancel: cancel}
+// budgetCtx derives a worker context from the session context, bounded by the
+// request's own budget measured from this agent's clock (config.BudgetWindow — a
+// duration precisely so server/agent clock skew cannot eat the window). Callers
+// invoke it at the request's arrival, so arrival and evaluation are the same
+// instant. Session cancellation (reconnect/shutdown) still cancels the work; a
+// spent budget yields an already-expired context, so the worker reports its
+// terminal timed-out state instead of collecting.
+func budgetCtx(sessionCtx context.Context, budgetMs int) boundedCtx {
+	now := time.Now()
+	deadline, ok := pcfg.BudgetWindow(budgetMs, now, now)
+	if !ok {
+		deadline = now
 	}
 	ctx, cancel := context.WithDeadline(sessionCtx, deadline)
 	return boundedCtx{ctx: ctx, cancel: cancel}

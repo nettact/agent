@@ -9,7 +9,7 @@
 // against the agent's existing effective/granted/supported permission views and
 // the platform's real capabilities, so a partial snapshot completes immediately
 // instead of waiting on a denied or unsupported group. The whole collection is
-// bounded by the request Deadline; the returned IncidentSnapshot always carries
+// bounded by the request's budget; the returned IncidentSnapshot always carries
 // the request/incident id and one result per attempted group, even when every
 // group is denied. Nothing here is persisted.
 package incidentscene
@@ -52,6 +52,19 @@ const (
 	reasonTimeout          = "timeout"
 )
 
+// Stable per-target error classes (SnapshotTargetResult.ErrorClass). These
+// describe the TARGET's resolution outcome, so an agent-side condition that
+// prevented the lookup from ever happening must never borrow errClassDNS —
+// reporting a DNS failure the target does not have sends the reader after the
+// wrong layer.
+const (
+	errClassInvalidTarget = "invalid_target" // the target string carries no resolvable host
+	errClassPolicyDenied  = "policy_denied"  // the agent's own target-access policy blocked it
+	errClassDNS           = "dns_error"      // the resolver answered, and the answer was a failure
+	errClassTimeout       = "timeout"        // the collection budget ran out before the resolver answered
+	errClassCanceled      = "canceled"       // the session ended before the resolver answered
+)
+
 // Identity is the detecting agent's own identity/version, fixed into the
 // snapshot at collection time so later renames never rewrite history.
 type Identity struct {
@@ -74,7 +87,7 @@ type Deps struct {
 }
 
 // Collect gathers the allowlisted incident-scene snapshot for req, bounded by
-// ctx (the caller derives ctx from req.Deadline). It always returns a snapshot
+// ctx (the caller derives ctx from req.BudgetMs). It always returns a snapshot
 // carrying the request/incident id and a result for every attempted group.
 func Collect(ctx context.Context, req pcfg.IncidentSnapshotRequest, deps Deps) telemetry.IncidentSnapshot {
 	snap := telemetry.IncidentSnapshot{
@@ -290,7 +303,7 @@ func resolveTarget(ctx context.Context, guard *netguard.Guard, ref pcfg.Snapshot
 	}
 	host, port := deriveHostPort(ref)
 	if host == "" {
-		res.ErrorClass = "invalid_target"
+		res.ErrorClass = errClassInvalidTarget
 		return res
 	}
 
@@ -313,30 +326,51 @@ func resolveTarget(ctx context.Context, guard *netguard.Guard, ref pcfg.Snapshot
 
 // resolveHost runs one host through the guard exactly once: a literal IP is
 // policy-checked directly; a hostname is pre-checked then vetted-resolved. It
-// returns the vetted addresses and a coarse error class ("" on success,
-// "policy_denied" on a policy block, "dns_error" on a resolution failure).
+// returns the vetted addresses and a coarse error class ("" on success).
+//
+// A dead collection context short-circuits before any lookup, and a lookup that
+// fails because the context died is classified by that context — not as
+// errClassDNS. The stdlib resolver wraps a context timeout in a *net.DNSError, so
+// treating every resolve error as a DNS failure would report "DNS resolution
+// failed" for a target whose name resolves perfectly well, whenever the snapshot
+// budget was already spent when collection began.
 func resolveHost(ctx context.Context, guard *netguard.Guard, host string) ([]netip.Addr, string) {
 	if a, err := netip.ParseAddr(host); err == nil {
 		a = a.Unmap()
 		if dec := guard.CheckAddr(a); !dec.Allowed {
-			return nil, "policy_denied"
+			return nil, errClassPolicyDenied
 		}
 		return []netip.Addr{a}, ""
 	}
+	if ctx.Err() != nil {
+		return nil, ctxErrorClass(ctx)
+	}
 	hd := guard.CheckHost(host)
 	if hd.Denied {
-		return nil, "policy_denied"
+		return nil, errClassPolicyDenied
 	}
 	vetted, err := guard.ResolveVetted(ctx, host, hd.NameAuthorized)
 	if err != nil {
 		var be *netguard.BlockedError
-		if errors.As(err, &be) {
-			return nil, "policy_denied"
+		switch {
+		case errors.As(err, &be):
+			return nil, errClassPolicyDenied
+		case ctx.Err() != nil:
+			return nil, ctxErrorClass(ctx)
 		}
-		return nil, "dns_error"
+		return nil, errClassDNS
 	}
 	sort.Slice(vetted, func(i, j int) bool { return vetted[i].Less(vetted[j]) })
 	return vetted, ""
+}
+
+// ctxErrorClass maps a dead collection context to the target error class that
+// explains why no answer was obtained: budget exhaustion vs session teardown.
+func ctxErrorClass(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errClassTimeout
+	}
+	return errClassCanceled
 }
 
 // deriveHostPort extracts the host and probe port from a target ref. HTTP targets

@@ -24,7 +24,7 @@ func TestRunRejectsInvalidAndExpiredRequestsWithoutProbing(t *testing.T) {
 		{"port", pcfg.TraceRequest{ReportID: "bad-port", Mode: pcfg.TraceModeTCP, DestinationHost: "1.1.1.1"}, telemetry.TraceStatusFailed, reasonInvalidPort},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := e.Run(context.Background(), tc.req)
+			got := e.Run(context.Background(), tc.req, time.Now())
 			if got.Status != tc.status || got.Reason != tc.reason {
 				t.Fatalf("result = %s/%s, want %s/%s", got.Status, got.Reason, tc.status, tc.reason)
 			}
@@ -33,11 +33,27 @@ func TestRunRejectsInvalidAndExpiredRequestsWithoutProbing(t *testing.T) {
 
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
 	e = New(nil, granted, granted, granted, 1)
+	// A spent budget (the server pushed a window the trace can no longer fit in) is
+	// terminal-at-start, and never sends a probe.
+	for _, budgetMs := range []int{0, -1} {
+		got := e.Run(context.Background(), pcfg.TraceRequest{
+			ReportID: "expired", Mode: pcfg.TraceModeICMP, DestinationHost: "1.1.1.1", BudgetMs: budgetMs,
+		}, time.Now())
+		if got.Status != telemetry.TraceStatusTimedOut || got.Reason != reasonDeadlineExceeded {
+			t.Fatalf("budget %dms result = %s/%s, want %s/%s", budgetMs,
+				got.Status, got.Reason, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
+		}
+	}
+
+	// The budget runs from receivedAt, not from entry into Run: a request whose
+	// window already elapsed before the worker was scheduled must not be handed a
+	// fresh window just because it started late.
 	got := e.Run(context.Background(), pcfg.TraceRequest{
-		ReportID: "expired", Mode: pcfg.TraceModeICMP, DestinationHost: "1.1.1.1", Deadline: time.Now().Add(-time.Second),
-	})
+		ReportID: "stale", Mode: pcfg.TraceModeICMP, DestinationHost: "1.1.1.1", BudgetMs: 1_000,
+	}, time.Now().Add(-2*time.Second))
 	if got.Status != telemetry.TraceStatusTimedOut || got.Reason != reasonDeadlineExceeded {
-		t.Fatalf("expired result = %s/%s", got.Status, got.Reason)
+		t.Fatalf("stale receivedAt result = %s/%s, want %s/%s",
+			got.Status, got.Reason, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
 	}
 }
 
