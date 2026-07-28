@@ -130,12 +130,17 @@ if $DOCKER_MODE; then
   # collector and the Agent's own route/resolver reads to the same mounts, so a
   # host CPU figure can never sit next to a container's default gateway.
   #
-  # --user 0:0 plus NET_RAW is what actually buys ICMP probing and traceroute:
-  # the image carries no file capability on purpose (see ci/Dockerfile), so a
-  # non-root process gets an empty permitted set no matter what is in the
-  # bounding set. Root here is a small addition to a container that already
-  # shares the host's network and PID namespaces; --container-view keeps the
-  # hardened non-root default.
+  # --user 0:0 plus NET_RAW is what buys PATH DIAGNOSTICS specifically. ICMP
+  # probing and gateway probing do not need it: they run over an unprivileged
+  # ping socket wherever net.ipv4.ping_group_range allows, which is the Docker
+  # default — measured working in a plain non-root container. Traceroute is
+  # different because it must RECEIVE intermediate Time-Exceeded replies, and
+  # only a raw socket delivers those. The image carries no file capability on
+  # purpose (see ci/Dockerfile), so a non-root process has an empty permitted set
+  # no matter what is in the bounding set, which is why this is root rather than
+  # --cap-add alone. Root is a small addition to a container that already shares
+  # the host's network and PID namespaces; --container-view keeps the hardened
+  # non-root default and still gets ICMP probing.
   #
   # Two individual files, not the whole /etc: os-release is what identifies the
   # monitored machine (without it the Agent registers the CONTAINER IMAGE's
