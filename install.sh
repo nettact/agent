@@ -9,7 +9,8 @@ DOWNLOAD_BASE="${NETTACT_AGENT_DOWNLOAD_BASE:-https://d.nettact.org/agent}"
 AUTO_UPDATE=false
 UPDATE_ONLY=false
 DOCKER_MODE=false
-HOST_NETWORK=false
+CONTAINER_VIEW=false
+PERMISSIONS=""
 TOKEN_FILE=""
 
 usage() {
@@ -17,14 +18,27 @@ usage() {
 NetTact Agent installer
 
 Usage:
-  install.sh --server-url <url> --token <one-time-token> [--auto-update]
-  install.sh --docker --server-url <url> --token <one-time-token> [--auto-update]
+  install.sh --server-url <url> --token <one-time-token> [options]
+  install.sh --docker --server-url <url> --token <one-time-token> [options]
   install.sh --update-only
 
 The same script installs a native systemd service on Linux, a launchd daemon on
 macOS, or a persistent container when --docker is selected. Re-running upgrades
-the native binary and keeps the existing Agent identity. --auto-update installs
-a daily native update timer or an Agent-scoped Docker image updater.
+the native binary and keeps the existing Agent identity.
+
+Options:
+  --auto-update        Install a daily native update timer, or an Agent-scoped
+                       Docker image updater.
+  --permissions <list> Comma-separated local permission policy, or the literal
+                       "none". This REPLACES the Agent's built-in default set
+                       rather than adding to it; omit it to keep the default.
+                       Wildcards are not accepted. The NetTact console's Agent
+                       page generates a ready-made value for you.
+  --container-view     Docker only: monitor the CONTAINER instead of the host.
+                       By default a Docker install monitors the Docker host —
+                       host network and PID namespaces, the host's /proc and
+                       /sys, and NET_RAW for ICMP — because that is the machine
+                       an operator means to watch. This flag opts out.
 EOF
 }
 
@@ -39,18 +53,39 @@ while [ $# -gt 0 ]; do
     --auto-update) AUTO_UPDATE=true; shift ;;
     --update-only) UPDATE_ONLY=true; shift ;;
     --docker) DOCKER_MODE=true; shift ;;
-    --host-network) HOST_NETWORK=true; shift ;;
+    --container-view) CONTAINER_VIEW=true; shift ;;
+    --permissions) PERMISSIONS="${2:?--permissions needs a value}"; shift 2 ;;
     --token-file) TOKEN_FILE="${2:?--token-file needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
 done
 
+# Normalize and validate the permission policy before touching anything: the
+# Agent rejects an unsatisfiable policy at startup, and finding that out after the
+# service is installed is a worse experience than failing here. Whitespace is
+# stripped rather than rejected so a value pasted out of the console or a wrapped
+# shell line still works.
+if [ -n "$PERMISSIONS" ]; then
+  PERMISSIONS="$(printf '%s' "$PERMISSIONS" | tr -d '[:space:]')"
+  case "$PERMISSIONS" in
+    "") die "--permissions needs a value (use \"none\" for an empty grant)" ;;
+    *'*'*|all|ALL) die "--permissions does not accept wildcards; list explicit permissions or \"none\"" ;;
+  esac
+  # A value of only separators (",", ",,,") would emit a `permissions:` key with
+  # no children, which the Agent reads as "not configured" and answers with the
+  # full built-in DEFAULT grant — the opposite of the restriction that was asked
+  # for, and silently. Require at least one real entry.
+  if [ "$PERMISSIONS" != none ] && [ -z "$(printf '%s' "$PERMISSIONS" | tr -d ',')" ]; then
+    die "--permissions lists no permissions; pass explicit ids or \"none\" for an empty grant"
+  fi
+fi
+
 if $DOCKER_MODE; then
   command -v docker >/dev/null 2>&1 || die "docker is required for --docker"
   docker info >/dev/null 2>&1 || die "cannot connect to the Docker daemon"
 fi
-$HOST_NETWORK && ! $DOCKER_MODE && die "--host-network requires --docker"
+$CONTAINER_VIEW && ! $DOCKER_MODE && die "--container-view requires --docker"
 [ -n "$TOKEN_FILE" ] && ! $DOCKER_MODE && die "--token-file is only supported with --docker"
 
 $UPDATE_ONLY || {
@@ -87,7 +122,52 @@ if $DOCKER_MODE; then
   elif [ -n "$TOKEN" ]; then
     RUN_ARGS+=(-e "NETTACT_AGENT_ENROLL_TOKEN=$TOKEN")
   fi
-  $HOST_NETWORK && RUN_ARGS+=(--network host)
+  [ -n "$PERMISSIONS" ] && RUN_ARGS+=(-e "NETTACT_AGENT_PERMISSIONS=$PERMISSIONS")
+
+  # Host view (the default): share the host's network and PID namespaces and
+  # expose its /proc and /sys, so the Agent reports the MACHINE rather than the
+  # container it happens to run in. HOST_PROC/HOST_SYS redirect both the metric
+  # collector and the Agent's own route/resolver reads to the same mounts, so a
+  # host CPU figure can never sit next to a container's default gateway.
+  #
+  # --user 0:0 plus NET_RAW is what actually buys ICMP probing and traceroute:
+  # the image carries no file capability on purpose (see ci/Dockerfile), so a
+  # non-root process gets an empty permitted set no matter what is in the
+  # bounding set. Root here is a small addition to a container that already
+  # shares the host's network and PID namespaces; --container-view keeps the
+  # hardened non-root default.
+  #
+  # Two individual files, not the whole /etc: os-release is what identifies the
+  # monitored machine (without it the Agent registers the CONTAINER IMAGE's
+  # distribution — "alpine" for an Ubuntu host), and resolv.conf is the resolver
+  # list it reports. Bind-mounting all of /etc would hand the container the host's
+  # shadow file and keys for two values.
+  #
+  # "Host" means the Docker DAEMON's host. On Docker Desktop that is the Linux
+  # VM, not Windows or macOS — there is no way for a Linux container to observe
+  # the outer OS, and the VM is the closest true answer.
+  if ! $CONTAINER_VIEW; then
+    DOCKER_OS="$(docker info --format '{{.OSType}}' 2>/dev/null || echo unknown)"
+    if [ "$DOCKER_OS" != linux ]; then
+      CONTAINER_VIEW=true
+      log "Docker host is not Linux ($DOCKER_OS); monitoring the container itself"
+    elif [ ! -d /proc ] || [ ! -d /sys ]; then
+      CONTAINER_VIEW=true
+      log "host /proc or /sys is unavailable; monitoring the container itself"
+    fi
+  fi
+  if $CONTAINER_VIEW; then
+    log "container view: this Agent reports the container's own network and processes"
+  else
+    log "host view: this Agent reports the Docker daemon host's network, processes and metrics"
+    log "  (disk metrics still describe the container's filesystem — see the permissions docs)"
+    RUN_ARGS+=(--network host --pid host --cap-add NET_RAW --user 0:0
+      -v /proc:/host/proc:ro -v /sys:/host/sys:ro
+      -e HOST_PROC=/host/proc -e HOST_SYS=/host/sys -e HOST_ETC=/host/etc)
+    for f in os-release resolv.conf; do
+      [ -r "/etc/$f" ] && RUN_ARGS+=(-v "/etc/$f:/host/etc/$f:ro")
+    done
+  fi
   docker run "${RUN_ARGS[@]}" "$IMG" >/dev/null
 
   sleep 2
@@ -171,10 +251,28 @@ yaml_quote() {
     printf "%s", $0
   } END { print "\"" }'
 }
+# Emit the permission policy as a YAML block list, or the literal `none` scalar
+# for an empty grant. Omitting the key entirely (no --permissions) leaves the
+# Agent on its built-in default set — writing an empty list would instead mean
+# "grant nothing", which is a very different install.
+yaml_permissions() {
+  case "$PERMISSIONS" in
+    "") return ;;
+    none) printf 'permissions: none\n'; return ;;
+  esac
+  printf 'permissions:\n'
+  # The trailing newline matters: without it `read` fails on the final field and
+  # the last permission is silently dropped from the installed policy.
+  printf '%s\n' "$PERMISSIONS" | tr ',' '\n' | while IFS= read -r perm; do
+    [ -n "$perm" ] || continue
+    printf '  - '; yaml_quote "$perm"; printf '\n'
+  done
+}
 {
   printf 'server_url: '; yaml_quote "$SERVER_URL"; printf '\n'
   printf 'data_dir: '; yaml_quote "$DATA_DIR"; printf '\n'
   printf 'enroll_token_file: '; yaml_quote "$TOKEN_FILE"; printf '\n'
+  yaml_permissions
 } > "$CONFIG_FILE"
 chmod 0600 "$CONFIG_FILE"
 

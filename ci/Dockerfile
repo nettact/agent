@@ -1,8 +1,28 @@
 # syntax=docker/dockerfile:1
 #
 # nettact-agent — the monitoring agent. A pure outbound client: it never listens on
-# any port, and on Linux needs no NET_RAW/privileged (ICMP probing is Windows-only in
-# this build), so it runs as a non-root user with no added capabilities.
+# any port and runs as a non-root user.
+#
+# Capabilities: the Linux build implements ICMP probing, gateway probing and
+# traceroute, which need a raw ICMP socket. The binary deliberately carries NO
+# file capability, for two measured reasons:
+#
+#   * `setcap cap_net_raw+ep` makes execve() FAIL with EPERM whenever NET_RAW is
+#     outside the container's bounding set, so `--cap-drop ALL` (a common
+#     hardening default, and the k8s `capabilities: drop: [ALL]` idiom) would stop
+#     the agent from starting at all instead of degrading gracefully.
+#   * Docker's DEFAULT bounding set already contains NET_RAW, so a file
+#     capability would silently hand raw sockets to every container, including
+#     ones deliberately run in the isolated --container-view mode.
+#
+# Raw-socket access is therefore granted explicitly at run time instead: run the
+# container as root (agent/install.sh --docker does this for its host view, where
+# the container already shares the host's network and PID namespaces). Without it
+# the agent still runs and simply reports ICMP as unsupported.
+#
+# Host visibility: by default a container sees its OWN network and processes. To
+# monitor the machine, run with --network host --pid host and point HOST_PROC /
+# HOST_SYS at bind-mounted host copies; agent/install.sh --docker does this.
 #
 # Build context: an assembled workspace directory with protocol/ and agent/ as
 # siblings (the release workflow checks out protocol at ci/deps.env's PROTOCOL_SHA):

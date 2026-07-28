@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -170,6 +171,48 @@ permissions: [host.process.basic.read, host.process.owner.read]
 	}
 	if len(cfg.Policy.Granted) != 0 {
 		t.Fatalf("permissions none grant = %v, want empty", cfg.Policy.Granted.Strings())
+	}
+}
+
+// TestInstallScriptConfigShape pins the exact file install.sh and install.ps1
+// write when the operator picks a permission set at enrollment: JSON-quoted
+// scalars plus a quoted block list. Those installers are the main way a policy
+// reaches an Agent, and a mismatch between what they emit and what this parser
+// accepts would only surface as a machine that refuses to start after install.
+func TestInstallScriptConfigShape(t *testing.T) {
+	// The installers always point enroll_token_file at a real file they just
+	// wrote, and the loader reads it eagerly, so the test needs one too.
+	tokenFile := filepath.Join(t.TempDir(), "enroll.token")
+	if err := os.WriteFile(tokenFile, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := `server_url: "https://server.example:12450"
+data_dir: "/var/lib/nettact-agent"
+enroll_token_file: ` + strconv.Quote(tokenFile) + `
+permissions:
+  - "probe.icmp"
+  - "probe.dns"
+  - "host.cpu.read"
+`
+	cfg, err := loadLayered(t, body, nil)
+	if err != nil {
+		t.Fatalf("installer-written config must load: %v", err)
+	}
+	want := []string{"probe.icmp", "probe.dns", "host.cpu.read"}
+	got := cfg.Policy.Granted
+	if len(got) != len(want) {
+		t.Fatalf("granted = %v, want %v", got.Strings(), want)
+	}
+	for _, id := range want {
+		if !got.Has(permission.ID(id)) {
+			t.Fatalf("granted = %v, missing %q", got.Strings(), id)
+		}
+	}
+	if cfg.Policy.Source != permission.SourceEnvironment {
+		t.Fatalf("policy source = %v, want environment (an explicit list)", cfg.Policy.Source)
+	}
+	if cfg.ServerURL != "https://server.example:12450" {
+		t.Fatalf("server_url = %q", cfg.ServerURL)
 	}
 }
 

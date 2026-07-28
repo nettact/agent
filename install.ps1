@@ -5,6 +5,11 @@ param(
     [string]$Token,
     [string]$Version = "latest",
     [string]$DownloadBase = "https://d.nettact.org/agent",
+    # Comma-separated local permission policy, or the literal "none". This
+    # REPLACES the Agent's built-in default set rather than adding to it; omit it
+    # to keep the default. The NetTact console's Agent page generates a
+    # ready-made value. Wildcards are not accepted.
+    [string]$Permissions,
     [switch]$AutoUpdate,
     [switch]$UpdateOnly
 )
@@ -30,6 +35,34 @@ if (-not $UpdateOnly) {
 }
 if ($AutoUpdate -and $Version -ne "latest") {
     throw "AutoUpdate cannot be combined with a pinned Version."
+}
+
+# Normalize and validate the permission policy up front: the Agent rejects an
+# unsatisfiable policy at startup, and discovering that after the scheduled task
+# is registered is a worse experience than failing here. Whitespace is stripped
+# rather than rejected so a value pasted out of the console still works.
+$permissionList = @()
+$permissionsNone = $false
+if ($Permissions) {
+    $Permissions = ($Permissions -replace '\s', '')
+    if (-not $Permissions) {
+        throw 'Permissions needs a value (use "none" for an empty grant).'
+    }
+    if ($Permissions.Contains("*") -or $Permissions -ieq "all") {
+        throw 'Permissions does not accept wildcards; list explicit permissions or "none".'
+    }
+    if ($Permissions -ieq "none") {
+        $permissionsNone = $true
+    } else {
+        $permissionList = @($Permissions.Split(",") | Where-Object { $_ })
+        # A value of only separators would emit a `permissions:` key with no
+        # children, which the Agent reads as "not configured" and answers with the
+        # full built-in DEFAULT grant — the opposite of the restriction that was
+        # asked for, and silently.
+        if ($permissionList.Count -eq 0) {
+            throw 'Permissions lists no permissions; pass explicit ids or "none" for an empty grant.'
+        }
+    }
 }
 
 $installDir = Join-Path $env:ProgramFiles "NetTact"
@@ -77,6 +110,18 @@ $serverJson = ConvertTo-Json $ServerUrl -Compress
 $dataJson = ConvertTo-Json $dataDir -Compress
 $tokenJson = ConvertTo-Json $tokenFile -Compress
 $config = "server_url: $serverJson`ndata_dir: $dataJson`nenroll_token_file: $tokenJson`n"
+# Emit the permission policy as a YAML block list, or the literal `none` scalar
+# for an empty grant. Omitting the key entirely (no -Permissions) leaves the Agent
+# on its built-in default set — an empty list would instead mean "grant nothing",
+# which is a very different install.
+if ($permissionsNone) {
+    $config += "permissions: none`n"
+} elseif ($permissionList.Count -gt 0) {
+    $config += "permissions:`n"
+    foreach ($perm in $permissionList) {
+        $config += "  - " + (ConvertTo-Json $perm -Compress) + "`n"
+    }
+}
 [IO.File]::WriteAllText($configFile, $config, $utf8NoBom)
 
 # Restrict configuration, token and state to Administrators and SYSTEM.

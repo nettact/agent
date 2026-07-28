@@ -226,12 +226,18 @@ func Run(ctx context.Context, cfg Config) error {
 	for id := range p.Supports() {
 		supported.Add(id)
 	}
-	// TCP traceroute needs a raw ICMP socket to observe intermediate Time-Exceeded
-	// responders (Administrator on Windows), so it is a runtime capability added to
-	// supported only when the engine can actually open one. ICMP traceroute is a
-	// static platform capability already advertised by p.Supports(). Effective
-	// stays supported∩granted, so desktop FullAccess remains capability-gated.
-	if _, tcpCap := traceroute.Supported(); tcpCap {
+	// Both traceroute modes are runtime capabilities owned by the traceroute
+	// engine, which is the only component that knows what observing intermediate
+	// Time-Exceeded responders costs on each OS: Administrator on Windows for TCP,
+	// a raw ICMP socket (CAP_NET_RAW/root) on Linux for either mode. Asking it
+	// keeps one answer per mode instead of a platform layer and an engine
+	// disagreeing. Effective stays supported∩granted, so desktop FullAccess
+	// remains capability-gated.
+	icmpTraceCap, tcpTraceCap := traceroute.Supported()
+	if icmpTraceCap {
+		supported.Add(permission.DiagnosticTracerouteICMP)
+	}
+	if tcpTraceCap {
 		supported.Add(permission.DiagnosticTracerouteTCP)
 	}
 	granted := cfg.Policy.Granted

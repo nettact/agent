@@ -9,6 +9,7 @@ import (
 
 	"github.com/mdlayher/wifi"
 
+	"github.com/nettact/agent/internal/hostfs"
 	"github.com/nettact/protocol/permission"
 )
 
@@ -24,9 +25,11 @@ func wifiPermissions() []permission.ID {
 
 // ifaceIsWireless reports whether a netdev is backed by Wi-Fi hardware, using the
 // kernel's /sys/class/net/<name>/wireless marker. This is independent of nl80211
-// so wireless hardware is recognized even when its status is unreadable.
+// so wireless hardware is recognized even when its status is unreadable. The sysfs
+// root goes through hostfs so a container pointed at the host's /sys classifies
+// the host's adapters, not the (empty) container view.
 func ifaceIsWireless(name string) bool {
-	_, err := os.Stat("/sys/class/net/" + name + "/wireless")
+	_, err := os.Stat(hostfs.SysPath("class", "net", name, "wireless"))
 	return err == nil
 }
 
@@ -34,12 +37,13 @@ func ifaceIsWireless(name string) bool {
 // Used to distinguish "no adapter" from "unreadable(driver)" when nl80211 itself
 // is missing/unreadable (per the approved Linux classification correction).
 func hasWirelessHardware() bool {
-	entries, err := os.ReadDir("/sys/class/net")
+	netRoot := hostfs.SysPath("class", "net")
+	entries, err := os.ReadDir(netRoot)
 	if err != nil {
 		return false
 	}
 	for _, e := range entries {
-		if _, err := os.Stat("/sys/class/net/" + e.Name() + "/wireless"); err == nil {
+		if _, err := os.Stat(netRoot + "/" + e.Name() + "/wireless"); err == nil {
 			return true
 		}
 	}
@@ -50,7 +54,7 @@ func isPermErr(err error) bool {
 	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)
 }
 
-func (genericPlatform) WiFi(includeSSID bool) WiFiResult {
+func (linuxPlatform) WiFi(includeSSID bool) WiFiResult {
 	cl, err := wifi.New()
 	if err != nil {
 		return classifyLinuxWiFiOpenErr(err)
