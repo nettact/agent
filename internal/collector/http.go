@@ -363,7 +363,7 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		resp.Body.Close()
 		cancel()
 
-		statusOK := statusAccepted(status, t.Params.AcceptedStatuses, t.Params.ExpectedStatus)
+		statusOK := statusAccepted(status, t.Params.AcceptedStatuses)
 		ok := 0.0
 		if statusOK && bodyMatch {
 			ok = 1.0
@@ -440,36 +440,31 @@ func blockedFromErr(t pcfg.ProbeTarget, be *netguard.BlockedError) BlockedProbe 
 	return BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: be.Matched, Reason: reason}
 }
 
-// statusAccepted decides whether an HTTP status counts as up. Precedence:
-//  1. accepted (CSV of codes/ranges, e.g. "200-299,301") when non-empty;
-//  2. expected (legacy single exact code) when > 0;
-//  3. default: any 2xx or 3xx.
-func statusAccepted(status int, accepted string, expected int) bool {
-	if accepted != "" {
-		for _, part := range strings.Split(accepted, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			lo, hi, ok := strings.Cut(part, "-")
-			if !ok {
-				hi = lo
-			}
-			a, err1 := strconv.Atoi(strings.TrimSpace(lo))
-			b, err2 := strconv.Atoi(strings.TrimSpace(hi))
-			if err1 != nil || err2 != nil {
-				continue
-			}
-			if status >= a && status <= b {
-				return true
-			}
+// statusAccepted decides whether an HTTP status counts as up: the accepted CSV
+// of codes/ranges (e.g. "200-299,301") when non-empty, else any 2xx or 3xx.
+func statusAccepted(status int, accepted string) bool {
+	if accepted == "" {
+		return status >= 200 && status < 400
+	}
+	for _, part := range strings.Split(accepted, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
 		}
-		return false
+		lo, hi, ok := strings.Cut(part, "-")
+		if !ok {
+			hi = lo
+		}
+		a, err1 := strconv.Atoi(strings.TrimSpace(lo))
+		b, err2 := strconv.Atoi(strings.TrimSpace(hi))
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if status >= a && status <= b {
+			return true
+		}
 	}
-	if expected > 0 {
-		return status == expected
-	}
-	return status >= 200 && status < 400
+	return false
 }
 
 // SetMinInterval applies the local per-target probe-interval floor (stability limit).

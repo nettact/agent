@@ -182,9 +182,8 @@ const pingSpacing = pcfg.PingSpacing
 // protocol/config schedule helpers, so a probe's real cycle timing can never
 // drift from the whole-cycle deadline the server derives (pcfg.CycleDeadline).
 func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams) pingCycleResult {
-	// PacketCount takes precedence; failing that, the legacy Retries knob (count =
-	// retries+1) when a user set it; otherwise a short burst so jitter/min/max are
-	// meaningful by default.
+	// PacketCount when the user set one; otherwise a short burst so jitter/min/max
+	// are meaningful by default.
 	count := pcfg.PingCount(params)
 	// Default per-echo timeout is 1s: generous for real ICMP RTTs (<1s worldwide)
 	// yet keeps a fully-lost default cycle (5×1s + 4×200ms ≈ 5.8s) under the 10s
