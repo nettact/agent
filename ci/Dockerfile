@@ -25,7 +25,8 @@
 # HOST_SYS at bind-mounted host copies; agent/install.sh --docker does this.
 #
 # Build context: an assembled workspace directory with protocol/ and agent/ as
-# siblings (the release workflow checks out protocol at ci/deps.env's PROTOCOL_SHA):
+# siblings (the release workflow checks out protocol's default branch and records
+# the resolved commit in nettact-agent-dependencies.json):
 #   docker build -f agent/ci/Dockerfile --build-arg VERSION=v0.4.0 <workspace-dir>
 # An isolated single-repo build fails on the v0.0.0 placeholder pseudo-versions.
 

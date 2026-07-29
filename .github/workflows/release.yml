@@ -4,9 +4,14 @@
 # server-lite/desktop — the tag version is stamped into the binary via ldflags
 # (agentrt.Version) and reported to the server at enrollment / in Hello frames.
 #
-# Sibling-repo sources are pinned by ci/deps.env (PROTOCOL_SHA): the workflow checks
-# out nettact/protocol at that exact commit, so releases never wait on a sibling tag
-# and the same tag always rebuilds identically.
+# Sibling-repo sources are NOT pinned in this repo: the workflow checks out
+# nettact/protocol's default branch and records the commit it resolved to, so
+# releases never wait on a sibling tag and nobody has to hand-maintain a SHA.
+# Every build publishes nettact-agent-dependencies.json naming that exact commit.
+#
+# The trade: a tag no longer rebuilds identically on its own, because protocol
+# moves. To reproduce a published release, pass its recorded commit as the
+# protocol_ref dispatch input below.
 #
 # Required secret: CI_SUBMODULE_SSH_KEY (org-level recommended) — read access to
 # nettact/protocol. GHCR auth uses GITHUB_TOKEN; cosign is keyless OIDC.
@@ -21,6 +26,13 @@ on:
       tag:
         description: Existing tag to (re)release, e.g. v0.4.0
         required: true
+      protocol_ref:
+        description: >-
+          protocol commit to build against. Empty resolves the default branch's
+          latest commit. When re-releasing an existing tag, pass the commit from
+          that release's nettact-agent-dependencies.json — otherwise protocol has
+          moved since and the rebuilt artifacts differ from the published ones.
+        required: false
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -70,20 +82,54 @@ jobs:
                                    || echo "is_latest=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Read sibling-repo pins
-        id: deps
-        run: |
-          set -euo pipefail
-          source agent/ci/deps.env
-          echo "protocol_sha=${PROTOCOL_SHA}" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout protocol @ pinned SHA
+      # An empty ref makes actions/checkout use the repository's default branch,
+      # which is how "latest protocol" is expressed here. The commit that lands is
+      # whatever the default branch pointed at the moment this step ran; the next
+      # step reads it back rather than assuming it.
+      - name: Checkout protocol
         uses: actions/checkout@v4
         with:
           repository: nettact/protocol
-          ref: ${{ steps.deps.outputs.protocol_sha }}
+          ref: ${{ inputs.protocol_ref }}
           path: protocol
           ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
+
+      # With no committed pin, the dependency record IS the audit trail: it is the
+      # only place that says which protocol source this binary contains. Published
+      # as a Release asset so it outlives the workflow run's log retention.
+      - name: Record dependency commits
+        id: deps
+        run: |
+          set -euo pipefail
+          protocol_sha=$(git -C protocol rev-parse HEAD)
+          [[ "$protocol_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "protocol checkout did not resolve to a full commit (got '$protocol_sha')" >&2
+            exit 1
+          }
+          echo "protocol_sha=$protocol_sha" >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist-out
+          jq -n \
+            --arg agent_version "${{ inputs.tag || github.ref_name }}" \
+            --arg agent_sha "${{ steps.rel.outputs.sha }}" \
+            --arg protocol_sha "$protocol_sha" \
+            '{
+              schema_version: 1,
+              agent: {version: $agent_version, commit: $agent_sha},
+              sources: {
+                protocol: {commit: $protocol_sha}
+              }
+            }' > dist-out/nettact-agent-dependencies.json
+          (
+            cd dist-out
+            sha256sum nettact-agent-dependencies.json > nettact-agent-dependencies.json.sha256
+          )
+          cat dist-out/nettact-agent-dependencies.json
+          {
+            echo "## Resolved dependency sources"
+            echo
+            echo "- protocol: \`$protocol_sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-go@v5
         with:
@@ -179,12 +225,19 @@ jobs:
             dist-bins/nettact-agent-darwin-arm64
             dist-bins/nettact-agent-windows-amd64.exe
             dist-bins/SHA256SUMS
+            dist-out/nettact-agent-dependencies.json
+            dist-out/nettact-agent-dependencies.json.sha256
             agent/install.sh
             agent/install.ps1
           body: |
             ## nettact-agent ${{ inputs.tag || github.ref_name }}
 
-            Built against `nettact/protocol@${{ steps.deps.outputs.protocol_sha }}`.
+            Built against `nettact/protocol@${{ steps.deps.outputs.protocol_sha }}`,
+            resolved from that repo's default branch when this build started.
+            `nettact-agent-dependencies.json` is the machine-readable record of it —
+            desktop packaging reads it to build this agent against the same protocol
+            source, and re-releasing this tag reproducibly means passing that commit
+            as the workflow's `protocol_ref` input.
 
             ### Container image (linux/amd64 · linux/arm64, cosign-signed)
             ```
@@ -228,6 +281,8 @@ jobs:
             nettact-agent-darwin-arm64
             nettact-agent-windows-amd64.exe
             SHA256SUMS
+            nettact-agent-dependencies.json
+            nettact-agent-dependencies.json.sha256
             install.sh
             install.ps1
           )
@@ -237,7 +292,8 @@ jobs:
               exit 1
             }
           done
-          (cd dist-out && sha256sum --check SHA256SUMS)
+          # SHA256SUMS covers the binaries only; the dependency record carries its own.
+          (cd dist-out && sha256sum --check SHA256SUMS nettact-agent-dependencies.json.sha256)
           ! grep -R 'github.com/nettact/agent/releases' dist-out/install.sh dist-out/install.ps1
 
       - name: Publish immutable version path
@@ -262,4 +318,5 @@ jobs:
             echo "- Merged Linux/macOS/Docker installer: $PUBLIC_BASE_URL/install.sh"
             echo "- Windows installer: $PUBLIC_BASE_URL/install.ps1"
             echo "- Versioned assets: $PUBLIC_BASE_URL/$TAG/"
+            echo "- Dependency record: $PUBLIC_BASE_URL/$TAG/nettact-agent-dependencies.json"
           } >> "$GITHUB_STEP_SUMMARY"
