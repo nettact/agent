@@ -24,12 +24,23 @@ import (
 	"github.com/nettact/protocol/wire"
 )
 
+// ProxySet exposes the live egress proxies to monitor evaluation. Evaluation only
+// needs each pinned proxy's TYPE and DNS mode to decide whether a monitor can run,
+// so this is an interface rather than a dependency on the transport package —
+// keeping monitoreval free of wireguard/netstack.
+//
+// Satisfied by *proxydial.Manager.
+type ProxySet interface {
+	Specs() map[string]config.ProxySpec
+}
+
 // Tracker holds the immutable policy views plus the latest evaluated state.
 type Tracker struct {
 	effective  permission.Set
 	granted    permission.Set
 	supported  permission.Set
 	guard      *netguard.Guard
+	proxies    ProxySet
 	policyHash string
 	// minProbeInterval is the agent-local per-target interval floor (the same
 	// stability limit the collectors apply). It raises the reported effective
@@ -53,12 +64,17 @@ type Tracker struct {
 // (0 = none) that the reported effective per-target interval is floored by.
 // uploadInterval is the agent's global WAL batch-upload cadence, reported at the
 // frame level rounded up to whole seconds (a sub-second interval becomes 1).
-func New(effective, granted, supported permission.Set, guard *netguard.Guard, policyHash string, minProbeInterval, uploadInterval time.Duration) *Tracker {
+//
+// proxies is the live egress-proxy set. A nil ProxySet is legal and fails closed:
+// every target with a proxy pin evaluates as proxy_missing rather than silently
+// becoming a direct dial.
+func New(effective, granted, supported permission.Set, guard *netguard.Guard, proxies ProxySet, policyHash string, minProbeInterval, uploadInterval time.Duration) *Tracker {
 	return &Tracker{
 		effective:             effective,
 		granted:               granted,
 		supported:             supported,
 		guard:                 guard,
+		proxies:               proxies,
 		policyHash:            policyHash,
 		minProbeInterval:      minProbeInterval,
 		uploadIntervalSeconds: ceilSeconds(uploadInterval),
@@ -126,11 +142,11 @@ func (t *Tracker) stampSchedule(entry *wire.MonitorStatusEntry, tgt config.Probe
 	entry.CycleDeadlineMs = int(config.CycleDeadline(tgt.Kind, tgt.Params) / time.Millisecond)
 }
 
-// evaluate computes a monitor's static status: permission first, then target
-// policy. All missing granted-but-unsupported permissions yield unsupported;
-// otherwise any missing permission yields permission_blocked (combined into one
-// entry). A literal-IP or hostname destination denied by policy yields
-// target_blocked.
+// evaluate computes a monitor's static status: permission first, then the egress
+// proxy pin, then target policy. All missing granted-but-unsupported permissions
+// yield unsupported; otherwise any missing permission yields permission_blocked
+// (combined into one entry). A literal-IP or hostname destination denied by policy
+// yields target_blocked.
 func (t *Tracker) evaluate(tgt config.ProbeTarget) wire.MonitorStatusEntry {
 	entry := wire.MonitorStatusEntry{MonitorID: tgt.MonitorID, Status: wire.MonitorStatusActive}
 
@@ -154,6 +170,14 @@ func (t *Tracker) evaluate(tgt config.ProbeTarget) wire.MonitorStatusEntry {
 		entry.Status = wire.MonitorStatusUnsupported
 		entry.MissingPermissions = unsupported
 		return entry
+	}
+
+	// Egress proxy pin. An unhonorable pin makes the monitor un-runnable, never
+	// direct: it is excluded from the runnable set here so the probe is not scheduled
+	// and fabricates no failure metric, and the reason travels to the server as an
+	// operational issue ("this monitor is not running, and here is why").
+	if blocked, ok := t.evaluateProxy(tgt); ok {
+		return blocked
 	}
 
 	// Target policy (static): literal-IP destination fully checked; hostname
@@ -272,6 +296,71 @@ func (t *Tracker) push(frame wire.MonitorStatus) {
 			}
 		}
 	}
+}
+
+// Reasons reported for a monitor whose egress-proxy pin cannot be honored. They
+// ride wire.MonitorStatusEntry.Reason into the server's operational-issue pipeline,
+// so an operator sees the monitor listed as not-running with a cause rather than as
+// a silently missing series.
+const (
+	// ReasonProxyMissing: the pinned proxy is not in the pushed config — normally
+	// because it was disabled (the server keeps the target in the push precisely so
+	// this stays reportable) or deleted.
+	ReasonProxyMissing = "proxy_missing"
+	// ReasonProxyUnsupported: the pinned proxy's transport cannot carry this probe
+	// kind (e.g. an ICMP echo through a SOCKS5 CONNECT tunnel).
+	ReasonProxyUnsupported = "proxy_unsupported"
+	// ReasonProxyRemoteDNSDenied: the proxy resolves the target name on its own side,
+	// so the agent cannot vet the address the connection actually reaches — and this
+	// agent's policy is an allowlist that has not authorized the name. Running anyway
+	// would mean probing an address the policy never approved.
+	ReasonProxyRemoteDNSDenied = "proxy_remote_dns_denied"
+)
+
+// evaluateProxy checks a target's proxy pin. ok is true when the pin makes the
+// monitor un-runnable, in which case the returned entry is the status to report.
+//
+// An unpinned target is always fine (a direct dial is what was configured). A
+// pinned one must clear three gates: the proxy must be present, its transport must
+// be able to carry this probe kind, and — under proxy-side DNS — the target name
+// must be authorized by policy, because that mode is the one case where the agent
+// cannot vet the concrete address the connection lands on.
+func (t *Tracker) evaluateProxy(tgt config.ProbeTarget) (wire.MonitorStatusEntry, bool) {
+	if tgt.ProxyID == "" {
+		return wire.MonitorStatusEntry{}, false
+	}
+	blocked := func(reason string) (wire.MonitorStatusEntry, bool) {
+		return wire.MonitorStatusEntry{
+			MonitorID: tgt.MonitorID,
+			Status:    wire.MonitorStatusUnsupported,
+			Reason:    reason,
+		}, true
+	}
+	// No proxy manager at all (a build or test without proxy support) still fails
+	// closed: a pinned monitor must not quietly become a direct one.
+	if t.proxies == nil {
+		return blocked(ReasonProxyMissing)
+	}
+	spec, ok := t.proxies.Specs()[tgt.ProxyID]
+	if !ok {
+		return blocked(ReasonProxyMissing)
+	}
+	if !config.ProxyCapable(tgt.Kind, tgt.Params, spec.Type) {
+		return blocked(ReasonProxyUnsupported)
+	}
+	if spec.DNSModeOrDefault() == config.ProxyDNSRemote {
+		if host := staticHost(tgt); host != "" {
+			if _, err := netip.ParseAddr(host); err != nil {
+				// A hostname resolved on the proxy's side: only the pre-resolution name
+				// check is available, so it has to be conclusive.
+				hd := t.guard.CheckHost(host)
+				if hd.Denied || !hd.NameAuthorized {
+					return blocked(ReasonProxyRemoteDNSDenied)
+				}
+			}
+		}
+	}
+	return wire.MonitorStatusEntry{}, false
 }
 
 // staticHost returns the destination host to statically check for a target, or

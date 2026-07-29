@@ -35,6 +35,7 @@ import (
 	"github.com/nettact/agent/internal/monitoreval"
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
+	"github.com/nettact/agent/internal/proxydial"
 	"github.com/nettact/agent/internal/scheduler"
 	"github.com/nettact/agent/internal/traceroute"
 	"github.com/nettact/agent/internal/wal"
@@ -304,7 +305,12 @@ func Run(ctx context.Context, cfg Config) error {
 	// never built, so its OS/gopsutil operations are never invoked.
 	var configurables []conn.Configurable
 	var selfSched []collector.Collector
-	tracker := monitoreval.New(effective, granted, supported, guard, hash, cfg.Limits.MinProbeInterval, cfg.UploadInterval)
+	// Egress proxies are built lazily on first use and torn down whenever a pushed
+	// generation changes, so constructing the manager here costs nothing until a
+	// target is actually pinned to one.
+	proxies := proxydial.NewManager(guard)
+	defer proxies.Close()
+	tracker := monitoreval.New(effective, granted, supported, guard, proxies, hash, cfg.Limits.MinProbeInterval, cfg.UploadInterval)
 
 	addProbe := func(c interface {
 		conn.Configurable
@@ -315,23 +321,25 @@ func Run(ctx context.Context, cfg Config) error {
 		configurables = append(configurables, c)
 		selfSched = append(selfSched, c)
 	}
+	// The gateway probe is the one kind that is never proxied: it targets the local
+	// first hop, where an egress proxy has no meaning.
 	if effective.Has(permission.NetworkGatewayProbe) {
 		addProbe(collector.NewGatewayPingCollector(p, guard))
 	}
 	if effective.Has(permission.ProbeICMP) {
-		addProbe(collector.NewPublicPingCollector(p, guard))
+		addProbe(collector.NewPublicPingCollector(p, guard, proxies))
 	}
 	if effective.Has(permission.ProbeDNS) {
-		addProbe(collector.NewDNSCollector(guard))
+		addProbe(collector.NewDNSCollector(guard, proxies))
 	}
 	if effective.Has(permission.ProbeHTTP) {
-		addProbe(collector.NewHTTPCollector(guard, effective.Has(permission.ProbeHTTPExtended)))
+		addProbe(collector.NewHTTPCollector(guard, proxies, effective.Has(permission.ProbeHTTPExtended)))
 	}
 	if effective.Has(permission.ProbeTCP) {
-		addProbe(collector.NewTCPCollector(guard))
+		addProbe(collector.NewTCPCollector(guard, proxies))
 	}
 	if effective.Has(permission.ProbeNAT) {
-		addProbe(collector.NewNATCollector(guard))
+		addProbe(collector.NewNATCollector(guard, proxies))
 	}
 
 	// The runtime-block sink routes collector policy blocks to the tracker and a
@@ -478,6 +486,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Scheduler:           sched,
 		DrainInterval:       cfg.UploadInterval,
 		Tracker:             tracker,
+		Proxies:             proxies,
 		Effective:           effective,
 		Granted:             granted,
 		Supported:           supported,

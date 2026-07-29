@@ -28,7 +28,7 @@ func TestClassify(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classify(c.reflexive, c.mapping, c.filter); got != c.want {
+			if got := classify(c.reflexive, c.mapping, c.filter, nil); got != c.want {
 				t.Fatalf("classify(%q,%d,%d) = %d, want %d", c.reflexive, c.mapping, c.filter, got, c.want)
 			}
 		})
@@ -86,7 +86,7 @@ func TestNATBindingSmoke(t *testing.T) {
 	if os.Getenv("NETTACT_STUN_IT") == "" {
 		t.Skip("set NETTACT_STUN_IT=1 to run the public-STUN integration test")
 	}
-	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{{Kind: "nat", Target: "stun.l.google.com:19302", Params: pcfg.ProbeParams{NATTransport: "udp", TimeoutMs: 3000, GlobalTimeoutMs: 8000}}})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

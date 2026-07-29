@@ -52,7 +52,7 @@ func cancelledCtx() context.Context {
 
 func TestPublicPingCancelledRunEmitsNothing(t *testing.T) {
 	p := &gwTestPlatform{}
-	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1"},
 		{MonitorID: "m2", Kind: "icmp", Target: "8.8.8.8"},
@@ -72,7 +72,7 @@ func TestPublicPingMidCycleAbortEmitsNothing(t *testing.T) {
 	// cut cycle would read as 2/3 lost (66%) and the second target as 100% loss.
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &cancelPingPlatform{cancel: cancel, cancelAfter: 1}
-	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1", Params: pcfg.ProbeParams{PacketCount: 3}},
 		{MonitorID: "m2", Kind: "icmp", Target: "8.8.8.8", Params: pcfg.ProbeParams{PacketCount: 3}},
@@ -121,7 +121,7 @@ func TestGatewayPingMidCycleAbortEmitsNothing(t *testing.T) {
 }
 
 func TestDNSCancelledRunEmitsNothing(t *testing.T) {
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "d1", Kind: "dns", Target: "example.com"},
 	})
@@ -133,7 +133,7 @@ func TestDNSCancelledRunEmitsNothing(t *testing.T) {
 }
 
 func TestHTTPCancelledRunEmitsNothing(t *testing.T) {
-	c := NewHTTPCollector(netguard.New(probepolicy.Policy{}, true), true)
+	c := NewHTTPCollector(netguard.New(probepolicy.Policy{}, true), nil, true)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "h1", Kind: "http", Target: "http://192.0.2.1/"},
 	})
@@ -145,7 +145,7 @@ func TestHTTPCancelledRunEmitsNothing(t *testing.T) {
 }
 
 func TestTCPCancelledRunEmitsNothing(t *testing.T) {
-	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "t1", Kind: "tcp", Target: "192.0.2.1", Params: pcfg.ProbeParams{Port: 443}},
 	})
@@ -162,7 +162,7 @@ func TestTCPProbeAbortedResultDropped(t *testing.T) {
 	// must not become a tcp.ok=0 sample. Both the literal-IP path (dial) and the
 	// hostname path (resolution) are covered; neither touches the network under a
 	// cancelled context.
-	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	ctx := cancelledCtx()
 	var res Result
 	c.probe(ctx, time.Now().UTC(), pcfg.ProbeTarget{
@@ -175,7 +175,7 @@ func TestTCPProbeAbortedResultDropped(t *testing.T) {
 }
 
 func TestNATCancelledRunEmitsNothing(t *testing.T) {
-	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "n1", Kind: "nat", Target: "stun.example"},
 	})
@@ -187,7 +187,7 @@ func TestNATCancelledRunEmitsNothing(t *testing.T) {
 }
 
 func TestNATEmitBindingAbortedFailureDropped(t *testing.T) {
-	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	target := pcfg.ProbeTarget{MonitorID: "n1", Kind: "nat", Target: "stun.example"}
 	base := map[string]string{"transport": "udp", "server": "stun.example:3478"}
 

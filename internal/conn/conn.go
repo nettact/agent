@@ -19,6 +19,7 @@ import (
 
 	"github.com/nettact/agent/internal/hostsnapshot"
 	"github.com/nettact/agent/internal/monitoreval"
+	"github.com/nettact/agent/internal/proxydial"
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
@@ -127,6 +128,12 @@ type Deps struct {
 	// target-access policy, yielding the runnable subset and the full-state
 	// MonitorStatus frame reported to the server.
 	Tracker *monitoreval.Tracker
+
+	// Proxies owns the egress proxies pushed alongside the targets. It is reconciled
+	// from the DesiredState BEFORE the monitors are evaluated, so evaluation sees the
+	// proxy set the collectors will actually dial through. Nil disables proxying: a
+	// pinned target then evaluates as proxy-missing rather than dialing directly.
+	Proxies *proxydial.Manager
 
 	// Effective/Granted/Supported are the agent's permission views, used to
 	// classify each requested snapshot scope (collected/denied/unsupported).
@@ -586,6 +593,15 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		if ds.ConfigVersion < r.appliedConfigVersion {
 			log.Printf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
 			return nil
+		}
+		// Reconcile the egress proxies FIRST. Two reasons for the ordering: monitor
+		// evaluation below needs the live proxy set to decide whether each pinned
+		// target is runnable at all, and a proxy whose generation changed must be torn
+		// down before the collectors are handed targets that reference it — otherwise
+		// the first cycle of the new generation could still ride the old tunnel or the
+		// old credentials.
+		if r.deps.Proxies != nil {
+			r.deps.Proxies.Apply(ds.Proxies)
 		}
 		// Evaluate every monitor against effective permissions and target policy.
 		// Only the runnable subset reaches the collectors, so a permission/target

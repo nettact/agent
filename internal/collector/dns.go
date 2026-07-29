@@ -5,16 +5,19 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/internal/proxydial"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -32,12 +35,19 @@ import (
 // exempt, like the agent's own control connection.
 type DNSCollector struct {
 	resolver   *net.Resolver
-	httpClient *http.Client // used for DoH queries
+	httpClient *http.Client // used for DoH queries on a direct (unproxied) target
 	sched      *schedState
 	guard      *netguard.Guard
+	proxies    *proxydial.Manager
+
+	// dohClients caches a DoH client per proxy generation, so a re-keyed proxy gets a
+	// fresh transport instead of keeping pooled connections on the replaced egress
+	// path. Guarded by mu.
+	mu         sync.Mutex
+	dohClients map[string]*http.Client
 }
 
-func NewDNSCollector(guard *netguard.Guard) *DNSCollector {
+func NewDNSCollector(guard *netguard.Guard, proxies *proxydial.Manager) *DNSCollector {
 	// DoH transport: environment proxy disabled, dials routed through the guard so
 	// the resolver endpoint (and any redirect) is policy-checked and IP-pinned.
 	doh := &http.Transport{Proxy: nil, DialContext: guard.DialContext, ForceAttemptHTTP2: true}
@@ -46,7 +56,67 @@ func NewDNSCollector(guard *netguard.Guard) *DNSCollector {
 		httpClient: &http.Client{Transport: doh},
 		sched:      newSchedState(pcfg.DefaultDNSInterval),
 		guard:      guard,
+		proxies:    proxies,
+		dohClients: map[string]*http.Client{},
 	}
+}
+
+// dohClientFor returns the DoH client for a target's egress: the shared direct
+// client, or a per-proxy-generation one that tunnels its dials.
+func (c *DNSCollector) dohClientFor(proxy *proxydial.Dialer) *http.Client {
+	if proxy == nil {
+		return c.httpClient
+	}
+	key := proxy.Spec.ID + "@" + strconv.Itoa(proxy.Spec.ConfigSerial)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cl, ok := c.dohClients[key]; ok {
+		return cl
+	}
+	// proxyDialFunc, NOT proxy.DialContext: the DoH resolver endpoint is a destination
+	// like any other, so in the default local-DNS mode it must be resolved and vetted
+	// here and the proxy handed the approved literal. Using the raw dial let a DoH
+	// hostname (and any redirect hop) be resolved on the far side, where no
+	// ip:/cidr:/scope: rule could apply — the same bypass the other DNS paths had.
+	//
+	// IdleConnTimeout bounds how long a tunnelled connection can sit idle. Without it
+	// an authenticated tunnel stayed open indefinitely, so a rotated proxy left its
+	// predecessor's connection alive.
+	cl := &http.Client{Transport: &http.Transport{
+		Proxy:             nil,
+		DialContext:       proxyDialFunc(c.guard, proxy),
+		ForceAttemptHTTP2: true,
+		IdleConnTimeout:   90 * time.Second,
+	}}
+	// Evict the generations this one replaces and close their idle connections, so a
+	// proxy edit does not accumulate live tunnels and file descriptors. The manager
+	// tears down its own dialers on Apply; this is the collector's matching half.
+	c.evictDoHClientsLocked(proxy.Spec.ID, key)
+	c.dohClients[key] = cl
+	return cl
+}
+
+// evictDoHClientsLocked drops every cached DoH client for a proxy id except keep,
+// closing its idle connections. Caller holds mu.
+func (c *DNSCollector) evictDoHClientsLocked(proxyID, keep string) {
+	prefix := proxyID + "@"
+	for k, cl := range c.dohClients {
+		if k == keep || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		if tr, ok := cl.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+		delete(c.dohClients, k)
+	}
+}
+
+// dialFor returns the dial function a DNS query should use. proxyDialFunc keeps the
+// guard's address check alive through a proxy: in the default local-DNS mode the
+// resolver endpoint is resolved and vetted here and the proxy is handed the approved
+// literal, rather than a hostname it would resolve unseen.
+func (c *DNSCollector) dialFor(proxy *proxydial.Dialer) proxydial.DialFunc {
+	return proxyDialFunc(c.guard, proxy)
 }
 
 func (c *DNSCollector) SetTargets(targets []pcfg.ProbeTarget) {
@@ -83,6 +153,32 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 			timeout = pcfg.DefaultDNSTimeout
 		}
 
+		// Resolve the pinned egress proxy. A pin that cannot be honored means the query
+		// is not sent at all (fail-closed): resolving through the default path instead
+		// would answer from a resolver the operator deliberately routed away from.
+		proxy, prerr := resolveProxy(ctx, c.proxies, t)
+		if prerr != nil {
+			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.DNSOK, telemetry.DNSErrorClass, nil, prerr)...)
+			res.Events = append(res.Events, proxyFailureEvent(now, t, "DNS query not attempted"))
+			continue
+		}
+		// A pinned monitor with no resolver endpoint has nothing a proxy could relay to:
+		// the system resolver is OS-owned ambient config, and the branches below would
+		// fall through to net.DefaultResolver — sending the query straight off the host,
+		// then reporting SUCCESS while the configured egress is down. That is the exact
+		// fail-open the pin exists to prevent, so it fails closed instead.
+		//
+		// ProxyCapable refuses the combination at save time, so this is the defensive
+		// half: a drift there must not silently leak the query.
+		if proxy != nil && strings.TrimSpace(t.Params.ResolverServer) == "" {
+			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.DNSOK, telemetry.DNSErrorClass, nil,
+				fmt.Errorf("%w: a proxied DNS monitor needs an explicit resolver server (the system resolver cannot be relayed)",
+					proxydial.ErrProxyKindUnsupported))...)
+			res.Events = append(res.Events, proxyFailureEvent(now, t, "DNS query not attempted"))
+			continue
+		}
+		dial := c.dialFor(proxy)
+
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		t0 := time.Now()
 		var ok bool
@@ -93,15 +189,15 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		case "doh":
 			// DNS over HTTPS: resolver_server is an https URL or a host we turn into
 			// the conventional /dns-query endpoint.
-			ok, reason, detail, derr = c.lookupDoH(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
+			ok, reason, detail, derr = c.lookupDoH(cctx, c.dohClientFor(proxy), t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
 		case "dot":
 			// DNS over TLS on port 853 (default). Done explicitly over a TLS stream —
 			// net.Resolver cannot be forced onto TCP framing reliably.
-			ok, reason, detail, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 853, t.Params.RecordType, t.Target, timeout, true, t.Params.IgnoreTLS)
+			ok, reason, detail, derr = c.lookupStream(cctx, dial, t.Params.ResolverServer, t.Params.ResolverPort, 853, t.Params.RecordType, t.Target, timeout, true, t.Params.IgnoreTLS)
 		case "tcp":
 			// Plain DNS over TCP to a specific nameserver, likewise done explicitly.
 			if t.Params.ResolverServer != "" {
-				ok, reason, detail, derr = c.lookupStream(cctx, t.Params.ResolverServer, t.Params.ResolverPort, 53, t.Params.RecordType, t.Target, timeout, false, false)
+				ok, reason, detail, derr = c.lookupStream(cctx, dial, t.Params.ResolverServer, t.Params.ResolverPort, 53, t.Params.RecordType, t.Target, timeout, false, false)
 			} else {
 				ok, reason, detail = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
 			}
@@ -110,13 +206,26 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 			// nameserver (dialed through the guard, so a denied endpoint is returned as
 			// a *netguard.BlockedError, not a silent DNS failure); otherwise use the
 			// process default resolver (OS-owned ambient config, exempt from policy).
+			//
+			// A proxied UDP query reaches here over a SOCKS5 UDP association or a
+			// WireGuard tunnel; the capability matrix refuses it for HTTP, whose only
+			// command is CONNECT. The system-resolver path is never proxied either way —
+			// it is OS-owned ambient config with no address for a proxy to relay to.
 			if t.Params.ResolverServer != "" {
-				ok, reason, detail, derr = c.lookupUDP(cctx, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target, timeout)
+				ok, reason, detail, derr = c.lookupUDP(cctx, dial, t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target, timeout)
 			} else {
 				ok, reason, detail = lookupRecord(cctx, c.resolver, t.Params.RecordType, t.Target)
 			}
 		}
 		cancel()
+
+		// A proxy failure reached through any of the paths above is an EGRESS failure,
+		// not a resolver verdict: re-classify so a dead proxy is never reported as a
+		// broken nameserver.
+		if pr, atTarget, isProxy := proxydial.ProxyReason(derr); isProxy && !atTarget {
+			reason = pr
+			detail = errText(derr)
+		}
 
 		// A policy block on the custom resolver endpoint is not a DNS failure.
 		var be *netguard.BlockedError
@@ -173,7 +282,7 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 // failure). Returns true when the response is NOERROR with an answer of the
 // requested record type; a failure carries its ProbeReason* code plus the raw
 // cause (network error text or rcode) for the detail label.
-func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, recordType, name string, timeout time.Duration) (bool, int, string, error) {
+func (c *DNSCollector) lookupUDP(ctx context.Context, dial proxydial.DialFunc, server string, port int, recordType, name string, timeout time.Duration) (bool, int, string, error) {
 	if port <= 0 {
 		port = 53
 	}
@@ -182,7 +291,7 @@ func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, r
 		return false, telemetry.ProbeReasonOther, errText(err), nil
 	}
 	addr := net.JoinHostPort(server, strconv.Itoa(port))
-	conn, err := c.guard.DialContext(ctx, "udp", addr)
+	conn, err := dial(ctx, "udp", addr)
 	if err != nil {
 		return false, classifyNetError(err), errText(err), err
 	}
@@ -215,7 +324,7 @@ func (c *DNSCollector) lookupUDP(ctx context.Context, server string, port int, r
 // contains at least one answer of the requested record type; a failure carries
 // its ProbeReason* code plus the raw cause for the detail label; a policy block
 // is returned as a *netguard.BlockedError.
-func (c *DNSCollector) lookupStream(ctx context.Context, server string, port, defaultPort int, recordType, name string, timeout time.Duration, useTLS, ignoreTLS bool) (bool, int, string, error) {
+func (c *DNSCollector) lookupStream(ctx context.Context, dial proxydial.DialFunc, server string, port, defaultPort int, recordType, name string, timeout time.Duration, useTLS, ignoreTLS bool) (bool, int, string, error) {
 	if port <= 0 {
 		port = defaultPort
 	}
@@ -225,7 +334,7 @@ func (c *DNSCollector) lookupStream(ctx context.Context, server string, port, de
 	}
 	addr := net.JoinHostPort(server, strconv.Itoa(port))
 
-	raw, err := c.guard.DialContext(ctx, "tcp", addr)
+	raw, err := dial(ctx, "tcp", addr)
 	if err != nil {
 		return false, classifyNetError(err), errText(err), err
 	}
@@ -369,7 +478,7 @@ func dnsRecordResult(has bool, err error, recordType string) (bool, int, string)
 // returned as a *netguard.BlockedError. Returns true when the response is NOERROR
 // with at least one answer; a failure carries its ProbeReason* code plus the raw
 // cause (transport error text, "DoH HTTP <n>", or rcode) for the detail label.
-func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, recordType, name string) (bool, int, string, error) {
+func (c *DNSCollector) lookupDoH(ctx context.Context, client *http.Client, server string, port int, recordType, name string) (bool, int, string, error) {
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
 		return false, telemetry.ProbeReasonOther, errText(err), nil
@@ -380,13 +489,18 @@ func (c *DNSCollector) lookupDoH(ctx context.Context, server string, port int, r
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		var be *netguard.BlockedError
 		if errors.As(err, &be) {
 			return false, telemetry.ProbeReasonOther, "", err
 		}
-		return false, classifyNetError(err), errText(err), nil
+		// The error is returned (not dropped) so the caller's ProxyReason check can see
+		// a typed proxy failure. Previously this returned nil here, which made a dead or
+		// rejecting proxy on a DoH monitor report as a generic resolver timeout — the one
+		// thing the proxy_* family exists to prevent. classifyNetError stays as the
+		// fallback for an ordinary transport error.
+		return false, classifyNetError(err), errText(err), err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

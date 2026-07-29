@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/pion/stun/v3"
 
 	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/internal/proxydial"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -31,17 +34,18 @@ import (
 // address): mapping and filtering are only well-defined and reliably measurable
 // over UDP, so they are not emitted for the connection/session transports.
 type NATCollector struct {
-	sched *schedState
-	guard *netguard.Guard
+	sched   *schedState
+	guard   *netguard.Guard
+	proxies *proxydial.Manager
 
 	mu         sync.Mutex
 	lastMapped map[string]string // target -> last reflexive addr, so we only event on change
 }
 
-func NewNATCollector(guard *netguard.Guard) *NATCollector {
+func NewNATCollector(guard *netguard.Guard, proxies *proxydial.Manager) *NATCollector {
 	// 30-min fallback: NAT type changes rarely and a full run is multi-RTT, so we
 	// avoid probing every self-tick when a target sets no interval_seconds.
-	return &NATCollector{guard: guard, sched: newSchedState(pcfg.DefaultNATInterval), lastMapped: map[string]string{}}
+	return &NATCollector{guard: guard, proxies: proxies, sched: newSchedState(pcfg.DefaultNATInterval), lastMapped: map[string]string{}}
 }
 
 // SetTargets replaces the NAT target list from a DesiredState update.
@@ -133,16 +137,37 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 
 	base := map[string]string{"transport": transport, "server": server}
 
+	// Resolve the pinned egress proxy. A pin that cannot be honored means no probe:
+	// discovering the NAT in front of the HOST when the operator asked about the path
+	// through a tunnel would be an answer to a different question.
+	//
+	// This kind has no error_class metric (a NAT result is categorical, not a
+	// failure taxonomy), so the failure is reported through emitBinding's ok=0 +
+	// probe-failed event, with the proxy cause in the message.
+	proxy, prerr := resolveProxy(ctx, c.proxies, t)
+	if prerr != nil {
+		c.emitBinding(ctx, now, t, res, base, "", 0, prerr)
+		return
+	}
+
 	if transport != "udp" {
 		// tcp/tls/dtls: binding test only.
-		reflexive, rtt, err := streamBinding(rctx, c.guard, transport, server, t.Params.IgnoreTLS, perReq)
+		reflexive, rtt, err := streamBinding(rctx, c.guard, proxy, transport, server, t.Params.IgnoreTLS, perReq)
 		c.emitBinding(ctx, now, t, res, base, reflexive, rtt, err)
 		return
 	}
 
 	// UDP: full RFC 5780 discovery over one unconnected socket so every round trip
-	// leaves from the same local port (required for mapping/filtering).
-	rt, err := newUDPRoundTripper(c.guard)
+	// leaves from the same local port (required for mapping/filtering). A proxied
+	// target opens that socket through the proxy — a SOCKS5 UDP association or a
+	// tunnel's netstack socket, both of which preserve the one-port property.
+	var rt *udpRoundTripper
+	var err error
+	if proxy != nil {
+		rt, err = newProxyUDPRoundTripper(proxy, c.guard)
+	} else {
+		rt, err = newUDPRoundTripper(c.guard)
+	}
 	if err != nil {
 		c.emitBinding(ctx, now, t, res, base, "", 0, err)
 		return
@@ -205,7 +230,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// mapping probes, and the filtering reply would arrive and read as a false
 	// endpoint-independent (full cone). At this point only the primary server has
 	// been contacted (by the binding test), so the filtering test is uncontaminated.
-	filtering, ferr := filteringBehavior(rctx, c.guard, server, perReq)
+	filtering, ferr := filteringBehavior(rctx, c.guard, proxy, server, perReq)
 	if be := asBlockedProbe(t, ferr); be != nil {
 		res.Blocked = append(res.Blocked, *be)
 		return
@@ -238,7 +263,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATFiltering, filtering,
 		map[string]string{"transport": transport, "behavior": mappingLabel(filtering)}))
 
-	natType := classify(reflexive, mapping, filtering)
+	natType := classify(reflexive, mapping, filtering, tunnelLocalAddrs(proxy))
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATType, natType,
 		map[string]string{"transport": transport, "type": natTypeLabel(natType)}))
 }
@@ -415,8 +440,20 @@ func testIII(other stun.OtherAddress) string {
 // full-cone). Each reply is also checked to have genuinely come from a changed
 // source, so a server that ignores CHANGE-REQUEST and answers from its primary
 // address is not counted as a pass.
-func filteringBehavior(ctx context.Context, guard *netguard.Guard, primary string, timeout time.Duration) (int, error) {
-	rt, err := newUDPRoundTripper(guard)
+// The socket is deliberately FRESH (not the mapping round tripper's) so the
+// filtering probes leave from a port that has not yet contacted the alternate
+// address — but it must still leave through the PINNED egress. Opening a host-stack
+// socket here would both leak direct STUN traffic despite the pin and combine the
+// host's filtering behaviour with the proxy egress's mapping behaviour, producing a
+// NATFiltering and derived NATType that describe no single path.
+func filteringBehavior(ctx context.Context, guard *netguard.Guard, proxy *proxydial.Dialer, primary string, timeout time.Duration) (int, error) {
+	var rt *udpRoundTripper
+	var err error
+	if proxy != nil {
+		rt, err = newProxyUDPRoundTripper(proxy, guard)
+	} else {
+		rt, err = newUDPRoundTripper(guard)
+	}
 	if err != nil {
 		return natUnknown, nil
 	}
@@ -461,9 +498,15 @@ func sourceChanged(from net.Addr, primary *net.UDPAddr, ipChanged bool) bool {
 }
 
 // classify maps mapping + filtering behavior to a classic NAT type (RFC 3489).
-func classify(reflexive string, mapping, filtering int) int {
+//
+// extraLocal carries addresses that are ours but are not OS interfaces — the
+// in-tunnel addresses of a userspace WireGuard proxy. Without them a tunnelled probe
+// whose reflexive address IS its tunnel address (no NAT on the tunnelled path) would
+// be misreported as full-cone or another mapped type, because isLocalIP only sees
+// net.InterfaceAddrs and a netstack address appears on no OS interface.
+func classify(reflexive string, mapping, filtering int, extraLocal []netip.Addr) int {
 	if host, _, err := net.SplitHostPort(reflexive); err == nil {
-		if ip := net.ParseIP(host); ip != nil && isLocalIP(ip) {
+		if ip := net.ParseIP(host); ip != nil && (isLocalIP(ip) || matchesAddr(ip, extraLocal)) {
 			return natTypeOpen // reflexive address is our own → no NAT
 		}
 	}
@@ -479,6 +522,45 @@ func classify(reflexive string, mapping, filtering int) int {
 	default:
 		return natTypeUnknown
 	}
+}
+
+// matchesAddr reports whether ip is one of addrs.
+func matchesAddr(ip net.IP, addrs []netip.Addr) bool {
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	a = a.Unmap()
+	for _, want := range addrs {
+		if want.Unmap() == a {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnelLocalAddrs returns a proxy's in-tunnel addresses, which are ours but belong
+// to no OS interface. Empty for the relay transports, whose reflexive address is the
+// relay's mapping and never one of ours.
+func tunnelLocalAddrs(proxy *proxydial.Dialer) []netip.Addr {
+	if proxy == nil || proxy.Spec.Type != pcfg.ProxyTypeWireGuard {
+		return nil
+	}
+	var out []netip.Addr
+	for _, part := range strings.Split(proxy.Spec.WGLocalAddrs, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(part); err == nil {
+			out = append(out, pfx.Addr().Unmap())
+			continue
+		}
+		if a, err := netip.ParseAddr(part); err == nil {
+			out = append(out, a.Unmap())
+		}
+	}
+	return out
 }
 
 func isLocalIP(ip net.IP) bool {
@@ -499,8 +581,12 @@ func isLocalIP(ip net.IP) bool {
 // udpRoundTripper owns one unconnected UDP socket. do() sends a binding request to
 // an arbitrary destination and returns the matching response, so mapping/filtering
 // tests all leave from the same local port.
+// conn is a net.PacketConn rather than a *net.UDPConn so the same RFC 5780
+// discovery runs unchanged over the host stack and over a WireGuard tunnel's
+// netstack socket. Both are unconnected sockets that send from ONE local port,
+// which is what makes the mapping and filtering tests meaningful at all.
 type udpRoundTripper struct {
-	conn  *net.UDPConn
+	conn  net.PacketConn
 	guard *netguard.Guard
 }
 
@@ -509,6 +595,24 @@ func newUDPRoundTripper(guard *netguard.Guard) (*udpRoundTripper, error) {
 	// IPv6 address is reachable; net.IP.Equal in sourceChanged treats the v4/v4-in-v6
 	// forms as equal, so the filtering comparison is unaffected.
 	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &udpRoundTripper{conn: conn, guard: guard}, nil
+}
+
+// newProxyUDPRoundTripper opens the discovery socket through a proxy that can carry
+// datagrams: a SOCKS5 UDP association, or a WireGuard tunnel's netstack socket. Both
+// give one unconnected socket that can address several destinations, which is what the
+// mapping and filtering tests require. HTTP CONNECT cannot, which is why the capability
+// matrix refuses NAT-over-udp for it.
+//
+// A caveat worth knowing when reading the result: through a proxy this measures the
+// NAT in front of the PROXY's egress, not the agent's. That is the honest answer for
+// the configured path — the same is true of a tunnel — but it is a different question
+// than "what NAT is in front of this agent".
+func newProxyUDPRoundTripper(d *proxydial.Dialer, guard *netguard.Guard) (*udpRoundTripper, error) {
+	conn, err := d.ListenPacket()
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +657,7 @@ func (u *udpRoundTripper) doAddr(ctx context.Context, dst *net.UDPAddr, timeout 
 	}
 	buf := make([]byte, 1500)
 	for {
-		if _, err := u.conn.WriteToUDP(req.Raw, dst); err != nil {
+		if _, err := u.conn.WriteTo(req.Raw, dst); err != nil {
 			return nil, nil, err
 		}
 		readUntil := time.Now().Add(perAttempt)
@@ -562,7 +666,7 @@ func (u *udpRoundTripper) doAddr(ctx context.Context, dst *net.UDPAddr, timeout 
 		}
 		_ = u.conn.SetReadDeadline(readUntil)
 		for {
-			n, from, err := u.conn.ReadFromUDP(buf)
+			n, from, err := u.conn.ReadFrom(buf)
 			if err != nil {
 				break // this attempt's window elapsed — retransmit if budget remains
 			}
@@ -584,13 +688,13 @@ func (u *udpRoundTripper) doAddr(ctx context.Context, dst *net.UDPAddr, timeout 
 
 // streamBinding performs a single STUN binding exchange over a connected transport
 // and returns the reflexive (mapped) address and round-trip latency (ms).
-func streamBinding(ctx context.Context, guard *netguard.Guard, transport, server string, ignoreTLS bool, timeout time.Duration) (string, float64, error) {
+func streamBinding(ctx context.Context, guard *netguard.Guard, proxy *proxydial.Dialer, transport, server string, ignoreTLS bool, timeout time.Duration) (string, float64, error) {
 	deadline := time.Now().Add(timeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
 
-	conn, datagram, err := dialSTUN(ctx, guard, transport, server, ignoreTLS, timeout)
+	conn, datagram, err := dialSTUN(ctx, guard, proxy, transport, server, ignoreTLS, timeout)
 	if err != nil {
 		return "", 0, err
 	}
@@ -617,14 +721,22 @@ func streamBinding(ctx context.Context, guard *netguard.Guard, transport, server
 
 // dialSTUN opens a connection for the tcp/tls/dtls transports. datagram is true for
 // dtls (one Read returns a whole record) so readSTUN uses datagram framing.
-func dialSTUN(ctx context.Context, guard *netguard.Guard, transport, server string, ignoreTLS bool, timeout time.Duration) (conn net.Conn, datagram bool, err error) {
+//
+// A non-nil proxy routes the TCP-framed transports through the tunnel/relay. dtls is
+// datagram-based, so proxied it arrives over a SOCKS5 UDP association or a WireGuard
+// tunnel; the capability matrix refuses it for HTTP, whose only command is CONNECT.
+func dialSTUN(ctx context.Context, guard *netguard.Guard, proxy *proxydial.Dialer, transport, server string, ignoreTLS bool, timeout time.Duration) (conn net.Conn, datagram bool, err error) {
 	host, _, _ := net.SplitHostPort(server)
+	// proxyDialFunc keeps the guard's address check alive through the proxy: in local
+	// DNS mode the STUN endpoint is resolved and vetted here and the proxy is handed
+	// the approved literal, instead of a hostname it would resolve unseen.
+	dial := proxyDialFunc(guard, proxy)
 	switch transport {
 	case "tcp":
-		c, err := guard.DialContext(ctx, "tcp", server)
+		c, err := dial(ctx, "tcp", server)
 		return c, false, err
 	case "tls":
-		raw, err := guard.DialContext(ctx, "tcp", server)
+		raw, err := dial(ctx, "tcp", server)
 		if err != nil {
 			return nil, false, err
 		}
@@ -646,7 +758,14 @@ func dialSTUN(ctx context.Context, guard *netguard.Guard, transport, server stri
 		// any deadline). Own the UDP socket and drive a cancellable HandshakeContext
 		// so a timeout actually aborts the handshake and releases the socket — no
 		// leaked goroutine or connection on an unresponsive endpoint.
-		pconn, err := net.ListenUDP("udp", nil)
+		// A tunnelled DTLS binding must send its datagrams inside the tunnel, so the
+		// socket comes from the tunnel's stack rather than the host's.
+		var pconn net.PacketConn
+		if proxy != nil {
+			pconn, err = proxy.ListenPacket()
+		} else {
+			pconn, err = net.ListenUDP("udp", nil)
+		}
 		if err != nil {
 			return nil, true, err
 		}

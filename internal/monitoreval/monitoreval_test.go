@@ -13,7 +13,7 @@ import (
 
 func TestRuntimeTransitionsRequireCurrentTargetGeneration(t *testing.T) {
 	tracker := New(permission.All(), permission.All(), permission.All(),
-		netguard.New(probepolicy.Policy{}, true), "policy", 45*time.Second, 5*time.Second)
+		netguard.New(probepolicy.Policy{}, true), nil, "policy", 45*time.Second, 5*time.Second)
 	target := config.ProbeTarget{
 		MonitorID: "monitor-a", Kind: "http", Target: "https://example.test",
 		Params: config.ProbeParams{IntervalSeconds: 10, TimeoutMs: 2_000}, ConfigSerial: 7,
@@ -70,7 +70,7 @@ func TestUploadIntervalSecondsRoundsUp(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tracker := New(permission.All(), permission.All(), permission.All(),
-				netguard.New(probepolicy.Policy{}, true), "policy", 0, tc.upload)
+				netguard.New(probepolicy.Policy{}, true), nil, "policy", 0, tc.upload)
 			_, frame := tracker.ApplyDesired(1, nil)
 			if frame.UploadIntervalSeconds != tc.want {
 				t.Fatalf("UploadIntervalSeconds = %d, want %d", frame.UploadIntervalSeconds, tc.want)

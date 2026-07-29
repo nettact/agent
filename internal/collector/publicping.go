@@ -8,6 +8,7 @@ import (
 
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
+	"github.com/nettact/agent/internal/proxydial"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -17,15 +18,16 @@ import (
 // per-protocol params (timeout, packet size, retries, interval) and is probed on
 // its own schedule via schedState — the agent drives Collect on a fine tick.
 type PublicPingCollector struct {
-	p     platform.Platform
-	guard *netguard.Guard
-	sched *schedState
+	p       platform.Platform
+	guard   *netguard.Guard
+	proxies *proxydial.Manager
+	sched   *schedState
 }
 
-func NewPublicPingCollector(p platform.Platform, guard *netguard.Guard) *PublicPingCollector {
+func NewPublicPingCollector(p platform.Platform, guard *netguard.Guard, proxies *proxydial.Manager) *PublicPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &PublicPingCollector{p: p, guard: guard, sched: newSchedState(pcfg.DefaultICMPInterval)}
+	return &PublicPingCollector{p: p, guard: guard, proxies: proxies, sched: newSchedState(pcfg.DefaultICMPInterval)}
 }
 
 // SetTargets replaces the ICMP target list from a DesiredState update.
@@ -60,6 +62,19 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 		if ctx.Err() != nil {
 			break
 		}
+		labels := map[string]string{"ip": t.Target}
+		// Resolve the pinned egress proxy. ICMP only traverses a WireGuard tunnel — the
+		// capability matrix refuses both relay protocols, neither of which has any
+		// command for forwarding an ICMP echo (SOCKS5 relays UDP, but not ICMP). So a
+		// pin that cannot be honored means the cycle is not run: reporting 100% loss
+		// measured on the HOST's stack would be an answer about the wrong path.
+		proxy, prerr := resolveProxy(ctx, c.proxies, t)
+		if prerr != nil {
+			reason, _, _ := proxydial.ProxyReason(prerr)
+			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels,
+				pingCycleResult{Loss: 100, Sent: pcfg.PingCount(t.Params), Reason: reason, Detail: errText(prerr)})
+			continue
+		}
 		// Vet the destination before dialing: a literal IP is checked directly; a
 		// hostname is resolved once through the guard and the vetted IP is pinned to
 		// the ping. A policy block is a target-policy block, not a loss sample.
@@ -70,7 +85,6 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 			res.Blocked = append(res.Blocked, *blocked)
 			continue
 		}
-		labels := map[string]string{"ip": t.Target}
 		if resolveErr != nil {
 			// Resolution failed AFTER policy vetting. Record a probe failure (100%
 			// loss) rather than handing the raw name to the platform pinger, which
@@ -90,7 +104,15 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 				pingCycleResult{Loss: 100, Reason: reason, Detail: errText(resolveErr)})
 			continue
 		}
-		r := pingCycle(ctx, c.p, pingTarget, t.Params)
+		// A tunnelled target builds its own echoes on the tunnel's ICMP socket; the
+		// platform pinger sends from the HOST stack and could not reach a tunnel-only
+		// destination at all.
+		var r pingCycleResult
+		if proxy != nil {
+			r = tunnelPingCycle(ctx, proxy, pingTarget, t.Params)
+		} else {
+			r = pingCycle(ctx, c.p, pingTarget, t.Params)
+		}
 		if ctx.Err() != nil {
 			break // cycle aborted mid-flight: unsent echoes are not lost echoes
 		}

@@ -19,6 +19,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/google/btree v1.1.2
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -38,7 +39,11 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/time v0.7.0
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
+	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	google.golang.org/protobuf v1.36.11 // indirect
+	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 	modernc.org/libc v1.55.3 // indirect
 	modernc.org/mathutil v1.6.0 // indirect
 	modernc.org/memory v1.8.0 // indirect

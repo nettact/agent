@@ -43,7 +43,7 @@ func TestTCPProbeErrorClassDetail(t *testing.T) {
 		}
 	}()
 
-	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true))
+	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil)
 	target := pcfg.ProbeTarget{MonitorID: "t1", Kind: "tcp", Target: "127.0.0.1",
 		Params: pcfg.ProbeParams{Port: port, TimeoutMs: 3000}}
 

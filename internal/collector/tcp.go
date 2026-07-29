@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/internal/proxydial"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -19,12 +20,13 @@ import (
 // Each target carries its own per-protocol params (port, tls, timeout, interval)
 // and is probed on its own schedule via schedState.
 type TCPCollector struct {
-	sched *schedState
-	guard *netguard.Guard
+	sched   *schedState
+	guard   *netguard.Guard
+	proxies *proxydial.Manager
 }
 
-func NewTCPCollector(guard *netguard.Guard) *TCPCollector {
-	return &TCPCollector{sched: newSchedState(pcfg.DefaultTCPInterval), guard: guard}
+func NewTCPCollector(guard *netguard.Guard, proxies *proxydial.Manager) *TCPCollector {
+	return &TCPCollector{sched: newSchedState(pcfg.DefaultTCPInterval), guard: guard, proxies: proxies}
 }
 
 func (c *TCPCollector) SetTargets(targets []pcfg.ProbeTarget) {
@@ -82,10 +84,27 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Resolve the pinned egress proxy first: a pin that cannot be honored means the
+	// probe is not attempted at all (fail-closed — never a direct connect, which
+	// would measure a path the operator did not configure).
+	proxy, prerr := resolveProxy(ctx, c.proxies, t)
+	if prerr != nil {
+		res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.TCPOK, telemetry.TCPErrorClass, labels, prerr)...)
+		res.Events = append(res.Events, proxyFailureEvent(now, t, "TCP connect not attempted"))
+		return
+	}
+	// Proxy-side DNS means the agent does not resolve at all, so there is no
+	// resolution segment to time: dns_ms is ABSENT rather than zero, matching this
+	// package's rule that a segment which did not happen is never reported as a
+	// zero-latency sample.
+	remoteDNS := proxy != nil && proxy.ResolvesRemotely()
+
 	// Phase 1 — resolution. A literal-IP target has no DNS segment (dns_ms is
 	// absent, not zero). A hostname is policy-checked before any query, then the
 	// vetted resolution is timed and the vetted literal IPs are dialed directly —
-	// the raw name never reaches the stdlib dialer (DNS-rebinding defense).
+	// the raw name never reaches the stdlib dialer (DNS-rebinding defense). With a
+	// proxy in local DNS mode the same vetting happens and the approved literal is
+	// what the proxy is asked to connect to, so the defense survives the proxy.
 	literal := false
 	var vetted []netip.Addr
 	nameAuthorized := false
@@ -93,6 +112,9 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	haveDNS := false
 	if _, perr := netip.ParseAddr(t.Target); perr == nil {
 		literal = true
+	} else if remoteDNS {
+		// The name is handed to the proxy verbatim. monitoreval already refused this
+		// combination unless the policy authorizes the name, so no check is repeated.
 	} else {
 		hd := c.guard.CheckHost(t.Target)
 		if hd.Denied {
@@ -139,13 +161,22 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	// per-address fallback and the hostname-authorization semantics that the guard's
 	// own DialContext applies (pinning one IP through DialContext would rerun the
 	// full allowlist and drop the fallback).
+	//
+	// A PROXIED connect goes through the proxy's tunnelled dial instead. It is handed
+	// the vetted literal under local DNS mode (so the address the policy approved is
+	// the address the proxy reaches) or the hostname under remote mode. The guard's
+	// per-address fallback does not apply here: the proxy owns the connection attempt,
+	// so only the first vetted address is offered.
 	addr := net.JoinHostPort(t.Target, port)
 	c0 := time.Now()
 	var conn net.Conn
 	var dialErr error
-	if literal {
+	switch {
+	case proxy != nil:
+		conn, dialErr = proxy.DialContext(cctx, "tcp", proxyTargetAddress(proxy, t.Target, port, vetted))
+	case literal:
 		conn, dialErr = c.guard.DialContext(cctx, "tcp", addr)
-	} else {
+	default:
 		conn, dialErr = c.guard.DialVettedAddrs(cctx, "tcp", vetted, port, nameAuthorized)
 	}
 	connectMs := msSince(c0)
@@ -183,9 +214,13 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	}
 	errClass := telemetry.ProbeReasonNone
 	detail := ""
+	// atTarget records whether the failure is the target's. For a proxied probe a
+	// dead or rejecting proxy must not be reported as a closed service — that is the
+	// distinction the whole proxy_* family exists to preserve.
+	atTarget := true
 	switch {
 	case !connectOK:
-		errClass = classifyNetError(dialErr)
+		errClass, atTarget = classifyProxyAwareError(dialErr, proxy != nil)
 		detail = errText(dialErr)
 	case tlsErr != nil:
 		// The failing phase IS the handshake, so a TLS error the classifier cannot
@@ -221,9 +256,15 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		res.Metrics = append(res.Metrics, mk(telemetry.TCPTLSms, tlsMs, telemetry.UnitMs))
 	}
 	if !overallOK {
+		msg := "TCP connect failed: " + addr
+		if !atTarget {
+			// Naming the egress path in the message matters: the operator reading this
+			// event must not start by checking a service that was never reached.
+			msg = "TCP connect failed at the egress proxy: " + addr
+		}
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
-			Severity: telemetry.SeverityWarn, Message: "TCP connect failed: " + addr,
+			Severity: telemetry.SeverityWarn, Message: msg,
 		})
 	}
 }
