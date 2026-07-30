@@ -20,14 +20,18 @@ import (
 // network.wifi.ssid.read. Registration itself requires
 // network.interface.status.read.
 type InterfaceCollector struct {
-	p          platform.Platform
-	reportAddr bool
-	reportWiFi bool
-	reportSSID bool
+	p             platform.Platform
+	reportAddr    bool
+	reportGateway bool
+	reportWiFi    bool
+	reportSSID    bool
 }
 
-func NewInterfaceCollector(p platform.Platform, reportAddr, reportWiFi, reportSSID bool) *InterfaceCollector {
-	return &InterfaceCollector{p: p, reportAddr: reportAddr, reportWiFi: reportWiFi, reportSSID: reportSSID}
+func NewInterfaceCollector(p platform.Platform, reportAddr, reportGateway, reportWiFi, reportSSID bool) *InterfaceCollector {
+	return &InterfaceCollector{
+		p: p, reportAddr: reportAddr, reportGateway: reportGateway,
+		reportWiFi: reportWiFi, reportSSID: reportSSID,
+	}
 }
 
 func (c *InterfaceCollector) Name() string { return "interface" }
@@ -39,7 +43,7 @@ func (c *InterfaceCollector) Collect(ctx context.Context) (Result, error) {
 	// permission; when denied, the platform never reads them (no read-then-redact).
 	ifaces, err := c.p.Interfaces(platform.IfaceQuery{
 		Addrs:    c.reportAddr,
-		Gateways: c.reportAddr,
+		Gateways: c.reportGateway,
 		DNS:      c.reportAddr,
 	})
 	if err != nil {
@@ -72,6 +76,11 @@ func (c *InterfaceCollector) Collect(ctx context.Context) (Result, error) {
 		WiFiReason: telemetry.WiFiReason(wr.Reason),
 		Interfaces: []telemetry.InterfaceState{}, // explicit empty: a zero-interface round still clears server rows
 	}
+	if c.reportGateway {
+		if gateway, interfaceName := resolveIPv4Gateway(ifaces, ""); gateway != "" {
+			snap.DefaultRoute = &telemetry.SnapshotRoute{Gateway: gateway, Interface: interfaceName}
+		}
+	}
 
 	for _, ifc := range ifaces {
 		if ifc.IsLoopback {
@@ -95,11 +104,15 @@ func (c *InterfaceCollector) Collect(ctx context.Context) (Result, error) {
 			Up:         ifc.Up,
 			IsWireless: ifc.IsWireless,
 		}
-		// Address/gateway/DNS disclosure is gated on the address-read permission.
+		// Addresses/DNS require address-read. Gateway disclosure is also allowed
+		// by the gateway-probe permission because that collector already resolves
+		// and probes the same OS route.
 		if c.reportAddr {
 			st.Addrs = ifc.Addrs
-			st.Gateway = firstOr(ifc.Gateways)
 			st.DNS = ifc.DNS
+		}
+		if c.reportGateway {
+			st.Gateway = firstOr(ifc.Gateways)
 		}
 
 		if a, ok := adapterByID[ifc.ID]; ok {

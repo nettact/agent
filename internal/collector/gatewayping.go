@@ -149,6 +149,15 @@ func (c *GatewayPingCollector) gatewayFor(iface string) string {
 	if err != nil {
 		return ""
 	}
+	gateway, _ := resolveIPv4Gateway(ifaces, iface)
+	return gateway
+}
+
+// resolveIPv4Gateway is the shared default-egress resolver used by both the
+// gateway probe and the interface snapshot. Keeping one resolver guarantees
+// that the UI's reported default route names the same NIC the gateway monitor
+// actually probes.
+func resolveIPv4Gateway(ifaces []platform.IfaceInfo, iface string) (gateway, interfaceName string) {
 	for _, ifc := range ifaces {
 		if ifc.IsLoopback || !ifc.Up {
 			continue
@@ -158,11 +167,11 @@ func (c *GatewayPingCollector) gatewayFor(iface string) string {
 		}
 		for _, gw := range ifc.Gateways {
 			if ip := net.ParseIP(gw); ip != nil && ip.To4() != nil {
-				return gw
+				return gw, ifc.Name
 			}
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // SetMinInterval applies the local per-target probe-interval floor (stability limit).

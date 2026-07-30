@@ -376,6 +376,7 @@ func Run(ctx context.Context, cfg Config) error {
 		tiered = append(tiered, collector.NewInterfaceCollector(
 			p,
 			effective.Has(permission.NetIfaceAddressRead),
+			effective.Has(permission.NetIfaceAddressRead) || effective.Has(permission.NetworkGatewayProbe),
 			effective.Has(permission.NetWiFiStatusRead),
 			effective.Has(permission.NetWiFiSSIDRead),
 		))

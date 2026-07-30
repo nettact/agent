@@ -32,20 +32,23 @@ func TestInterfaceCollectorAuthoritativeWiFiSnapshot(t *testing.T) {
 	p := ifaceTestPlatform{
 		ifaces: []platform.IfaceInfo{
 			{ID: "lo", Name: "lo", IsLoopback: true, Up: true},
-			{ID: "eth", Name: "eth0", Up: true},
-			{ID: "wifi-id", Name: "wlan0", Up: true, IsWireless: true, Addrs: []string{"192.168.1.2/24"}},
+			{ID: "eth", Name: "eth0", Up: true, Gateways: []string{"192.168.1.1"}},
+			{ID: "wifi-id", Name: "wlan0", Up: true, IsWireless: true, Addrs: []string{"192.168.1.2/24"}, Gateways: []string{"10.0.0.1"}},
 		},
 		wifi: platform.WiFiResult{State: "ok", Adapters: []platform.WiFiStatus{{
 			ID: "wifi-id", Name: "wlan0", State: "connected", SSID: "home", Band: "5", Channel: 36,
 			SignalDBm: intPtr(-55), Quality: intPtr(90), RxMbps: floatPtr(432.1), TxMbps: floatPtr(866.7),
 		}}},
 	}
-	res, err := NewInterfaceCollector(p, true, true, true).Collect(context.Background())
+	res, err := NewInterfaceCollector(p, true, true, true, true).Collect(context.Background())
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
 	if res.InterfaceSnapshot == nil || len(res.InterfaceSnapshot.Interfaces) != 2 {
 		t.Fatalf("snapshot=%+v", res.InterfaceSnapshot)
+	}
+	if route := res.InterfaceSnapshot.DefaultRoute; route == nil || route.Gateway != "192.168.1.1" || route.Interface != "eth0" {
+		t.Fatalf("default route=%+v, want eth0 via 192.168.1.1", route)
 	}
 	if len(res.Inventory) != 0 {
 		t.Fatalf("interface collector emitted obsolete inventory deltas: %+v", res.Inventory)
@@ -82,7 +85,7 @@ func TestInterfaceCollectorMissingAdapterAndDisconnectedMetrics(t *testing.T) {
 		ifaces: []platform.IfaceInfo{{ID: "w", Name: "wlan0", IsWireless: true}},
 		wifi:   platform.WiFiResult{State: "ok"},
 	}
-	res, err := NewInterfaceCollector(missing, true, true, true).Collect(context.Background())
+	res, err := NewInterfaceCollector(missing, true, true, true, true).Collect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +101,7 @@ func TestInterfaceCollectorMissingAdapterAndDisconnectedMetrics(t *testing.T) {
 
 	disconnected := missing
 	disconnected.wifi.Adapters = []platform.WiFiStatus{{ID: "w", Name: "wlan0", State: "disconnected", SSID: "stale", Band: "5", Channel: 36}}
-	res, err = NewInterfaceCollector(disconnected, true, true, true).Collect(context.Background())
+	res, err = NewInterfaceCollector(disconnected, true, true, true, true).Collect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

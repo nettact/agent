@@ -16,6 +16,9 @@
 # Required secret: CI_SUBMODULE_SSH_KEY (org-level recommended) — read access to
 # nettact/protocol. GHCR auth uses GITHUB_TOKEN; cosign is keyless OIDC.
 
+# Public downloads are served by the d.nettact.org Cloudflare Worker directly
+# from this private GitHub Release. No release asset is copied to R2.
+
 name: Release
 
 on:
@@ -244,79 +247,3 @@ jobs:
             docker pull ghcr.io/${{ github.repository_owner }}/nettact-agent:${{ inputs.tag || github.ref_name }}
             ```
             Verify binary integrity with `sha256sum -c SHA256SUMS`.
-
-  publish-r2:
-    name: Publish Agent assets to R2
-    runs-on: ubuntu-latest
-    needs: release
-    permissions:
-      contents: read
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
-      PUBLIC_BASE_URL: https://d.nettact.org/agent
-      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
-      R2_BUCKET: ${{ vars.R2_BUCKET }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Validate R2 configuration
-        run: |
-          set -euo pipefail
-          : "${R2_ACCOUNT_ID:?Set the R2_ACCOUNT_ID repository variable}"
-          : "${R2_BUCKET:?Set the R2_BUCKET repository variable}"
-          : "${AWS_ACCESS_KEY_ID:?Set the R2_ACCESS_KEY_ID repository secret}"
-          : "${AWS_SECRET_ACCESS_KEY:?Set the R2_SECRET_ACCESS_KEY repository secret}"
-
-      - name: Download and verify Release assets
-        run: |
-          set -euo pipefail
-          mkdir -p dist-out
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist-out --pattern 'nettact-agent-*' --pattern 'SHA256SUMS' --pattern 'install.sh' --pattern 'install.ps1'
-          expected=(
-            nettact-agent-linux-amd64
-            nettact-agent-linux-arm64
-            nettact-agent-darwin-amd64
-            nettact-agent-darwin-arm64
-            nettact-agent-windows-amd64.exe
-            SHA256SUMS
-            nettact-agent-dependencies.json
-            nettact-agent-dependencies.json.sha256
-            install.sh
-            install.ps1
-          )
-          for asset in "${expected[@]}"; do
-            [[ -f "dist-out/$asset" ]] || {
-              echo "Missing required Release asset: $asset" >&2
-              exit 1
-            }
-          done
-          # SHA256SUMS covers the binaries only; the dependency record carries its own.
-          (cd dist-out && sha256sum --check SHA256SUMS nettact-agent-dependencies.json.sha256)
-          ! grep -R 'github.com/nettact/agent/releases' dist-out/install.sh dist-out/install.ps1
-
-      - name: Publish immutable version path
-        run: |
-          set -euo pipefail
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 sync dist-out/ "s3://${R2_BUCKET}/agent/$TAG/" --endpoint-url "$endpoint" --delete --no-progress --only-show-errors --cache-control 'public, max-age=31536000, immutable'
-
-      - name: Publish latest Agent assets
-        if: needs.release.outputs.is_latest == 'true'
-        run: |
-          set -euo pipefail
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 sync dist-out/ "s3://${R2_BUCKET}/agent/" --endpoint-url "$endpoint" --no-progress --only-show-errors --cache-control 'public, max-age=300'
-
-      - name: Publish download summary
-        run: |
-          {
-            echo "## R2 Agent downloads"
-            echo
-            echo "- Version: $TAG"
-            echo "- Merged Linux/macOS/Docker installer: $PUBLIC_BASE_URL/install.sh"
-            echo "- Windows installer: $PUBLIC_BASE_URL/install.ps1"
-            echo "- Versioned assets: $PUBLIC_BASE_URL/$TAG/"
-            echo "- Dependency record: $PUBLIC_BASE_URL/$TAG/nettact-agent-dependencies.json"
-          } >> "$GITHUB_STEP_SUMMARY"
