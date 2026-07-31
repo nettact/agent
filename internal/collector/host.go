@@ -16,16 +16,16 @@ import (
 )
 
 // HostMetricsCollector reports this machine's own CPU / memory / disk / load /
-// uptime / network-I/O as ordinary time-series metrics (LayerLocal), modeled on
-// the NeoHtop dashboard. Each metric family is gated on its own permission
-// (host.cpu.read, host.memory.read, …); a denied family invokes no gopsutil
-// operation and emits nothing.
+// uptime / network-I/O / temperature as ordinary time-series metrics
+// (LayerLocal), modeled on the NeoHtop dashboard. Each metric family is gated on
+// its own permission (host.cpu.read, host.memory.read, …); a denied family
+// invokes no gopsutil operation and emits nothing.
 //
 // CPU utilization is measured as the delta since the previous Collect (interval
 // 0 in gopsutil), which fits the regular scheduler tier. Network rates are
 // computed from the byte-counter delta between successive Collects.
 type HostMetricsCollector struct {
-	cpu, mem, disk, load, uptime, netio bool
+	cpu, mem, disk, load, uptime, netio, temp bool
 
 	lastNetRx uint64
 	lastNetTx uint64
@@ -35,8 +35,11 @@ type HostMetricsCollector struct {
 
 // NewHostMetricsCollector builds the collector with each metric family gated on
 // its permission. Only granted families are ever sampled.
-func NewHostMetricsCollector(cpuOn, memOn, diskOn, loadOn, uptimeOn, netioOn bool) *HostMetricsCollector {
-	c := &HostMetricsCollector{cpu: cpuOn, mem: memOn, disk: diskOn, load: loadOn, uptime: uptimeOn, netio: netioOn}
+func NewHostMetricsCollector(cpuOn, memOn, diskOn, loadOn, uptimeOn, netioOn, tempOn bool) *HostMetricsCollector {
+	c := &HostMetricsCollector{
+		cpu: cpuOn, mem: memOn, disk: diskOn,
+		load: loadOn, uptime: uptimeOn, netio: netioOn, temp: tempOn,
+	}
 	// Prime CPU baselines so the first real Collect reports a delta, not a
 	// since-boot average. Errors here are non-fatal.
 	if cpuOn {
@@ -142,6 +145,23 @@ func (c *HostMetricsCollector) Collect(ctx context.Context) (Result, error) {
 			c.lastNetTx = io[0].BytesSent
 			c.lastNetAt = time.Now()
 			c.primed = true
+		}
+	}
+
+	// Temperature: one series per sensor, plus the hottest reading as the "host"
+	// aggregate — the same aggregate/detail split as CPU, and the series the
+	// console overview graphs. A machine with no readable sensor emits nothing,
+	// leaving a gap in the chart rather than a synthetic zero.
+	if c.temp {
+		hottest, any := 0.0, false
+		for _, r := range collectTemps(ctx) {
+			add(telemetry.HostTempSensorC, r.target, r.celsius, telemetry.UnitCelsius)
+			if !any || r.celsius > hottest {
+				hottest, any = r.celsius, true
+			}
+		}
+		if any {
+			add(telemetry.HostTempC, "host", hottest, telemetry.UnitCelsius)
 		}
 	}
 

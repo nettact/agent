@@ -241,6 +241,15 @@ func Run(ctx context.Context, cfg Config) error {
 	if tcpTraceCap {
 		supported.Add(permission.DiagnosticTracerouteTCP)
 	}
+	// Temperature is the other runtime capability: unlike CPU or memory, a
+	// machine may expose no thermal sensor at all (most VMs, many consumer
+	// boards, and Windows ACPI thermal zones that are absent or elevation-gated).
+	// Probing once here keeps supported honest, so an operator who granted the
+	// permission sees "unsupported on this host" instead of an always-empty
+	// chart.
+	if collector.TemperatureSupported(ctx) {
+		supported.Add(permission.HostTemperatureRead)
+	}
 	granted := cfg.Policy.Granted
 	effective := permission.EffectiveFrom(granted, supported)
 
@@ -392,6 +401,7 @@ func Run(ctx context.Context, cfg Config) error {
 			effective.Has(permission.HostLoadRead),
 			effective.Has(permission.HostUptimeRead),
 			effective.Has(permission.HostNetworkIORead),
+			effective.Has(permission.HostTemperatureRead),
 		))
 	}
 	sched := scheduler.New(tiered, selfSched, sink)
@@ -543,6 +553,8 @@ func platformIndependentSupported() permission.Set {
 		permission.ProbeTCP,
 		permission.ProbeNAT,
 		// Host metrics — gopsutil cpu/mem/disk/load/host/net, compiled everywhere.
+		// HostTemperatureRead is deliberately absent: sensors are a per-machine
+		// capability, so Run probes for one and adds the permission there.
 		permission.HostCPURead,
 		permission.HostMemoryRead,
 		permission.HostDiskRead,
@@ -567,6 +579,7 @@ func hostMetricsEnabled(effective permission.Set) bool {
 	for _, id := range []permission.ID{
 		permission.HostCPURead, permission.HostMemoryRead, permission.HostDiskRead,
 		permission.HostLoadRead, permission.HostUptimeRead, permission.HostNetworkIORead,
+		permission.HostTemperatureRead,
 	} {
 		if effective.Has(id) {
 			return true
