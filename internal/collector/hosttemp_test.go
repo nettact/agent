@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nettact/protocol/telemetry"
 
@@ -87,6 +90,82 @@ func TestCollectTempsFiltersAndDedupes(t *testing.T) {
 		if got[i] != w {
 			t.Fatalf("reading %d = %+v, want %+v", i, got[i], w)
 		}
+	}
+}
+
+// A machine can report a key that already looks like the suffixed form of
+// another. Every emitted target must still be distinct, or two sensors collapse
+// onto one series and one value overwrites the other at the same timestamp.
+func TestCollectTempsTargetsStayUniqueAgainstNaturalSuffixes(t *testing.T) {
+	stubSensors(t, []pshost.TemperatureStat{
+		{SensorKey: "cpu", Temperature: 40},
+		{SensorKey: "cpu", Temperature: 41},   // collides -> cpu_2
+		{SensorKey: "cpu_2", Temperature: 42}, // natural cpu_2 -> must not reuse
+		{SensorKey: "cpu", Temperature: 43},   // -> cpu_3
+	}, nil)
+
+	got := collectTemps(context.Background())
+	if len(got) != 4 {
+		t.Fatalf("expected 4 readings, got %d (%+v)", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, r := range got {
+		if seen[r.target] {
+			t.Fatalf("duplicate target %q in %+v", r.target, got)
+		}
+		seen[r.target] = true
+	}
+	// Every distinct reading must survive with its own value.
+	byTarget := map[string]float64{}
+	for _, r := range got {
+		byTarget[r.target] = r.celsius
+	}
+	for _, want := range []float64{40, 41, 42, 43} {
+		found := false
+		for _, v := range byTarget {
+			if v == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("reading %v was dropped: %+v", want, got)
+		}
+	}
+}
+
+// A provider that never answers must not accumulate queries: the first caller
+// waits out sensorTimeout, and callers after it are refused until the stuck read
+// finally returns.
+func TestCollectTempsKeepsAtMostOneReadInFlight(t *testing.T) {
+	prevTimeout := sensorTimeout
+	sensorTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { sensorTimeout = prevTimeout })
+
+	release := make(chan struct{})
+	var calls atomic.Int32
+	prev := readSensors
+	readSensors = func(context.Context) ([]pshost.TemperatureStat, error) {
+		calls.Add(1)
+		<-release
+		return []pshost.TemperatureStat{{SensorKey: "k10temp", Temperature: 55}}, nil
+	}
+	t.Cleanup(func() {
+		readSensors = prev
+		close(release)
+		// Let the stuck goroutine finish so it cannot leak into another test.
+		for sensorBusy.Load() {
+			runtime.Gosched()
+		}
+	})
+
+	if got := collectTemps(context.Background()); got != nil {
+		t.Fatalf("a stuck read must yield nothing, got %+v", got)
+	}
+	if got := collectTemps(context.Background()); got != nil {
+		t.Fatalf("second call must be refused while the read is in flight, got %+v", got)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("expected exactly 1 underlying read, got %d", n)
 	}
 }
 

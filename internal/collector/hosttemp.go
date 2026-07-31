@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	pshost "github.com/shirou/gopsutil/v3/host"
@@ -20,10 +21,19 @@ import (
 // readSensors is the gopsutil seam, replaced in tests.
 var readSensors = pshost.SensorsTemperaturesWithContext
 
-// sensorTimeout caps a single sensor read. The Windows WMI provider can block
-// for far longer than the regular collection tier if the ACPI thermal zone is
-// unhealthy, and a stuck read would stall every other host metric behind it.
-const sensorTimeout = 3 * time.Second
+// sensorTimeout caps how long a caller waits for a sensor read. The Windows WMI
+// provider can block for far longer than the regular collection tier if the ACPI
+// thermal zone is unhealthy, and a stuck read would stall every other host
+// metric behind it. A var so tests can shorten the wait.
+var sensorTimeout = 3 * time.Second
+
+// sensorBusy is held for as long as a read is genuinely outstanding, which is
+// not the same as "a caller is waiting". gopsutil honours cancellation on
+// Windows by returning while the wmi.Query goroutine underneath it keeps
+// running, so a hung provider would otherwise strand one more query on every
+// 30s collection cycle. Skipping while the previous read is still in flight
+// bounds that at one.
+var sensorBusy atomic.Bool
 
 // tempReading is one accepted sensor: a series-safe target and its value.
 type tempReading struct {
@@ -39,26 +49,60 @@ type tempReading struct {
 // discard good data. The plausibility filter is the real gate — no plausible
 // reading means no temperature support, whatever err says.
 func collectTemps(ctx context.Context) []tempReading {
-	ctx, cancel := context.WithTimeout(ctx, sensorTimeout)
-	defer cancel()
-
-	stats, _ := readSensors(ctx)
+	stats, ok := readSensorsGuarded(ctx)
+	if !ok {
+		return nil
+	}
 	out := make([]tempReading, 0, len(stats))
-	seen := make(map[string]int, len(stats))
+	used := make(map[string]bool, len(stats))
 	for _, s := range stats {
 		if !plausibleTemp(s.Temperature) {
 			continue
 		}
+		// Distinct sensors can sanitize onto one key, and a machine can also
+		// report a key that already looks like a suffixed one ("cpu" twice plus
+		// a literal "cpu_2"). Probing for the first free target rather than
+		// counting occurrences of the base keeps every target unique, so two
+		// sensors can never collapse into one series.
 		key := sanitizeSensorKey(s.SensorKey)
-		// Distinct sensors can sanitize to the same key (or report the same key
-		// outright). Suffix the repeats so they don't collapse into one series.
-		seen[key]++
-		if n := seen[key]; n > 1 {
-			key += "_" + strconv.Itoa(n)
+		if used[key] {
+			base := key
+			for n := 2; ; n++ {
+				key = base + "_" + strconv.Itoa(n)
+				if !used[key] {
+					break
+				}
+			}
 		}
+		used[key] = true
 		out = append(out, tempReading{target: key, celsius: s.Temperature})
 	}
 	return out
+}
+
+// readSensorsGuarded performs the sensor read on its own goroutine and stops
+// waiting after sensorTimeout, reporting ok=false. The goroutine keeps sensorBusy
+// held until the underlying call actually returns — detached from the caller's
+// context on purpose, so that giving up on a stuck provider does not license the
+// next cycle to start another query behind it.
+func readSensorsGuarded(ctx context.Context) ([]pshost.TemperatureStat, bool) {
+	if !sensorBusy.CompareAndSwap(false, true) {
+		return nil, false
+	}
+	ch := make(chan []pshost.TemperatureStat, 1)
+	go func() {
+		stats, _ := readSensors(context.WithoutCancel(ctx))
+		// Release before publishing, so a caller that receives the result can
+		// immediately start the next read.
+		sensorBusy.Store(false)
+		ch <- stats
+	}()
+	select {
+	case stats := <-ch:
+		return stats, true
+	case <-time.After(sensorTimeout):
+		return nil, false
+	}
 }
 
 // plausibleTemp rejects readings no real sensor produces. Firmware that has no
