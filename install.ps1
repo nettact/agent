@@ -104,6 +104,22 @@ if ($UpdateOnly) {
     return
 }
 
+# A full install REPLACES any previous installation outright. The previous
+# scheduled tasks go away (including the update task — if -AutoUpdate is not on
+# this command line, the machine must not keep updating), and the Agent's
+# identity and queued telemetry are wiped so it re-enrolls with the token passed
+# HERE. Resuming the old identity would silently ignore that token, and a stale
+# credential (agent deleted in the console, server moved) breaks startup in ways
+# that look like network failures. The wipe is also what gives the verification
+# below its positive signal: a full install always produces a fresh enrollment.
+Unregister-ScheduledTask -TaskName "NetTact Agent" -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "NetTact Agent Update" -Confirm:$false -ErrorAction SilentlyContinue
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $installDir "install.ps1")
+if (Test-Path $dataDir) {
+    Remove-Item -Recurse -Force $dataDir
+}
+New-Item -ItemType Directory -Force $dataDir | Out-Null
+
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 [IO.File]::WriteAllText($tokenFile, $Token, $utf8NoBom)
 $serverJson = ConvertTo-Json $ServerUrl -Compress
@@ -134,52 +150,60 @@ if ($LASTEXITCODE -ne 0) {
 # reach the operator. Task Scheduler discards the process's stdout/stderr, and
 # the Agent reports every startup failure there, so a failure under the task
 # alone is undiagnosable. This is the Windows counterpart to the journalctl
-# dump install.sh does. A successful run persists the agent identity in
-# $dataDir, so the scheduled task below reuses it.
-Write-Host "==> Verifying configuration and enrolling"
+# dump install.sh does.
+#
+# The data dir was wiped above, so this run always enrolls fresh — and the Agent
+# persists its identity (agent.json) the moment enrollment succeeds, so that
+# file appearing is positive proof the server was reachable and the token
+# accepted. Nothing weaker counts as success: "still alive after N seconds"
+# would pass an Agent stuck against an unreachable server. The deadline outlasts
+# the enrollment POST's 30s HTTP timeout (internal/enroll), so a black-holed
+# server surfaces as the Agent exiting with the real error, which is shown. A
+# successful run leaves the identity in $dataDir for the scheduled task below.
+Write-Host "==> Verifying server connectivity and enrolling"
 $outLog = Join-Path ([IO.Path]::GetTempPath()) "nettact-agent-preflight.out"
 $errLog = Join-Path ([IO.Path]::GetTempPath()) "nettact-agent-preflight.err"
-# The Agent persists its identity the moment enrollment succeeds, so that file
-# appearing is a positive confirmation. "Still alive after N seconds" is not: the
-# enrollment POST has its own 30s HTTP timeout (internal/enroll), so an Agent
-# blocked against a black-holed server looks exactly like a healthy one until
-# that timeout fires and it exits with the real error. The grace period below
-# therefore has to outlast that timeout, and on a re-install (identity already on
-# disk, so the Agent resumes instead of enrolling) surviving it is all we have.
 $credentialFile = Join-Path $dataDir "agent.json"
-$hadCredential = Test-Path $credentialFile
 try {
     $preflight = Start-Process -FilePath $binary -ArgumentList "--config `"$configFile`"" `
         -NoNewWindow -PassThru -RedirectStandardOutput $outLog -RedirectStandardError $errLog
-    $verified = $false
-    $graceDeadline = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $graceDeadline) {
-        if ($preflight.HasExited) {
+    $enrolled = $false
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $credentialFile) {
+            $enrolled = $true
             break
         }
-        if (-not $hadCredential -and (Test-Path $credentialFile)) {
-            $verified = $true
+        if ($preflight.HasExited) {
             break
         }
         Start-Sleep -Milliseconds 250
     }
-    if (-not $verified -and -not $preflight.HasExited) {
-        $verified = $true
+    # agent.json is written non-atomically; give the write a moment to finish
+    # before the writer is stopped, or the scheduled task could inherit a
+    # truncated credential.
+    if ($enrolled) {
+        Start-Sleep -Seconds 1
     }
-    if (-not $verified) {
+    # Stop it before reading the logs (releases the redirect handles); on
+    # success the scheduled task below resumes from the saved identity.
+    if (-not $preflight.HasExited) {
+        Stop-Process -Id $preflight.Id -Force -ErrorAction SilentlyContinue
+        $preflight.WaitForExit(10000) | Out-Null
+    }
+    if (-not $enrolled) {
         Write-Host ""
-        Write-Host "The Agent exited instead of staying up. Its output was:"
+        Write-Host "INSTALL FAILED: the Agent could not enroll with $ServerUrl. Its output was:"
         $output = @(Get-Content $errLog, $outLog -ErrorAction SilentlyContinue)
         if ($output.Count -eq 0) {
-            Write-Host "    (the Agent produced no output)"
+            Write-Host "    (the Agent produced no output — is $ServerUrl reachable from this machine?)"
         }
         foreach ($line in $output) {
             Write-Host "    $line"
         }
-        throw "The Agent could not start. See its output above."
+        Write-Host "Nothing was left running. Fix the problem, generate a fresh token in the console, and run the install command again."
+        throw "Installation failed: the Agent could not enroll. See its output above."
     }
-    Stop-Process -Id $preflight.Id -Force -ErrorAction SilentlyContinue
-    $preflight.WaitForExit(10000) | Out-Null
 } finally {
     Remove-Item -Force -ErrorAction SilentlyContinue $outLog, $errLog
 }
@@ -192,7 +216,6 @@ $taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceA
 # defaults (New-ScheduledTaskSettingsSet sets them to $true).
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $taskPrincipal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
 
@@ -222,7 +245,7 @@ if (-not $running) {
     if ($info) {
         Write-Host ("Task '{0}' last result: 0x{1:X8} (last run {2})" -f $taskName, $info.LastTaskResult, $info.LastRunTime)
     }
-    throw "The Agent started correctly in the foreground but did not stay running under Task Scheduler > '$taskName'."
+    throw "INSTALL FAILED: the Agent enrolled correctly in the foreground but did not stay running under Task Scheduler > '$taskName'."
 }
 
 if ($AutoUpdate) {
@@ -234,4 +257,4 @@ if ($AutoUpdate) {
     Write-Host "==> Daily automatic updates enabled."
 }
 
-Write-Host "==> Agent installed and running. It should appear in the NetTact console within seconds."
+Write-Host "==> SUCCESS: Agent enrolled and running. It should appear in the NetTact console within seconds."

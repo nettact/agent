@@ -23,8 +23,10 @@ Usage:
   install.sh --update-only
 
 The same script installs a native systemd service on Linux, a launchd daemon on
-macOS, or a persistent container when --docker is selected. Re-running upgrades
-the native binary and keeps the existing Agent identity.
+macOS, or a persistent container when --docker is selected. A full install
+REPLACES any previous installation — the previous Agent identity is wiped so
+the machine re-enrolls with the token given here. --update-only upgrades the
+binary in place and keeps the identity.
 
 Options:
   --auto-update        Install a daily native update timer, or an Agent-scoped
@@ -44,6 +46,23 @@ EOF
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
+
+# Positive install verification: run the given check command (a test for the
+# Agent's persisted agent.json, which appears the moment enrollment succeeds)
+# until it passes or the deadline expires. That file is proof the server was
+# reachable and the token accepted. Merely "the service/container is running" is
+# NOT success — on an unreachable server the Agent exits after its 30s enroll
+# timeout and the service manager quietly restarts it forever, which is exactly
+# the install that used to be reported as successful. The window outlasts one
+# full enroll attempt plus a restart.
+wait_enrolled() {
+  deadline=$(( $(date +%s) + 75 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -93,8 +112,6 @@ $UPDATE_ONLY || {
   if [ -z "$TOKEN" ]; then
     if $DOCKER_MODE && [ -n "$TOKEN_FILE" ]; then
       :
-    elif $DOCKER_MODE && docker volume inspect nettact-agent-data >/dev/null 2>&1; then
-      :
     else
       die "--token is required (Docker also accepts --token-file)"
     fi
@@ -110,7 +127,22 @@ if $DOCKER_MODE; then
 
   IMG="ghcr.io/nettact/nettact-agent:${VERSION:-latest}"
   log "starting Agent container from $IMG"
+  # Tear the previous installation down updater-FIRST: a leftover Watchtower
+  # could restart the new container mid-enrollment (burning the one-time token
+  # after the server marked it used but before the credential was saved), and
+  # would survive a failed install holding the Docker socket. It is re-created
+  # below only when --auto-update is on THIS command line and the install
+  # verified.
+  docker rm -f nettact-agent-updater >/dev/null 2>&1 || true
   docker rm -f nettact-agent >/dev/null 2>&1 || true
+  # A full install replaces the previous one: the identity volume is removed so
+  # the Agent re-enrolls with the token given HERE. Resuming the old identity
+  # would silently ignore that token, and a stale credential (agent deleted in
+  # the console, server moved) breaks startup in ways that look like network
+  # failures. The wipe is also what makes agent.json a positive success signal.
+  docker volume rm nettact-agent-data >/dev/null 2>&1 || true
+  ! docker volume inspect nettact-agent-data >/dev/null 2>&1 || \
+    die "could not remove the previous identity volume nettact-agent-data (still in use by another container?); remove it and re-run this command"
   RUN_ARGS=(-d --name nettact-agent --restart unless-stopped
     -e "NETTACT_AGENT_SERVER_URL=$SERVER_URL"
     -e NETTACT_AGENT_DATA_DIR=/agent-data
@@ -175,17 +207,30 @@ if $DOCKER_MODE; then
   fi
   docker run "${RUN_ARGS[@]}" "$IMG" >/dev/null
 
-  sleep 2
-  [ "$(docker inspect -f '{{.State.Running}}' nettact-agent 2>/dev/null)" = true ] || {
+  log "verifying server connectivity and enrolling"
+  if ! wait_enrolled docker exec nettact-agent test -f /agent-data/agent.json; then
     docker logs --tail 30 nettact-agent >&2 || true
-    die "Agent container failed to stay running"
-  }
+    docker rm -f nettact-agent >/dev/null 2>&1 || true
+    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). The container was removed; fix the problem, generate a fresh token in the console, and re-run this command."
+  fi
+  # Enrollment succeeded, but the restart policy would also mask an Agent that
+  # crashes right after it: the credential survives restarts, so agent.json
+  # alone cannot vouch for a stable process. Require the SAME container
+  # instance to still be up after a short dwell — a crash loop shows up as a
+  # changed StartedAt or Running=false.
+  STARTED_AT="$(docker inspect -f '{{.State.StartedAt}}' nettact-agent 2>/dev/null)"
+  sleep 3
+  if [ "$(docker inspect -f '{{.State.Running}}' nettact-agent 2>/dev/null)" != true ] || \
+     [ "$(docker inspect -f '{{.State.StartedAt}}' nettact-agent 2>/dev/null)" != "$STARTED_AT" ]; then
+    docker logs --tail 30 nettact-agent >&2 || true
+    docker rm -f nettact-agent >/dev/null 2>&1 || true
+    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). The container was removed; fix the problem, generate a fresh token in the console, and re-run this command."
+  fi
   if $AUTO_UPDATE; then
     log "enabling daily automatic Agent image updates"
-    docker rm -f nettact-agent-updater >/dev/null 2>&1 || true
     docker run -d --name nettact-agent-updater --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:latest --cleanup --interval 86400 nettact-agent >/dev/null
   fi
-  log "Agent installed and running (logs: docker logs -f nettact-agent)"
+  log "SUCCESS: Agent enrolled and running (logs: docker logs -f nettact-agent)"
   exit 0
 fi
 
@@ -242,6 +287,30 @@ if $UPDATE_ONLY; then
 fi
 
 install -m 0755 "$tmp" "$BIN"
+
+# Tear the previous installation down BEFORE touching its state, updater
+# FIRST: a leftover update timer/daemon runs --update-only, which restarts the
+# Agent — mid-enrollment that can burn the one-time token (after the server
+# marked it used but before the credential was saved), and after a failed
+# install it would resurrect a disabled service. It is re-created below only
+# when --auto-update is on THIS command line. Then the Agent itself, which
+# would otherwise write into the data dir between the wipe and the restart.
+if [ "$OS" = linux ]; then
+  systemctl disable --now nettact-agent-update.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/nettact-agent-update.timer /etc/systemd/system/nettact-agent-update.service
+  systemctl stop nettact-agent.service >/dev/null 2>&1 || true
+else
+  launchctl bootout system/org.nettact.agent.update >/dev/null 2>&1 || true
+  rm -f /Library/LaunchDaemons/org.nettact.agent.update.plist
+  launchctl bootout system/org.nettact.agent >/dev/null 2>&1 || true
+fi
+rm -rf /usr/local/lib/nettact-agent
+
+# A full install replaces the previous one: the data dir (identity + queued
+# telemetry) is wiped so the Agent re-enrolls with the token given HERE — see
+# the Docker section for why resuming the old identity would be wrong.
+# --update-only is the path that keeps identity.
+rm -rf "$DATA_DIR"
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 chmod 0700 "$CONFIG_DIR" "$DATA_DIR"
 printf '%s' "$TOKEN" > "$TOKEN_FILE"
@@ -300,14 +369,31 @@ User=root
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now nettact-agent.service
+  # enable + restart, NOT enable --now + restart: two starts in a row can kill
+  # the first instance mid-enrollment — after the server marked the one-time
+  # token used but before the credential was saved — burning the token.
+  systemctl enable nettact-agent.service
   systemctl restart nettact-agent.service
-  sleep 2
-  systemctl is-active --quiet nettact-agent.service || {
+  log "verifying server connectivity and enrolling"
+  if ! wait_enrolled test -f "$DATA_DIR/agent.json"; then
     journalctl -u nettact-agent.service -n 30 --no-pager >&2 || true
-    die "Agent service failed to start"
-  }
-  log "Agent installed and running (logs: journalctl -u nettact-agent -f)"
+    systemctl disable --now nettact-agent.service >/dev/null 2>&1 || true
+    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+  fi
+  # Enrollment succeeded, but Restart=always would also mask an Agent that
+  # crashes right after it: the credential survives restarts, so agent.json
+  # alone cannot vouch for a stable process. Require the SAME service instance
+  # to still be active after a short dwell — a crash loop shows up as inactive
+  # (auto-restart pending) or a changed activation timestamp.
+  STARTED="$(systemctl show -p ActiveEnterTimestampMonotonic nettact-agent.service 2>/dev/null)"
+  sleep 3
+  if ! systemctl is-active --quiet nettact-agent.service || \
+     [ "$(systemctl show -p ActiveEnterTimestampMonotonic nettact-agent.service 2>/dev/null)" != "$STARTED" ]; then
+    journalctl -u nettact-agent.service -n 30 --no-pager >&2 || true
+    systemctl disable --now nettact-agent.service >/dev/null 2>&1 || true
+    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+  fi
+  log "SUCCESS: Agent enrolled and running (logs: journalctl -u nettact-agent -f)"
 else
   PLIST=/Library/LaunchDaemons/org.nettact.agent.plist
   launchctl bootout system/org.nettact.agent >/dev/null 2>&1 || true
@@ -331,11 +417,29 @@ else
 </plist>
 EOF
   chmod 0644 "$PLIST"
+  # bootstrap starts the daemon (RunAtLoad); a kickstart -k on top would be a
+  # second start that can kill the first mid-enrollment and burn the token.
   launchctl bootstrap system "$PLIST"
-  launchctl kickstart -k system/org.nettact.agent
-  sleep 2
-  launchctl print system/org.nettact.agent >/dev/null 2>&1 || die "Agent daemon failed to start"
-  log "Agent installed and running (logs: tail -f /var/log/nettact-agent.log)"
+  log "verifying server connectivity and enrolling"
+  if ! wait_enrolled test -f "$DATA_DIR/agent.json"; then
+    tail -n 30 /var/log/nettact-agent.log >&2 2>/dev/null || true
+    launchctl bootout system/org.nettact.agent >/dev/null 2>&1 || true
+    rm -f "$PLIST"
+    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+  fi
+  # Enrollment succeeded, but KeepAlive would also mask an Agent that crashes
+  # right after it: the credential survives restarts, so agent.json alone
+  # cannot vouch for a stable process. Require the SAME process to still be up
+  # after a short dwell — a crash loop shows up as a missing or changed PID.
+  AGENT_PID="$(pgrep -x nettact-agent || true)"
+  sleep 3
+  if [ -z "$AGENT_PID" ] || [ "$(pgrep -x nettact-agent || true)" != "$AGENT_PID" ]; then
+    tail -n 30 /var/log/nettact-agent.log >&2 2>/dev/null || true
+    launchctl bootout system/org.nettact.agent >/dev/null 2>&1 || true
+    rm -f "$PLIST"
+    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+  fi
+  log "SUCCESS: Agent enrolled and running (logs: tail -f /var/log/nettact-agent.log)"
 fi
 
 if $AUTO_UPDATE; then
