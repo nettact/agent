@@ -36,6 +36,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -158,7 +159,7 @@ type Recorder struct {
 	source string
 	caps   []string
 
-	cur    *gs.Run
+	cur    *session
 	curPID int
 	// lastBucketTS is the second the current run was last seen presenting. It is
 	// what a run ends at: the sensor's own last observed second is a fact, while
@@ -167,13 +168,56 @@ type Recorder struct {
 	lastBucketTS time.Time
 	// parked holds runs that stopped presenting but whose process is still alive
 	// enough to come back, keyed by that process id. See reviveWindow.
-	parked map[int]*gs.Run
+	parked map[int]*session
 
 	dirty    []*gs.Run
 	dirtySet map[string]bool
 
 	buckets []gs.Bucket
 	dropped int
+}
+
+// session is a run plus what the recorder knows about it that the record itself
+// does not carry.
+type session struct {
+	run *gs.Run
+	// profiled records that a tracking status has told this recorder which
+	// profile the run belongs to — including the answer "none".
+	//
+	// It exists because "we have not been told yet" and "we were told it matches
+	// nothing" have to behave differently. A run opened by a sec line, before any
+	// status, has no assignment yet, and the first status that names one stamps it
+	// in place. A run that HAS an assignment never changes it: a later status
+	// naming a different one (or none) describes a different game, and the run
+	// ends there so its seconds keep the assignment they were collected under.
+	profiled bool
+}
+
+// profileClaim is what one sensor line says about which game a run belongs to. A
+// tracking status always makes a claim, possibly the claim that the process
+// matched no profile; a sec line makes none at all. The difference decides
+// whether a run continues or a new one begins, so the two cannot be represented
+// by the same empty string.
+type profileClaim struct {
+	id    string
+	known bool
+}
+
+// claimed is the claim a tracking status makes; id may be empty, which is the
+// positive claim that the process matched no profile.
+func claimed(id string) profileClaim { return profileClaim{id: id, known: true} }
+
+// unclaimed is what a sec line says about the profile: nothing.
+var unclaimed = profileClaim{}
+
+// accepts reports whether a line making this claim belongs to the session.
+//
+// A claimless line always does — a sec line says nothing about the profile and
+// must never split a run over it. A claim on a run with no assignment yet
+// establishes it. Otherwise only the identical assignment continues the run,
+// which is what makes a run's game immutable once known.
+func (s *session) accepts(c profileClaim) bool {
+	return !c.known || !s.profiled || s.run.ProfileID == c.id
 }
 
 // reviveWindow is how long a process that stops presenting keeps its run.
@@ -211,7 +255,7 @@ func (r *Recorder) status(st gs.Status) {
 		if st.PID != nil {
 			pid = *st.PID
 		}
-		r.track(pid, st.Proc, st.Title)
+		r.track(pid, st.Proc, st.Title, claimed(st.ProfileID))
 	case gs.StateIdle, gs.StateError:
 		// Parked rather than closed outright: a session that stopped presenting
 		// long enough to be called over is exactly the one a person returns to,
@@ -223,13 +267,13 @@ func (r *Recorder) status(st gs.Status) {
 
 // track folds a tracking status into the current run, or moves to another one.
 // Caller holds mu.
-func (r *Recorder) track(pid int, proc, title string) {
+func (r *Recorder) track(pid int, proc, title string, profile profileClaim) {
 	if proc == "" {
 		// A run is identified by its process, and there is nothing to identify
 		// this one by. The sec lines that follow name it, so the data is not lost.
 		return
 	}
-	if r.cur != nil && (pid == r.curPID || proc == r.cur.Proc) {
+	if r.cur != nil && (pid == r.curPID || proc == r.cur.run.Proc) && r.cur.accepts(profile) {
 		// Still the session in progress. The process id identifies it, but the
 		// program running under it also does while that session is live: a
 		// launcher handing the game off replaces the id mid-session, and treating
@@ -239,6 +283,9 @@ func (r *Recorder) track(pid int, proc, title string) {
 		// The id is what identifies a session that has STOPPED — see switchTo.
 		// Two launches of the same program are two sessions, and only the id
 		// tells them apart once neither is running.
+		//
+		// A changed profile assignment is the one thing that does NOT continue the
+		// run, however well the process matches: see stampProfile.
 		if pid > 0 {
 			r.curPID = pid
 		}
@@ -246,15 +293,42 @@ func (r *Recorder) track(pid int, proc, title string) {
 		// game mid-launch — clearing a title we already have on that basis would
 		// replace a fact with the absence of one.
 		r.retitle(title)
+		r.stampProfile(profile)
 		return
 	}
-	r.switchTo(pid, proc, title, time.Now().UTC())
+	r.switchTo(pid, proc, title, profile, time.Now().UTC())
 }
 
 func (r *Recorder) retitle(title string) {
-	if title != "" && title != r.cur.Title {
-		r.cur.Title = title
-		r.markDirty(r.cur)
+	if title != "" && title != r.cur.run.Title {
+		r.cur.run.Title = title
+		r.markDirty(r.cur.run)
+	}
+}
+
+// stampProfile records which game the current run is, the first time a status
+// says so. Caller holds mu, and has established that the run accepts the claim.
+//
+// A profile assignment is written once and never rewritten. It describes how the
+// seconds already collected were captured — which games the site was recording,
+// and under which rules — so moving it would retroactively file a whole session
+// under a game it was not being recorded as. When the assignment changes, the run
+// ends and a new one begins instead (see accepts and switchTo); the change can
+// only happen across a sensor restart, because a running sensor's configuration
+// is fixed.
+//
+// The first stamp is not a change. A run opened by a sec line, before any status
+// could name the process's profile, has no assignment yet, and the status that
+// arrives next fills it in place rather than splitting a session in two over its
+// own first second.
+func (r *Recorder) stampProfile(profile profileClaim) {
+	if !profile.known || r.cur.profiled {
+		return
+	}
+	r.cur.profiled = true
+	if profile.id != "" {
+		r.cur.run.ProfileID = profile.id
+		r.markDirty(r.cur.run)
 	}
 }
 
@@ -263,37 +337,43 @@ func (r *Recorder) retitle(title string) {
 //
 // The current run is parked rather than forgotten, because the person is very
 // likely coming back to it — that is what alt-tab is.
-func (r *Recorder) switchTo(pid int, proc, title string, now time.Time) {
+func (r *Recorder) switchTo(pid int, proc, title string, profile profileClaim, now time.Time) {
 	r.parkCurrent(now)
 	r.sweepParked(now)
 
-	if run := r.parked[pid]; run != nil && run.Proc == proc {
+	// The parked run is reopened only if it is the same program AND the same
+	// game: a process that comes back matching a different profile than it was
+	// recorded under is a new run, so the seconds either side of the restart keep
+	// the assignment each was collected with.
+	if s := r.parked[pid]; s != nil && s.run.Proc == proc && s.accepts(profile) {
 		// Reopening: the end recorded when it was parked was provisional, and the
 		// server takes the newer report. Its extent grows to cover the gap, which
 		// is honest — the session did span it, with a pause in the middle that the
 		// absent seconds already describe.
 		delete(r.parked, pid)
-		run.EndedAt = nil
-		r.cur, r.curPID, r.lastBucketTS = run, pid, time.Time{}
+		s.run.EndedAt = nil
+		r.cur, r.curPID, r.lastBucketTS = s, pid, time.Time{}
 		r.retitle(title)
-		r.markDirty(run)
+		r.stampProfile(profile)
+		r.markDirty(s.run)
 		return
 	}
-	r.start(pid, proc, title, now)
+	r.start(pid, proc, title, profile, now)
 }
 
 // start opens a run at startedAt. Caller holds mu.
-func (r *Recorder) start(pid int, proc, title string, startedAt time.Time) {
+func (r *Recorder) start(pid int, proc, title string, profile profileClaim, startedAt time.Time) {
 	run := &gs.Run{
 		ID:         uuid.NewString(),
 		Proc:       proc,
 		Title:      title,
+		ProfileID:  profile.id,
 		StartedAt:  startedAt,
 		LastSeenAt: startedAt,
 		Source:     r.source,
 		Caps:       append([]string(nil), r.caps...),
 	}
-	r.cur, r.curPID = run, pid
+	r.cur, r.curPID = &session{run: run, profiled: profile.known}, pid
 	r.lastBucketTS = time.Time{}
 	r.markDirty(run)
 }
@@ -303,16 +383,16 @@ func (r *Recorder) parkCurrent(now time.Time) {
 	if r.cur == nil {
 		return
 	}
-	run, pid := r.cur, r.curPID
+	s, pid := r.cur, r.curPID
 	r.closeRun()
 	if pid <= 0 {
 		// Nothing to recognize it by later. It stays ended.
 		return
 	}
 	if r.parked == nil {
-		r.parked = map[int]*gs.Run{}
+		r.parked = map[int]*session{}
 	}
-	r.parked[pid] = run
+	r.parked[pid] = s
 	// Swept here as well as on the way back in, so a machine that parks sessions
 	// and never returns to any of them does not hold every one of them forever.
 	r.sweepParked(now)
@@ -324,8 +404,8 @@ func (r *Recorder) parkCurrent(now time.Time) {
 // six-hour session interrupted for a minute is one session, and measuring from
 // its start would refuse to reopen it. Caller holds mu.
 func (r *Recorder) sweepParked(now time.Time) {
-	for pid, run := range r.parked {
-		if now.Sub(run.LastSeenAt) > reviveWindow {
+	for pid, s := range r.parked {
+		if now.Sub(s.run.LastSeenAt) > reviveWindow {
 			delete(r.parked, pid)
 		}
 	}
@@ -342,8 +422,8 @@ func (r *Recorder) closeRun() {
 		// no observed moment to end at, so the agent's own clock is all there is.
 		ended = time.Now().UTC()
 	}
-	r.cur.EndedAt = &ended
-	r.markDirty(r.cur)
+	r.cur.run.EndedAt = &ended
+	r.markDirty(r.cur.run)
 	r.cur, r.curPID, r.lastBucketTS = nil, 0, time.Time{}
 }
 
@@ -386,24 +466,26 @@ func (r *Recorder) sec(m gs.Sec) {
 	case r.cur == nil:
 		// Frames before any status, or after a session the sensor declared over.
 		// The second happened, so it gets a run — reopening the one this process
-		// id already had, when it has one. A sec line names its process but never
-		// its window, so a new run stays untitled rather than carrying a guess.
-		r.switchTo(m.PID, m.Proc, "", ts)
-	case m.PID != r.curPID && m.Proc != r.cur.Proc:
+		// id already had, when it has one. A sec line names neither its window nor
+		// its profile, so a new run carries neither rather than a guess; the status
+		// line that names them stamps them when it arrives. Saying nothing about
+		// the profile is also why a sec line can never split a run over one.
+		r.switchTo(m.PID, m.Proc, "", unclaimed, ts)
+	case m.PID != r.curPID && m.Proc != r.cur.run.Proc:
 		// A different program is drawing. The status line normally says so first;
 		// arriving here means the seconds moved before the transition did, and
 		// attributing them to the previous session would put one game's frames in
 		// another game's record.
-		r.switchTo(m.PID, m.Proc, "", ts)
+		r.switchTo(m.PID, m.Proc, "", unclaimed, ts)
 	case m.PID != r.curPID:
 		// Same program, new process id: a launcher handing the game off. One
 		// session, and the id it is now known by moves with it.
 		r.curPID = m.PID
 	}
-	r.cur.LastSeenAt = ts
+	r.cur.run.LastSeenAt = ts
 	r.lastBucketTS = ts
-	r.markDirty(r.cur)
-	r.push(gs.Bucket{RunID: r.cur.ID, TS: ts, Sample: m.Sample})
+	r.markDirty(r.cur.run)
+	r.push(gs.Bucket{RunID: r.cur.run.ID, TS: ts, Sample: m.Sample})
 }
 
 // markDirty queues a run to be sent on the next drain. Caller holds mu.
@@ -479,8 +561,10 @@ func (r *Recorder) Requeue(runs []gs.Run, buckets []gs.Bucket) {
 		}
 	}
 	for i := range runs {
-		run := r.cur
-		if run == nil || run.ID != runs[i].ID {
+		var run *gs.Run
+		if r.cur != nil && r.cur.run.ID == runs[i].ID {
+			run = r.cur.run
+		} else {
 			// The run has already ended, so the recorder no longer holds it; keep
 			// the copy that was handed back. Without this, an ending that failed
 			// to persist would never be sent and the run would stay open forever.
@@ -525,6 +609,27 @@ type Supervisor struct {
 	// both.
 	Recorder
 
+	cfgMu sync.Mutex
+	// cfg is the configuration the next sensor run will be started with. The
+	// sensor is configured once, at spawn, so this is the only place a change can
+	// be held until there is a process to hand it to.
+	cfg gs.Config
+	// configured records whether cfg came from the server or is still the
+	// placeholder. Nothing is captured before it is true — see configuredCh.
+	configured bool
+	// configuredCh is closed by the first SetConfig of the process. Run waits on
+	// it before spawning anything, so an agent that has not been told what it may
+	// capture captures nothing.
+	configuredCh chan struct{}
+	// restart stops the sensor run in progress so the loop can spawn a new one
+	// with a changed configuration. Nil while no run is in flight.
+	restart context.CancelFunc
+	// reconfigured records that the run that just ended was stopped on purpose by
+	// SetConfig. A restart the agent asked for is not a sensor failure: it must
+	// not count toward the failure streak, grow the backoff, or delay the
+	// replacement, all of which would punish the sensor for doing as it was told.
+	reconfigured bool
+
 	reasonMu sync.Mutex
 	// reason is the last failure the sensor named on its own way out. The process
 	// exit code says only that it stopped; this says why, in the vocabulary the
@@ -534,10 +639,120 @@ type Supervisor struct {
 
 // NewSupervisor returns a supervisor for the sensor at path. emit delivers
 // lifecycle events; it may be nil, and is called from the supervisor goroutine.
+//
+// The supervisor starts unconfigured and captures nothing until SetConfig is
+// called; the placeholder configuration below exists only so a run started by
+// mistake would still be a well-formed one.
 func NewSupervisor(path string, emit func(telemetry.Event)) *Supervisor {
-	s := &Supervisor{path: path, emit: emit}
+	s := &Supervisor{
+		path:         path,
+		emit:         emit,
+		cfg:          gs.Config{Type: gs.TypeConfig, Proto: ProtoVersion, Mode: gs.ModeAll},
+		configuredCh: make(chan struct{}),
+	}
 	s.run = s.runOnce
 	return s
+}
+
+// SetConfig installs the configuration the sensor captures under, starting or
+// restarting a sensor as needed to hand it over.
+//
+// The restart is the mechanism: a sensor is configured once, at spawn, so a
+// changed mode or profile list can only reach it through a new process. That is
+// deliberate — it keeps the sensor free of reconfiguration state and keeps every
+// second of a capture run described by one set of rules. The run the player is
+// having survives it, because a process that comes back inside the revive window
+// resumes its run rather than starting another (see reviveWindow).
+//
+// The FIRST call is also what releases Run to spawn anything at all (see
+// waitForConfig), so it is never filtered out as a no-op change however closely
+// it resembles the placeholder.
+//
+// Type and Proto are stamped here rather than trusted from the caller: they
+// describe the protocol this build speaks, which is not something a caller
+// assembling profiles has any business deciding.
+func (s *Supervisor) SetConfig(cfg gs.Config) {
+	cfg.Type, cfg.Proto = gs.TypeConfig, ProtoVersion
+
+	s.cfgMu.Lock()
+	first := !s.configured
+	if !first && reflect.DeepEqual(s.cfg, cfg) {
+		// The server re-pushes the whole configuration on every reconnect and on
+		// every unrelated edit. Restarting the sensor for a configuration it is
+		// already running would interrupt capture for no reason at all.
+		s.cfgMu.Unlock()
+		return
+	}
+	s.cfg, s.configured = cfg, true
+	restart := s.restart
+	s.reconfigured = restart != nil
+	s.cfgMu.Unlock()
+
+	if first {
+		close(s.configuredCh)
+	}
+	if restart != nil {
+		restart()
+	}
+}
+
+// waitForConfig blocks until the server's first game configuration arrives, or
+// ctx ends. It reports whether a configuration was received.
+//
+// Nothing is captured before that point, and the reason is the site's own
+// privacy setting: a site that has named its games and turned off "record
+// everything else" means it, and an agent that captured every presenting window
+// for the seconds — or, with the server unreachable, the hours — before the
+// first push would be overriding that decision precisely when nobody could see
+// it happening. Recording only what has been asked for is the conservative
+// default, and the WAL keeps whatever is recorded, so there is no such thing as
+// capturing "just until the push arrives".
+//
+// It also matches how the probe side already behaves: nothing here is persisted
+// across restarts (the data directory holds the key, the credential and the
+// WAL), so the collectors likewise sit with no targets until a DesiredState
+// arrives. Both halves of the agent wait to be told what to do.
+func (s *Supervisor) waitForConfig(ctx context.Context) bool {
+	select {
+	case <-s.configuredCh:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// currentConfig returns the configuration to start a sensor with.
+func (s *Supervisor) currentConfig() gs.Config {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return s.cfg
+}
+
+// configLine returns the single line the agent writes to a freshly spawned
+// sensor's stdin, newline included.
+func (s *Supervisor) configLine() ([]byte, error) {
+	b, err := json.Marshal(s.currentConfig())
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+// beginRun registers the cancel that SetConfig uses to stop this run, and clears
+// the flag the previous run left behind.
+func (s *Supervisor) beginRun(cancel context.CancelFunc) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.restart, s.reconfigured = cancel, false
+}
+
+// finishRun unregisters the run's cancel and reports whether it was a
+// configuration change that ended it.
+func (s *Supervisor) finishRun() bool {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.restart = nil
+	return s.reconfigured
 }
 
 // setReason records the failure the sensor named for itself.
@@ -595,7 +810,15 @@ const failuresBeforeEvent = 3
 // ceiling, because the conditions that stop it (a game exiting, a driver
 // hiccup, a transient permission change) are the kind that come back on their
 // own, and a permanent stop would need an agent restart to recover from.
+//
+// It spawns nothing until the server's first game configuration arrives — see
+// waitForConfig. A SetConfig that happened before Run was called satisfies that
+// immediately.
 func (s *Supervisor) Run(ctx context.Context) {
+	if !s.waitForConfig(ctx) {
+		return
+	}
+
 	backoff := backoffMin
 	failures := 0
 	reported := false
@@ -603,8 +826,15 @@ func (s *Supervisor) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		s.takeReason() // a new run does not inherit the last one's failure
 
+		// Each run gets its own context so a configuration change can end that run
+		// alone: cancelling it takes the ordinary stop path (stdin closes, the
+		// sensor shuts its trace session down cleanly), and the loop then spawns a
+		// replacement carrying the new configuration.
+		runCtx, stopRun := context.WithCancel(ctx)
+		s.beginRun(stopRun)
+
 		errCh := make(chan error, 1)
-		go func() { errCh <- s.run(ctx) }()
+		go func() { errCh <- s.run(runCtx) }()
 
 		// Health is a property of a run that is *still going*, not of one that
 		// ended. A working sensor runs until the agent stops it, so waiting for the
@@ -628,6 +858,8 @@ func (s *Supervisor) Run(ctx context.Context) {
 			// sensor actually stops.
 			err = <-errCh
 		}
+		reconfigured := s.finishRun()
+		stopRun()
 		// The sensor is gone, so nothing is observing the game any more. Closing the
 		// run here rather than waiting for a status that will never come is what
 		// keeps a restart from stitching the seconds either side of the gap into one
@@ -635,6 +867,13 @@ func (s *Supervisor) Run(ctx context.Context) {
 		s.endRun()
 		if ctx.Err() != nil {
 			return
+		}
+		if reconfigured {
+			// The agent stopped this sensor to hand it a new configuration. Nothing
+			// failed, so nothing is counted, reported, or waited out: the replacement
+			// starts immediately, and the game the player is in the middle of resumes
+			// into the same run.
+			continue
 		}
 
 		if !wasHealthy {

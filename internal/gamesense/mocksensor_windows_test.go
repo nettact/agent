@@ -3,11 +3,18 @@
 package gamesense
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
+
+	gs "github.com/nettact/protocol/gamesense"
 )
 
 // This file is the contract test for the spawn path. The sensor component is
@@ -22,11 +29,67 @@ import (
 
 const mockEnv = "NETTACT_GAMESENSE_MOCK"
 
+// mockConfigEnv names a file the mock writes the config line it was given to, so
+// a test can assert on what the agent actually sent rather than only on the fact
+// that the sensor accepted something.
+const mockConfigEnv = "NETTACT_GAMESENSE_MOCK_CONFIG"
+
 func TestMain(m *testing.M) {
 	if scenario := os.Getenv(mockEnv); scenario != "" {
 		os.Exit(runMockSensor(scenario, os.Args[1:]))
 	}
 	os.Exit(m.Run())
+}
+
+// mockBadStartup is the exit code the mock uses when the agent failed its half of
+// the startup contract — wrong argv, or a missing or malformed config line.
+const mockBadStartup = 3
+
+// acceptConfig plays the sensor's side of run startup: check the argv, then read
+// the one config line the agent must write to stdin before anything is captured.
+// It returns the reader so the caller can go on waiting for the EOF that means
+// stop.
+//
+// This is the strict half of the contract on purpose. A sensor that started
+// capturing without a config would be guessing at the tracking mode, which is
+// the difference between recording the games a site asked for and recording
+// every window on the machine.
+func acceptConfig(args []string) (*bufio.Reader, bool) {
+	want := []string{"--run", "--proto", strconv.Itoa(gs.ProtoVersion)}
+	if len(args) != len(want) {
+		fmt.Fprintf(os.Stderr, "mock sensor: argv %v, want %v\n", args, want)
+		return nil, false
+	}
+	for i, a := range args {
+		if a != want[i] {
+			fmt.Fprintf(os.Stderr, "mock sensor: argv %v, want %v\n", args, want)
+			return nil, false
+		}
+	}
+
+	stdin := bufio.NewReader(os.Stdin)
+	line, err := stdin.ReadBytes('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mock sensor: no config line: %v\n", err)
+		return nil, false
+	}
+	var cfg gs.Config
+	if err := json.Unmarshal(line, &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "mock sensor: unparseable config line: %v\n", err)
+		return nil, false
+	}
+	if cfg.Type != gs.TypeConfig || cfg.Proto != gs.ProtoVersion {
+		fmt.Fprintf(os.Stderr, "mock sensor: config line is %q/proto %d, want %q/proto %d\n",
+			cfg.Type, cfg.Proto, gs.TypeConfig, gs.ProtoVersion)
+		return nil, false
+	}
+	if path := os.Getenv(mockConfigEnv); path != "" {
+		if err := os.WriteFile(path, line, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "mock sensor: record config line: %v\n", err)
+			return nil, false
+		}
+	}
+	return stdin, true
 }
 
 // runMockSensor plays one scenario as if it were nettact-sensor.exe.
@@ -36,13 +99,17 @@ func runMockSensor(scenario string, args []string) int {
 	switch scenario {
 	case "ok":
 		if probing {
-			fmt.Println(`{"type":"probe","proto":2,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
+			fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
 			return 0
+		}
+		stdin, ok := acceptConfig(args)
+		if !ok {
+			return mockBadStartup
 		}
 		// The capabilities are stated, not promised: hello is written once the
 		// frame source is open and its query registered, so by here the sensor
 		// knows which optional fields its seconds will carry.
-		fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+		fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
 			`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`)
 		fmt.Println(`{"type":"status","state":"tracking","pid":4242,"proc":"mock.exe","title":"Mock Game"}`)
 		for i := 0; i < 3; i++ {
@@ -57,19 +124,23 @@ func runMockSensor(scenario string, args []string) int {
 				`"present":{"mode":"hardware_independent_flip","sync":0,"tearing":false,"api":"dxgi"}}`+"\n",
 				i, 60+i, 59+i, 60+i, 58+i)
 		}
-		// Wait for the agent to close stdin — the documented stop signal.
-		_, _ = os.Stdin.Read(make([]byte, 1))
+		// Wait for the agent to close stdin — the documented stop signal, which is
+		// why the pipe the config arrived on is kept open and read to its end.
+		_, _ = io.Copy(io.Discard, stdin)
 		return 0
 
 	case "blocked":
 		if probing {
-			fmt.Println(`{"type":"probe","proto":2,"sensor_version":"0.2.0-mock","ok":false,` +
+			fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":false,` +
 				`"reason":"service_unavailable"}`)
 			return 0
 		}
+		if _, ok := acceptConfig(args); !ok {
+			return mockBadStartup
+		}
 		// A hello with no source is a run that failed to start; the status that
 		// follows carries the reason, and the sensor gives up.
-		fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock"}`)
+		fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock"}`)
 		fmt.Println(`{"type":"status","state":"error","reason":"service_unavailable"}`)
 		return 4
 
@@ -89,7 +160,10 @@ func runMockSensor(scenario string, args []string) int {
 		return 0
 
 	case "runcrash":
-		fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+		if _, ok := acceptConfig(args); !ok {
+			return mockBadStartup
+		}
+		fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
 			`"caps":["displayed"]}`)
 		fmt.Println(`{"type":"status","state":"tracking","pid":1,"proc":"mock.exe","title":"Mock Game"}`)
 		fmt.Println(`{"type":"sec","ts":"2026-08-01T12:00:00Z","pid":1,"proc":"mock.exe",` +
@@ -212,6 +286,65 @@ func TestRunOnceRecordsFromMockSensor(t *testing.T) {
 	}
 	if buckets[0].Hist.Layout != "log24_v1" || len(buckets[0].Hist.Counts) != 24 {
 		t.Fatalf("first bucket histogram = %+v", buckets[0].Hist)
+	}
+}
+
+// The spawn path's other half: the sensor is handed its configuration on stdin
+// before it captures anything, and the pipe stays open afterwards so closing it
+// is still what stops the run.
+func TestRunOnceSendsTheConfigurationOnStdin(t *testing.T) {
+	s := NewSupervisor(self(t, "ok"), nil)
+	recorded := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv(mockConfigEnv, recorded)
+
+	s.SetConfig(gs.Config{
+		GPU:  true,
+		Mode: gs.ModeProfiles,
+		Profiles: []gs.ConfigProfile{
+			{ID: "p1", Exe: []string{"mock.exe"}, TargetFPS: 144, Tier: gs.TierDiag},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.runOnce(ctx) }()
+
+	deadline := time.After(10 * time.Second)
+	for len(s.peek()) < 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("sensor exited early: %v", err)
+		case <-deadline:
+			t.Fatal("timed out waiting for the sensor to produce a second")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runOnce did not return after cancellation")
+	}
+
+	line, err := os.ReadFile(recorded)
+	if err != nil {
+		t.Fatalf("the sensor recorded no config line: %v", err)
+	}
+	var got gs.Config
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("config line %q: %v", line, err)
+	}
+	if got.Type != gs.TypeConfig || got.Proto != ProtoVersion {
+		t.Errorf("config = %+v, want %q at proto %d", got, gs.TypeConfig, ProtoVersion)
+	}
+	if got.Mode != gs.ModeProfiles || !got.GPU {
+		t.Errorf("config = %+v, want the mode and gpu flag it was given", got)
+	}
+	if len(got.Profiles) != 1 || got.Profiles[0].ID != "p1" ||
+		len(got.Profiles[0].Exe) != 1 || got.Profiles[0].Exe[0] != "mock.exe" ||
+		got.Profiles[0].TargetFPS != 144 || got.Profiles[0].Tier != gs.TierDiag {
+		t.Errorf("profiles = %+v, want the one it was given intact", got.Profiles)
 	}
 }
 

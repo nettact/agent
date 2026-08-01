@@ -117,6 +117,19 @@ type IntervalSetter interface {
 	SetIntervals(base, regular time.Duration)
 }
 
+// GameApplier receives the site's game-capture configuration from DesiredState
+// pushes. It is a second, independent configuration axis: game profiles and
+// probe targets change at unrelated times and carry their own version numbers,
+// so they are applied through separate hooks rather than one "here is the new
+// state" call (see applyPush).
+//
+// Applying the same configuration twice must be harmless — the implementation
+// is expected to compare before acting, because acting means restarting the
+// sensor process.
+type GameApplier interface {
+	ApplyGameConfig(cfg pcfg.GameConfig)
+}
+
 // Deps are the agent-side components the session drives.
 type Deps struct {
 	Outbox        *wal.Store
@@ -134,6 +147,11 @@ type Deps struct {
 	// proxy set the collectors will actually dial through. Nil disables proxying: a
 	// pinned target then evaluates as proxy-missing rather than dialing directly.
 	Proxies *proxydial.Manager
+
+	// Game applies the pushed game-capture configuration. Nil when this build has
+	// no game sensor to configure — the ordinary case for an install that does not
+	// ship one — in which case the game half of a push is simply not acted on.
+	Game GameApplier
 
 	// Effective/Granted/Supported are the agent's permission views, used to
 	// classify each requested snapshot scope (collected/denied/unsupported).
@@ -209,8 +227,10 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		dialer: opts.Dialer,
 		// Start behind any real version so the server's unconditional
 		// on-connect DesiredState push is always applied, even after an agent
-		// restart where the server thinks we are current.
+		// restart where the server thinks we are current. Both axes start there
+		// for the same reason.
 		appliedConfigVersion: -1,
+		appliedGameVersion:   -1,
 	}
 
 	bo := &backoff{base: opts.backoffBase, cap: opts.backoffCap}
@@ -247,15 +267,20 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 	}
 }
 
-// runner holds the state that survives across sessions. appliedConfigVersion
-// is in-memory only and touched exclusively by the session goroutine.
+// runner holds the state that survives across sessions. The applied-version
+// counters are in-memory only and touched exclusively by the session goroutine.
 type runner struct {
 	opts   Options
 	deps   Deps
 	dialer wire.Dialer
 
 	appliedConfigVersion int
-	lastSnapshotAt       time.Time
+	// appliedGameVersion is the game-configuration serial this process has
+	// installed. It is a separate counter because the server bumps it
+	// separately: a profile edit leaves ConfigVersion untouched, and a monitor
+	// edit leaves this untouched (see applyPush).
+	appliedGameVersion int
+	lastSnapshotAt     time.Time
 }
 
 // session runs one connection lifecycle: dial, Hello, then the frame loop
@@ -579,8 +604,8 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-
 }
 
 // applyPush handles one server push. Runs only on the session goroutine, so
-// config application and appliedConfigVersion stay race-free. DesiredState and
-// the host SnapshotRequest are served inline (unchanged); the incident-snapshot
+// config application and the applied-version guards stay race-free. DesiredState
+// and the host SnapshotRequest are served inline (unchanged); the incident-snapshot
 // and traceroute requests are dispatched to a background worker and answered
 // asynchronously via aw.resultCh, so this call returns immediately and the WAL
 // drain/ack/config/monitor-status flow is never blocked by diagnostic work.
@@ -588,57 +613,22 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 	switch {
 	case f.DesiredState != nil:
 		ds := f.DesiredState
-		// Guard against out-of-order delivery: the server's fan-out builds
-		// DesiredState on independent goroutines, so a push carrying version N
-		// can arrive after N+1 was already applied. Applying it would silently
-		// regress targets/intervals; equal versions re-apply harmlessly.
-		if ds.ConfigVersion < r.appliedConfigVersion {
-			log.Printf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
-			return nil
+		// One push, two independent configuration axes. The probe half and the
+		// game half carry their own serials and are bumped by unrelated edits, so
+		// a frame can be stale on one and fresh on the other: renaming a game
+		// profile re-pushes an unchanged ConfigVersion, and adding a monitor
+		// re-pushes an unchanged game Version. Each half is therefore guarded
+		// separately — a stale probe version must not skip a fresh game block, and
+		// vice versa.
+		//
+		// The game half goes first because it writes nothing to the socket and
+		// cannot fail: putting it after the probe half would let a MonitorStatus
+		// write failure (which ends the session) swallow a configuration the agent
+		// has already been handed.
+		r.applyGameConfig(ds.Game)
+		if err := r.applyProbeConfig(sessionCtx, c, ds); err != nil {
+			return err
 		}
-		// Reconcile the egress proxies FIRST. Two reasons for the ordering: monitor
-		// evaluation below needs the live proxy set to decide whether each pinned
-		// target is runnable at all, and a proxy whose generation changed must be torn
-		// down before the collectors are handed targets that reference it — otherwise
-		// the first cycle of the new generation could still ride the old tunnel or the
-		// old credentials.
-		if r.deps.Proxies != nil {
-			r.deps.Proxies.Apply(ds.Proxies)
-		}
-		// Evaluate every monitor against effective permissions and target policy.
-		// Only the runnable subset reaches the collectors, so a permission/target
-		// blocked monitor is never scheduled and produces no synthetic failure.
-		runnable := ds.ProbeTargets
-		var frame *wire.MonitorStatus
-		if r.deps.Tracker != nil {
-			run, f := r.deps.Tracker.ApplyDesired(ds.ConfigVersion, ds.ProbeTargets)
-			runnable = run
-			frame = &f
-		}
-		// Install this generation in the collectors and scheduler and advance the
-		// stale-version guard BEFORE attesting it: the full-state MonitorStatus frame
-		// must describe a generation the agent is actually running, never one that is
-		// merely evaluated. appliedConfigVersion moves in lockstep with the targets/
-		// intervals now in place, so a subsequent stale-config guard reflects what is
-		// truly installed.
-		for _, cfg := range r.deps.Configurables {
-			cfg.SetTargets(runnable)
-		}
-		r.deps.Scheduler.SetIntervals(
-			time.Duration(ds.Intervals.BaseSeconds)*time.Second,
-			time.Duration(ds.Intervals.RegularSeconds)*time.Second,
-		)
-		r.appliedConfigVersion = ds.ConfigVersion
-		// Emit the full-state MonitorStatus only after applying config (covers the
-		// reconnect/restart reevaluation for free). A write failure here is reported
-		// after the generation is fully installed, so a reconnect re-attests state
-		// consistent with what the agent is running.
-		if frame != nil {
-			if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: frame}); werr != nil {
-				return fmt.Errorf("write monitor status: %w", werr)
-			}
-		}
-		log.Printf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
 
 	case f.SnapshotRequest != nil:
 		req := f.SnapshotRequest
@@ -657,6 +647,87 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 	case f.TraceRequest != nil:
 		r.dispatchTrace(sessionCtx, aw, *f.TraceRequest)
 	}
+	return nil
+}
+
+// applyGameConfig installs the pushed game-capture configuration, if it is new
+// enough to be worth installing. A nil block means the server has nothing to say
+// about game capture on this push, which is not the same as an empty one — the
+// latter is a deliberate "no profiles, record everything" and does get applied.
+//
+// Runs on the session goroutine, so appliedGameVersion needs no locking.
+func (r *runner) applyGameConfig(game *pcfg.GameConfig) {
+	if game == nil || r.deps.Game == nil {
+		return
+	}
+	// Same out-of-order guard as the probe axis, on this axis's own serial.
+	// Equal versions re-apply: the applier compares the resulting sensor
+	// configuration and only acts on a real change, so a repeat costs nothing.
+	if game.Version < r.appliedGameVersion {
+		log.Printf("ignoring stale game config v%d (v%d already applied)", game.Version, r.appliedGameVersion)
+		return
+	}
+	r.deps.Game.ApplyGameConfig(*game)
+	r.appliedGameVersion = game.Version
+	log.Printf("applied game config v%d: %d profiles (record unmatched=%v)",
+		game.Version, len(game.Profiles), game.RecordUnmatched)
+}
+
+// applyProbeConfig installs the monitoring half of a DesiredState push: proxies,
+// probe targets and tier intervals, followed by the full-state MonitorStatus
+// frame attesting the generation now running.
+func (r *runner) applyProbeConfig(sessionCtx context.Context, c wire.Conn, ds *pcfg.DesiredState) error {
+	// Guard against out-of-order delivery: the server's fan-out builds
+	// DesiredState on independent goroutines, so a push carrying version N
+	// can arrive after N+1 was already applied. Applying it would silently
+	// regress targets/intervals; equal versions re-apply harmlessly.
+	if ds.ConfigVersion < r.appliedConfigVersion {
+		log.Printf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
+		return nil
+	}
+	// Reconcile the egress proxies FIRST. Two reasons for the ordering: monitor
+	// evaluation below needs the live proxy set to decide whether each pinned
+	// target is runnable at all, and a proxy whose generation changed must be torn
+	// down before the collectors are handed targets that reference it — otherwise
+	// the first cycle of the new generation could still ride the old tunnel or the
+	// old credentials.
+	if r.deps.Proxies != nil {
+		r.deps.Proxies.Apply(ds.Proxies)
+	}
+	// Evaluate every monitor against effective permissions and target policy.
+	// Only the runnable subset reaches the collectors, so a permission/target
+	// blocked monitor is never scheduled and produces no synthetic failure.
+	runnable := ds.ProbeTargets
+	var frame *wire.MonitorStatus
+	if r.deps.Tracker != nil {
+		run, f := r.deps.Tracker.ApplyDesired(ds.ConfigVersion, ds.ProbeTargets)
+		runnable = run
+		frame = &f
+	}
+	// Install this generation in the collectors and scheduler and advance the
+	// stale-version guard BEFORE attesting it: the full-state MonitorStatus frame
+	// must describe a generation the agent is actually running, never one that is
+	// merely evaluated. appliedConfigVersion moves in lockstep with the targets/
+	// intervals now in place, so a subsequent stale-config guard reflects what is
+	// truly installed.
+	for _, cfg := range r.deps.Configurables {
+		cfg.SetTargets(runnable)
+	}
+	r.deps.Scheduler.SetIntervals(
+		time.Duration(ds.Intervals.BaseSeconds)*time.Second,
+		time.Duration(ds.Intervals.RegularSeconds)*time.Second,
+	)
+	r.appliedConfigVersion = ds.ConfigVersion
+	// Emit the full-state MonitorStatus only after applying config (covers the
+	// reconnect/restart reevaluation for free). A write failure here is reported
+	// after the generation is fully installed, so a reconnect re-attests state
+	// consistent with what the agent is running.
+	if frame != nil {
+		if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: frame}); werr != nil {
+			return fmt.Errorf("write monitor status: %w", werr)
+		}
+	}
+	log.Printf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
 	return nil
 }
 

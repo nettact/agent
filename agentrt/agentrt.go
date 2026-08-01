@@ -46,6 +46,7 @@ import (
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
 	protoenroll "github.com/nettact/protocol/enroll"
+	gs "github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
@@ -506,6 +507,15 @@ func Run(ctx context.Context, cfg Config) error {
 			_, _ = outbox.Append(wal.Records{Events: []telemetry.Event{ev}})
 		})
 	}
+	// The game profiles arrive on the same DesiredState push as the probe targets
+	// but on their own version axis, so the session applies them through their own
+	// hook. Left nil when there is no sensor to configure — an agent that cannot
+	// capture frames has nothing to do with a profile list, and a hook that exists
+	// only to discard what it is given would be one more thing to keep honest.
+	var gameApplier conn.GameApplier
+	if gameSensor != nil {
+		gameApplier = gameConfigApplier{sensor: gameSensor}
+	}
 	sched := scheduler.New(tiered, selfSched, sink)
 
 	// Ordered shutdown, in this exact order: cancel runCtx so the scheduler and
@@ -672,6 +682,7 @@ func Run(ctx context.Context, cfg Config) error {
 		DrainInterval:       cfg.UploadInterval,
 		Tracker:             tracker,
 		Proxies:             proxies,
+		Game:                gameApplier,
 		Effective:           effective,
 		Granted:             granted,
 		Supported:           supported,
@@ -749,6 +760,58 @@ func platformIndependentSupported() permission.Set {
 		permission.HostConnectionRemoteRead,
 		permission.HostConnectionOwnerRead,
 	)
+}
+
+// gameConfigApplier hands the site's pushed game configuration to the sensor
+// supervisor. It is the whole of the agent's game-configuration policy: the
+// server states what the site wants, and the translation into what the sensor is
+// told happens here, once.
+type gameConfigApplier struct{ sensor *gamesense.Supervisor }
+
+// ApplyGameConfig installs the pushed configuration. The supervisor compares it
+// against what the sensor is already running, so a re-push of an unchanged
+// configuration — which is most of them — costs nothing.
+func (a gameConfigApplier) ApplyGameConfig(cfg pcfg.GameConfig) {
+	a.sensor.SetConfig(sensorConfig(cfg))
+}
+
+// sensorConfig translates the site's game configuration into the sensor's.
+//
+// The mode is derived here rather than pushed, because it is the site's
+// record-unmatched setting under another name: "do not record processes that
+// match no profile" IS strict tracking. The profile count deliberately does not
+// enter into it. A site that turns the setting off before naming its first game
+// — or deletes its last profile while it is off — has said that nothing
+// unmatched may be recorded, and with no profiles nothing matches, so the
+// correct outcome is that nothing is captured at all. Falling back to recording
+// everything in that window would override the one setting that exists to
+// prevent it, at exactly the moment the site has nothing else to say. Capture
+// resumes the moment a profile is created. Out of the box the setting is on, so
+// a fresh site still records everything.
+//
+// Name and MonitorIDs are deliberately dropped: neither changes what the sensor
+// does, and a field the sensor carries without reading is a field that can drift.
+func sensorConfig(cfg pcfg.GameConfig) gs.Config {
+	mode := gs.ModeAll
+	if !cfg.RecordUnmatched {
+		mode = gs.ModeProfiles
+	}
+	var profiles []gs.ConfigProfile
+	for _, p := range cfg.Profiles {
+		profiles = append(profiles, gs.ConfigProfile{
+			ID:        p.ID,
+			Exe:       p.Exe,
+			TargetFPS: p.TargetFPS,
+			Tier:      p.Tier,
+		})
+	}
+	return gs.Config{
+		// GPU stays off until the adapter-telemetry work lands: the flag says the
+		// sensor may read GPU telemetry, and nothing on either side collects it yet.
+		GPU:      false,
+		Mode:     mode,
+		Profiles: profiles,
+	}
 }
 
 // hostMetricsEnabled reports whether any host.* metric family is effective.

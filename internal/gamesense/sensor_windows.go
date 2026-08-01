@@ -112,6 +112,25 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		defer windows.CloseHandle(job)
 	}
 
+	// The configuration is the first and only thing the agent writes: the sensor
+	// waits for it before opening a capture session, because the mode decides
+	// which processes it may report at all. The pipe stays open afterwards —
+	// closing it is still the stop signal, and nothing else is ever sent.
+	//
+	// A sensor that cannot be told what to capture is not a sensor that should be
+	// left running, so a failed write ends the run like any other startup failure
+	// and the supervisor restarts it.
+	line, err := s.configLine()
+	if err == nil {
+		_, err = stdin.Write(line)
+	}
+	if err != nil {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("send sensor config: %w", err)
+	}
+
 	go logDiagnostics(stderr)
 
 	// Read on this goroutine so the run lasts exactly as long as the sensor's

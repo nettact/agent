@@ -2,12 +2,14 @@ package gamesense
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,7 +37,7 @@ func secLine(ts, proc string, pid int) string {
 }
 
 func TestParseProbeLineAcceptsAWorkingSensor(t *testing.T) {
-	got := parseProbeLine([]byte(`{"type":"probe","proto":2,"sensor_version":"0.2.0",` +
+	got := parseProbeLine([]byte(`{"type":"probe","proto":3,"sensor_version":"0.2.0",` +
 		`"ok":true,"pm_version":"2.3.0"}`))
 	if !got.OK {
 		t.Fatalf("probe = %+v, want OK", got)
@@ -59,7 +61,7 @@ func TestParseProbeLineKeepsBlockedReason(t *testing.T) {
 	} {
 		t.Run(want, func(t *testing.T) {
 			got := parseProbeLine([]byte(fmt.Sprintf(
-				`{"type":"probe","proto":2,"sensor_version":"0.2.0","ok":false,"reason":%q}`, want)))
+				`{"type":"probe","proto":3,"sensor_version":"0.2.0","ok":false,"reason":%q}`, want)))
 			if got.OK {
 				t.Fatalf("probe = %+v, want not OK", got)
 			}
@@ -75,13 +77,13 @@ func TestParseProbeLineRejectsUnusableAnswers(t *testing.T) {
 		name, line, wantReason string
 	}{
 		{"garbage", `not json at all`, ReasonProbeFailed},
-		{"wrong type", `{"type":"hello","proto":2}`, ReasonProbeFailed},
+		{"wrong type", `{"type":"hello","proto":3}`, ReasonProbeFailed},
 		{"empty", ``, ReasonProbeFailed},
 		{"newer protocol", `{"type":"probe","proto":99,"ok":true}`, ReasonProtoMismatch},
 		{"older protocol", `{"type":"probe","proto":1,"ok":true}`, ReasonProtoMismatch},
 		// The sensor says it cannot capture but does not say why. Still blocked,
 		// and still given a code rather than an empty reason.
-		{"unexplained", `{"type":"probe","proto":2,"ok":false}`, ReasonProbeFailed},
+		{"unexplained", `{"type":"probe","proto":3,"ok":false}`, ReasonProbeFailed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,14 +101,14 @@ func TestParseProbeLineRejectsUnusableAnswers(t *testing.T) {
 func TestConsumeBucketsSecondsAndSkipsNoise(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
 	s.consume(strings.NewReader(strings.Join([]string{
-		`{"type":"hello","proto":2,"sensor_version":"0.2.0","source":"presentmon_service",` +
+		`{"type":"hello","proto":3,"sensor_version":"0.2.0","source":"presentmon_service",` +
 			`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`,
 		`{"type":"status","state":"tracking","pid":42,"proc":"game.exe","title":"Deep Rock Galactic"}`,
 		secLine("2026-08-01T12:00:00.500Z", "game.exe", 42),
 		`{"type":"sec"`, // truncated line: skipped, must not end the stream
 		`this is not json`,
 		// A message type this build does not know is ignored, not fatal.
-		`{"type":"gpu","proto":2,"temp_c":71}`,
+		`{"type":"gpu","proto":3,"temp_c":71}`,
 		secLine("2026-08-01T12:00:01.500Z", "game.exe", 42),
 	}, "\n")))
 
@@ -460,8 +462,8 @@ func TestAProcessQuietPastTheWindowStartsFresh(t *testing.T) {
 	// Park it, then move the clock past the window before it returns.
 	s.mu.Lock()
 	s.parkCurrent(time.Now().UTC())
-	for _, run := range s.parked {
-		run.LastSeenAt = time.Now().UTC().Add(-2 * reviveWindow)
+	for _, parked := range s.parked {
+		parked.run.LastSeenAt = time.Now().UTC().Add(-2 * reviveWindow)
 	}
 	s.mu.Unlock()
 
@@ -617,6 +619,7 @@ func TestAStoppedSensorEndsTheRun(t *testing.T) {
 		return ctx.Err()
 	}
 
+	configure(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.Run(ctx) }()
@@ -769,6 +772,7 @@ func TestSupervisorReportsPersistentFailureOnceThenRecovery(t *testing.T) {
 		return ctx.Err()
 	}
 
+	configure(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.Run(ctx) }()
@@ -837,6 +841,7 @@ func TestFailureEventCarriesTheSensorsOwnReason(t *testing.T) {
 		return errors.New("sensor exited with code 4")
 	}
 
+	configure(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.Run(ctx) }()
@@ -888,6 +893,7 @@ func TestFailureEventFallsBackToAStableReason(t *testing.T) {
 	})
 	s.run = func(context.Context) error { return errors.New("exit status 1") }
 
+	configure(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.Run(ctx) }()
@@ -954,6 +960,7 @@ func TestSupervisorStaysQuietForOccasionalExits(t *testing.T) {
 		return ctx.Err()
 	}
 
+	configure(s)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	s.Run(ctx)
@@ -976,6 +983,7 @@ func TestSupervisorStopsOnCancel(t *testing.T) {
 		return ctx.Err()
 	}
 
+	configure(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.Run(ctx) }()
@@ -1071,6 +1079,519 @@ func TestLocateFindsNothingOffWindows(t *testing.T) {
 	}
 	if got := Probe(context.Background(), "sensor"); got.OK {
 		t.Fatalf("Probe() = %+v, want not OK", got)
+	}
+}
+
+// configure gives the supervisor the first configuration, which is what releases
+// it to spawn a sensor at all — the DesiredState push, in production. Tests
+// about the restart policy rather than the gate use it to get past the gate.
+func configure(s *Supervisor) {
+	s.SetConfig(gs.Config{Mode: gs.ModeAll})
+}
+
+// Nothing is captured until the server has said what may be captured. A site
+// that named its games and turned off "record everything else" would otherwise
+// have every window on the machine recorded for the seconds — or, with the
+// server unreachable, the hours — before the first push landed, and the WAL
+// keeps whatever is recorded. This is the same posture as the probe side, where
+// no target is persisted across restarts either.
+func TestSupervisorCapturesNothingBeforeItIsConfigured(t *testing.T) {
+	restoreSchedule(t, time.Millisecond, time.Millisecond, time.Hour)
+
+	s := NewSupervisor("sensor", nil)
+	var spawns atomic.Int32
+	spawned := make(chan struct{}, 4)
+	s.run = func(ctx context.Context) error {
+		spawns.Add(1)
+		spawned <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	select {
+	case <-spawned:
+		t.Fatal("the sensor was spawned before any configuration arrived")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	s.SetConfig(gs.Config{
+		Mode:     gs.ModeProfiles,
+		Profiles: []gs.ConfigProfile{{ID: "p1", Exe: []string{"game.exe"}, Tier: gs.TierBase}},
+	})
+	select {
+	case <-spawned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the sensor was not spawned once it was configured")
+	}
+	if got := s.currentConfig(); got.Mode != gs.ModeProfiles {
+		t.Fatalf("spawned with %+v, want the configuration that released it", got)
+	}
+	if n := spawns.Load(); n != 1 {
+		t.Fatalf("spawned %d times for one configuration, want 1", n)
+	}
+}
+
+// An agent shut down before it was ever configured — a server that was
+// unreachable for the whole session — must stop waiting and return, not leak the
+// goroutine its caller is joining on.
+func TestSupervisorStopsWhileWaitingForItsConfiguration(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	s.run = func(context.Context) error {
+		t.Error("the sensor was spawned by a supervisor that was never configured")
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.Run(ctx) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return while waiting for a configuration")
+	}
+}
+
+// The configuration usually arrives before the supervisor is even started — the
+// session applies a push as soon as it lands, and the sensor goroutine may not
+// have been scheduled yet. It must run immediately rather than wait for a second
+// push that may be an hour away.
+func TestConfigurationBeforeRunIsPickedUpImmediately(t *testing.T) {
+	restoreSchedule(t, time.Millisecond, time.Millisecond, time.Hour)
+
+	s := NewSupervisor("sensor", nil)
+	started := make(chan gs.Config, 4)
+	s.run = func(ctx context.Context) error {
+		started <- s.currentConfig()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s.SetConfig(gs.Config{
+		Mode:     gs.ModeProfiles,
+		Profiles: []gs.ConfigProfile{{ID: "p1", Exe: []string{"game.exe"}, Tier: gs.TierDiag}},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	got := nextRun(t, started)
+	if got.Mode != gs.ModeProfiles || len(got.Profiles) != 1 {
+		t.Fatalf("first run started with %+v, want the configuration set before Run", got)
+	}
+}
+
+// The sensor is configured once, at spawn, so the supervisor holds the
+// configuration between runs.
+func TestSupervisorStampsTheProtocolFieldsOnTheConfig(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+
+	// The protocol fields belong to this build, not to whoever assembled the
+	// profiles, so they are stamped rather than trusted.
+	s.SetConfig(gs.Config{Type: "nonsense", Proto: 99, Mode: gs.ModeProfiles})
+	got := s.currentConfig()
+	if got.Type != gs.TypeConfig || got.Proto != ProtoVersion {
+		t.Fatalf("config = %+v, want the protocol fields restamped", got)
+	}
+	if got.Mode != gs.ModeProfiles {
+		t.Fatalf("config = %+v, want the mode it was given", got)
+	}
+
+	// What a spawned sensor is actually handed: one JSON line, newline included.
+	line, err := s.configLine()
+	if err != nil {
+		t.Fatalf("configLine() = %v", err)
+	}
+	if len(line) == 0 || line[len(line)-1] != '\n' {
+		t.Fatalf("config line %q is not newline-terminated; the sensor reads one line", line)
+	}
+	var decoded gs.Config
+	if err := json.Unmarshal(line, &decoded); err != nil {
+		t.Fatalf("config line %q: %v", line, err)
+	}
+	if decoded.Type != gs.TypeConfig || decoded.Mode != gs.ModeProfiles {
+		t.Fatalf("config line decoded to %+v", decoded)
+	}
+}
+
+// Changing the configuration restarts the sensor, because that is the only way a
+// sensor learns a new one. The restart is not a failure: it must not be counted
+// toward the failure streak and must not wait out the backoff, or the agent would
+// punish the sensor for doing what the agent asked and leave capture off for the
+// backoff's length every time a profile is edited.
+func TestConfigChangeRestartsTheSensorWithoutAFailurePenalty(t *testing.T) {
+	// A backoff far longer than the test's patience, and a health window no run
+	// reaches: if a configuration restart were treated like a crash, the
+	// replacement would not start in time and the streak would be reported.
+	restoreSchedule(t, 10*time.Second, 10*time.Second, time.Hour)
+
+	var mu sync.Mutex
+	var failures int
+	s := NewSupervisor("sensor", func(ev telemetry.Event) {
+		if ev.Type != telemetry.EventGameSensorFailed {
+			return
+		}
+		mu.Lock()
+		failures++
+		mu.Unlock()
+	})
+
+	started := make(chan gs.Config, 16)
+	s.run = func(ctx context.Context) error {
+		started <- s.currentConfig()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	configure(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	if got := nextRun(t, started); got.Mode != gs.ModeAll {
+		t.Fatalf("first run started with %+v, want the default configuration", got)
+	}
+
+	// More restarts than the reporting threshold, so counting them as failures
+	// could not stay invisible.
+	for i := 0; i < failuresBeforeEvent+1; i++ {
+		id := fmt.Sprintf("p%d", i)
+		s.SetConfig(gs.Config{
+			Mode:     gs.ModeProfiles,
+			Profiles: []gs.ConfigProfile{{ID: id, Exe: []string{"game.exe"}, Tier: gs.TierBase}},
+		})
+		got := nextRun(t, started)
+		if got.Type != gs.TypeConfig || got.Proto != ProtoVersion {
+			t.Fatalf("restart %d ran with %+v, want the protocol fields stamped", i, got)
+		}
+		if len(got.Profiles) != 1 || got.Profiles[0].ID != id {
+			t.Fatalf("restart %d ran with %+v, want the profile just installed", i, got)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if failures != 0 {
+		t.Errorf("emitted %d failure events for %d configuration restarts, want none",
+			failures, failuresBeforeEvent+1)
+	}
+}
+
+// The server re-pushes the whole configuration on every reconnect and on every
+// unrelated edit. Restarting for a configuration the sensor is already running
+// would interrupt capture — and split nothing but the agent's own patience —
+// for no change at all.
+func TestAnUnchangedConfigurationDoesNotRestartTheSensor(t *testing.T) {
+	restoreSchedule(t, time.Millisecond, time.Millisecond, time.Hour)
+
+	s := NewSupervisor("sensor", nil)
+	started := make(chan gs.Config, 8)
+	s.run = func(ctx context.Context) error {
+		started <- s.currentConfig()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	configure(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	nextRun(t, started)
+	cfg := gs.Config{
+		Mode:     gs.ModeProfiles,
+		Profiles: []gs.ConfigProfile{{ID: "p1", Exe: []string{"game.exe"}, Tier: gs.TierDiag}},
+	}
+	s.SetConfig(cfg)
+	nextRun(t, started)
+
+	// The same configuration again, twice, including the shape the caller passed
+	// the first time.
+	s.SetConfig(cfg)
+	s.SetConfig(gs.Config{
+		Type: gs.TypeConfig, Proto: ProtoVersion,
+		Mode:     gs.ModeProfiles,
+		Profiles: []gs.ConfigProfile{{ID: "p1", Exe: []string{"game.exe"}, Tier: gs.TierDiag}},
+	})
+	select {
+	case got := <-started:
+		t.Fatalf("the sensor restarted for an unchanged configuration: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// nextRun waits for the supervisor to start a sensor and returns the
+// configuration it started with. The wait is deliberately shorter than the
+// backoff the callers set, so a restart that went through the failure path fails
+// the test rather than merely being slow.
+func nextRun(t *testing.T, started <-chan gs.Config) gs.Config {
+	t.Helper()
+	select {
+	case cfg := <-started:
+		return cfg
+	case <-time.After(2 * time.Second):
+		t.Fatal("the supervisor did not start a sensor")
+		return gs.Config{}
+	}
+}
+
+// Which game a run belongs to is the sensor's decision — it holds the profile
+// list the run is being captured under — and the agent copies it rather than
+// matching the process name again against a list it may hold a different
+// generation of.
+func TestRunCarriesTheProfileTheSensorMatched(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	s.consume(strings.NewReader(strings.Join([]string{
+		`{"type":"status","state":"tracking","pid":1,"proc":"cs2.exe","title":"CS2","profile_id":"prof-cs2"}`,
+		secLine("2026-08-01T12:00:00Z", "cs2.exe", 1),
+		// A process matching nothing is an "other process" run, which is a normal
+		// record under the record-everything mode and simply carries no profile.
+		`{"type":"status","state":"tracking","pid":2,"proc":"chrome.exe"}`,
+		secLine("2026-08-01T12:00:01Z", "chrome.exe", 2),
+	}, "\n")))
+
+	runs, _ := s.Drain()
+	if len(runs) != 2 {
+		t.Fatalf("got %d runs, want one per process: %+v", len(runs), runs)
+	}
+	if runs[0].ProfileID != "prof-cs2" {
+		t.Errorf("run = %+v, want the profile the sensor matched", runs[0])
+	}
+	if runs[1].ProfileID != "" {
+		t.Errorf("run = %+v, want no profile for a process that matched none", runs[1])
+	}
+}
+
+// A run's profile assignment never changes. It describes how the seconds already
+// collected were captured, so moving it would file a whole session under a game
+// it was not being recorded as; the session ends and a new one begins instead.
+//
+// The assignment can only change across a sensor restart — a running sensor's
+// configuration is fixed — so these tests all go through the restart path:
+// consume, endRun (park), then the next sensor's first status.
+//
+// restartWith replays that sequence and returns everything drained afterwards.
+func restartWith(t *testing.T, s *Supervisor, first, second string) ([]gs.Run, []gs.Bucket) {
+	t.Helper()
+	s.consume(strings.NewReader(first))
+	s.endRun()
+	s.consume(strings.NewReader(second))
+	return s.Drain()
+}
+
+// profileOf indexes drained runs by id, keeping the newest copy of each — the
+// drain stream is an upsert stream, so a run can appear more than once.
+func runsByID(runs []gs.Run) map[string]gs.Run {
+	byID := map[string]gs.Run{}
+	for _, r := range runs {
+		byID[r.ID] = r
+	}
+	return byID
+}
+
+// Reassigning an executable from one profile to another splits the session: the
+// seconds recorded as the first game stay recorded as the first game.
+func TestAReassignedProfileStartsANewRun(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	runs, buckets := restartWith(t, s,
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+			secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+		}, "\n"),
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-b"}`,
+			secLine("2026-08-02T01:00:10Z", "game.exe", 100),
+		}, "\n"))
+
+	byID := runsByID(runs)
+	if len(byID) != 2 {
+		t.Fatalf("recorded %d runs, want the session split at the reassignment: %+v", len(byID), runs)
+	}
+	var before, after gs.Run
+	for _, r := range byID {
+		switch r.ProfileID {
+		case "prof-a":
+			before = r
+		case "prof-b":
+			after = r
+		default:
+			t.Fatalf("run %+v carries neither profile", r)
+		}
+	}
+	if before.EndedAt == nil {
+		t.Errorf("run = %+v, want the first game's session ended at the reassignment", before)
+	}
+	if after.EndedAt != nil {
+		t.Errorf("run = %+v, want the new session still open", after)
+	}
+	if len(buckets) != 2 || buckets[0].RunID != before.ID || buckets[1].RunID != after.ID {
+		t.Fatalf("buckets = %+v, want each second on the run it was collected under", buckets)
+	}
+}
+
+// Deleting the profile a running game matched leaves what was already recorded
+// stamped with it, and records what follows as the unprofiled process it now is.
+func TestLosingTheProfileStartsANewUnprofiledRun(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	runs, _ := restartWith(t, s,
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+			secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+		}, "\n"),
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
+			secLine("2026-08-02T01:00:10Z", "game.exe", 100),
+		}, "\n"))
+
+	byID := runsByID(runs)
+	if len(byID) != 2 {
+		t.Fatalf("recorded %d runs, want the session split when the profile went away: %+v", len(byID), runs)
+	}
+	var stamped, plain int
+	for _, r := range byID {
+		if r.ProfileID == "prof-a" {
+			stamped++
+			if r.EndedAt == nil {
+				t.Errorf("run = %+v, want the profiled session ended", r)
+			}
+		} else {
+			plain++
+		}
+	}
+	if stamped != 1 || plain != 1 {
+		t.Fatalf("runs = %+v, want one still stamped and one unprofiled", runs)
+	}
+}
+
+// The mirror: a process that was knowingly matching nothing, then matches a
+// newly created profile. What was recorded as an ordinary process stays that way.
+func TestGainingAProfileStartsANewRun(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	runs, _ := restartWith(t, s,
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
+			secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+		}, "\n"),
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+			secLine("2026-08-02T01:00:10Z", "game.exe", 100),
+		}, "\n"))
+
+	byID := runsByID(runs)
+	if len(byID) != 2 {
+		t.Fatalf("recorded %d runs, want the session split when the profile appeared: %+v", len(byID), runs)
+	}
+	for _, r := range byID {
+		if r.ProfileID == "prof-a" && r.EndedAt != nil {
+			t.Errorf("run = %+v, want the newly profiled session open", r)
+		}
+		if r.ProfileID == "" && r.EndedAt == nil {
+			t.Errorf("run = %+v, want the unprofiled session ended", r)
+		}
+	}
+}
+
+// A restart that does not change the assignment is the ordinary case — an
+// unrelated profile was edited, or the sensor crashed — and must still resume the
+// one session the player is having.
+func TestAnUnchangedProfileResumesTheRun(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	runs, buckets := restartWith(t, s,
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+			secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+		}, "\n"),
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+			secLine("2026-08-02T01:00:10Z", "game.exe", 100),
+		}, "\n"))
+
+	byID := runsByID(runs)
+	if len(byID) != 1 {
+		t.Fatalf("recorded %d runs, want the session resumed across the restart: %+v", len(byID), runs)
+	}
+	for _, r := range byID {
+		if r.ProfileID != "prof-a" || r.EndedAt != nil {
+			t.Fatalf("run = %+v, want it still open and still the same game", r)
+		}
+	}
+	if len(buckets) != 2 || buckets[0].RunID != buckets[1].RunID {
+		t.Fatalf("buckets = %+v, want both seconds on the one run", buckets)
+	}
+}
+
+// A run opened by a sec line has no assignment yet — nothing has said what the
+// process matched. The status that follows fills it in place: that is the first
+// stamp, not a change, and splitting there would turn one session into two over
+// its own first second.
+func TestFirstStatusStampsARunOpenedByASecondLine(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	s.consume(strings.NewReader(strings.Join([]string{
+		secLine("2026-08-01T12:00:00Z", "game.exe", 1),
+		`{"type":"status","state":"tracking","pid":1,"proc":"game.exe","title":"A Game","profile_id":"prof-a"}`,
+		secLine("2026-08-01T12:00:01Z", "game.exe", 1),
+	}, "\n")))
+
+	runs, buckets := s.Drain()
+	byID := runsByID(runs)
+	if len(byID) != 1 {
+		t.Fatalf("recorded %d runs, want the seconds and the status on one: %+v", len(byID), runs)
+	}
+	for _, r := range byID {
+		if r.ProfileID != "prof-a" || r.Title != "A Game" {
+			t.Fatalf("run = %+v, want the first status stamped onto it", r)
+		}
+	}
+	if len(buckets) != 2 || buckets[0].RunID != buckets[1].RunID {
+		t.Fatalf("buckets = %+v, want both seconds on the one run", buckets)
+	}
+}
+
+// A sec line says nothing about the profile, so it can never split a run over
+// one — neither while the run is current nor when it is what reopens a parked
+// run whose game is already known.
+func TestSecondsNeverSplitARunOverItsProfile(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	runs, buckets := restartWith(t, s,
+		strings.Join([]string{
+			`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+			secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+			secLine("2026-08-02T01:00:01Z", "game.exe", 100),
+		}, "\n"),
+		// The replacement sensor's seconds arrive before its first status.
+		secLine("2026-08-02T01:00:10Z", "game.exe", 100))
+
+	byID := runsByID(runs)
+	if len(byID) != 1 {
+		t.Fatalf("recorded %d runs, want one: %+v", len(byID), runs)
+	}
+	for _, r := range byID {
+		if r.ProfileID != "prof-a" {
+			t.Fatalf("run = %+v, want its profile untouched by lines that never mention one", r)
+		}
+	}
+	if len(buckets) != 3 {
+		t.Fatalf("recorded %d seconds, want all three on the one run", len(buckets))
 	}
 }
 
