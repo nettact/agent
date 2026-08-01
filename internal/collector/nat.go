@@ -135,7 +135,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	rctx, cancel := context.WithTimeout(ctx, global)
 	defer cancel()
 
-	base := map[string]string{"transport": transport, "server": server}
+	base := map[string]string{telemetry.NATTransportLabel: transport, telemetry.NATServerLabel: server}
 
 	// Resolve the pinned egress proxy. A pin that cannot be honored means no probe:
 	// discovering the NAT in front of the HOST when the operator asked about the path
@@ -304,12 +304,16 @@ func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.Pr
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerWAN,
 			Severity: telemetry.SeverityWarn,
-			Message:  "NAT binding failed (" + base["transport"] + ") " + base["server"] + ": " + err.Error(),
+			Message:  "NAT binding failed (" + base[telemetry.NATTransportLabel] + ") " + base[telemetry.NATServerLabel] + ": " + err.Error(),
 			Attrs:    base,
 		})
 		return
 	}
-	okLabels := map[string]string{"transport": base["transport"], "server": base["server"], "mapped_addr": reflexive}
+	okLabels := map[string]string{
+		telemetry.NATTransportLabel: base[telemetry.NATTransportLabel],
+		telemetry.NATServerLabel:    base[telemetry.NATServerLabel],
+		"mapped_addr":               reflexive,
+	}
 	res.Metrics = append(res.Metrics,
 		telemetry.Metric{TS: now, Kind: telemetry.NATOK, Target: t.Target, Layer: telemetry.LayerWAN,
 			Value: 1, Unit: telemetry.UnitBool, Labels: okLabels, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial})
@@ -321,7 +325,7 @@ func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.Pr
 
 	// The change-gate is per monitor: two monitors probing the same server must
 	// each track their own last mapped address.
-	key := t.MonitorID + "|" + base["transport"] + "|" + t.Target
+	key := t.MonitorID + "|" + base[telemetry.NATTransportLabel] + "|" + t.Target
 	c.mu.Lock()
 	changed := c.lastMapped[key] != reflexive
 	c.lastMapped[key] = reflexive
@@ -330,7 +334,7 @@ func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.Pr
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventWANIPChanged, Layer: telemetry.LayerWAN,
 			Severity: telemetry.SeverityInfo,
-			Message:  "NAT mapped address " + reflexive + " (" + base["transport"] + ")",
+			Message:  "NAT mapped address " + reflexive + " (" + base[telemetry.NATTransportLabel] + ")",
 			Attrs:    okLabels,
 		})
 	}

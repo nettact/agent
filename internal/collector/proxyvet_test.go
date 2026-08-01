@@ -280,7 +280,7 @@ func TestDNSProxiedWithoutResolverFailsClosed(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeSOCKS5, Host: "127.0.0.1", Port: 1, ConfigSerial: 1,
 	}})
-	c := NewDNSCollector(testGuard(), mgr)
+	c := NewDNSCollector(testGuard(), mgr, nil)
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "dns", Target: "example.test", ProxyID: "prx", ConfigSerial: 1,
 	}})
@@ -404,7 +404,7 @@ func TestDoHProxiedRequestVetsResolverLocally(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeSOCKS5, Host: phost, Port: pport, ConfigSerial: 1,
 	}})
-	c := NewDNSCollector(testGuard(), mgr)
+	c := NewDNSCollector(testGuard(), mgr, nil)
 	// A hostname DoH endpoint: under local DNS the agent must resolve it and ask the
 	// proxy for the literal.
 	c.SetTargets([]pcfg.ProbeTarget{{
@@ -428,7 +428,7 @@ func TestDoHProxiedRequestVetsResolverLocally(t *testing.T) {
 // transports hold authenticated tunnels, so accumulating them leaks connections and file
 // descriptors for as long as the agent runs.
 func TestDoHClientsEvictSupersededGenerations(t *testing.T) {
-	c := NewDNSCollector(testGuard(), proxydial.NewManager(testGuard()))
+	c := NewDNSCollector(testGuard(), proxydial.NewManager(testGuard()), nil)
 	gen := func(serial int) *proxydial.Dialer {
 		return &proxydial.Dialer{Spec: pcfg.ProxySpec{ID: "prx", ConfigSerial: serial}}
 	}

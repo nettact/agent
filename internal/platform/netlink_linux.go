@@ -282,11 +282,3 @@ func parseNeighbors(msgs []syscall.NetlinkMessage) []Neighbor {
 	return out
 }
 
-func appendUnique(list []string, v string) []string {
-	for _, x := range list {
-		if x == v {
-			return list
-		}
-	}
-	return append(list, v)
-}

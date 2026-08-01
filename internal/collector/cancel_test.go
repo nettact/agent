@@ -121,7 +121,7 @@ func TestGatewayPingMidCycleAbortEmitsNothing(t *testing.T) {
 }
 
 func TestDNSCancelledRunEmitsNothing(t *testing.T) {
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "d1", Kind: "dns", Target: "example.com"},
 	})

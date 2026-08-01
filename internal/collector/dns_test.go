@@ -3,9 +3,14 @@ package collector
 import (
 	"net"
 	"testing"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 
+	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/probepolicy"
+	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
 
@@ -88,4 +93,123 @@ func TestDNSRecordResult(t *testing.T) {
 			t.Fatalf("got (%v, %d, %q)", ok, reason, detail)
 		}
 	})
+}
+
+// TestResolverLabelsNameTheDialedEndpoint pins the labels a failing DNS cycle
+// carries so the server can aim its path diagnostic at the resolver rather than
+// at the queried name (DIAG-003). The branches here must stay in lockstep with
+// Collect's protocol switch: a label naming an endpoint the query never dialed
+// would send the diagnostic somewhere the fault never was.
+func TestResolverLabelsNameTheDialedEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		params   pcfg.ProbeParams
+		wantAddr string
+		wantProt string
+	}{
+		{"udp default port", pcfg.ProbeParams{ResolverServer: "1.1.1.1"}, "1.1.1.1:53", "udp"},
+		{"udp explicit port", pcfg.ProbeParams{ResolverServer: "1.1.1.1", ResolverPort: 5353}, "1.1.1.1:5353", "udp"},
+		{"tcp default port", pcfg.ProbeParams{ResolverServer: "9.9.9.9", ResolverProtocol: "tcp"}, "9.9.9.9:53", "tcp"},
+		{"dot default port", pcfg.ProbeParams{ResolverServer: "dns.example", ResolverProtocol: "dot"}, "dns.example:853", "dot"},
+		{"dot explicit port", pcfg.ProbeParams{ResolverServer: "dns.example", ResolverProtocol: "dot", ResolverPort: 8853}, "dns.example:8853", "dot"},
+		{"doh bare host normalizes to the query URL", pcfg.ProbeParams{ResolverServer: "doh.example", ResolverProtocol: "doh"},
+			"https://doh.example/dns-query", "doh"},
+		{"doh url passes through", pcfg.ProbeParams{ResolverServer: "https://doh.example/q", ResolverProtocol: "doh"},
+			"https://doh.example/q", "doh"},
+	}
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := c.resolverLabels(pcfg.ProbeTarget{Kind: "dns", Target: "example.com", Params: tc.params}, "")
+			if got[telemetry.DNSResolverLabel] != tc.wantAddr ||
+				got[telemetry.DNSResolverProtocolLabel] != tc.wantProt {
+				t.Fatalf("resolverLabels = %v, want resolver=%q protocol=%q", got, tc.wantAddr, tc.wantProt)
+			}
+		})
+	}
+}
+
+// A DoH query that followed a redirect must name the endpoint that ANSWERED, not
+// the one configured: diagnosing the configured host could report a healthy path
+// while the endpoint that actually failed goes unexamined.
+func TestResolverLabelsFollowDoHRedirect(t *testing.T) {
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com",
+		Params: pcfg.ProbeParams{ResolverServer: "https://doh.example/dns-query", ResolverProtocol: "doh"}}
+
+	got := c.resolverLabels(target, "https://redirected.example/dns-query")
+	if got[telemetry.DNSResolverLabel] != "https://redirected.example/dns-query" {
+		t.Fatalf("resolver label = %v, want the endpoint that served the request", got)
+	}
+	// No response at all (transport error): the configured URL is the only endpoint
+	// involved, so it stands.
+	got = c.resolverLabels(target, "")
+	if got[telemetry.DNSResolverLabel] != "https://doh.example/dns-query" {
+		t.Fatalf("resolver label = %v, want the configured endpoint", got)
+	}
+}
+
+// TestResolverLabelsForSystemResolver covers the system-resolver arm: the label
+// names whatever the OS reports, and is ABSENT when the platform cannot name one
+// — the server must report the diagnostic unavailable rather than trace a guess.
+func TestResolverLabelsForSystemResolver(t *testing.T) {
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil,
+		permission.FromStrings([]string{string(permission.NetIfaceAddressRead)}))
+	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com"}
+
+	c.sysResolvers = []string{"192.0.2.53", "192.0.2.54"}
+	c.sysResolversAt = time.Now()
+	got := c.resolverLabels(target, "")
+	if got[telemetry.DNSResolverLabel] != "192.0.2.53:53" || got[telemetry.DNSResolverProtocolLabel] != "udp" {
+		t.Fatalf("system resolver labels = %v, want the first server on udp/53", got)
+	}
+
+	c.sysResolvers = nil
+	c.sysResolversAt = time.Now()
+	if got := c.resolverLabels(target, ""); got != nil {
+		t.Fatalf("unnameable system resolver produced labels %v, want none", got)
+	}
+}
+
+// Naming the system resolver means reading the host's configured DNS servers,
+// which network.interface.address.read governs. An operator who grants DNS
+// probing while withholding that permission must not get their resolver
+// configuration reported through the diagnostic label instead.
+func TestSystemResolverRequiresAddressReadPermission(t *testing.T) {
+	// Probing is granted; address read is not.
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil,
+		permission.FromStrings([]string{string(permission.ProbeDNS)}))
+	// Even with a discovery result already cached, the label must not appear.
+	c.sysResolvers = []string{"192.0.2.53"}
+	c.sysResolversAt = time.Now()
+
+	if got := c.resolverLabels(pcfg.ProbeTarget{Kind: "dns", Target: "example.com"}, ""); got != nil {
+		t.Fatalf("system resolver leaked without address-read permission: %v", got)
+	}
+
+	// A resolver the SERVER configured is exempt: echoing it back tells the server
+	// only what it already sent down.
+	got := c.resolverLabels(pcfg.ProbeTarget{Kind: "dns", Target: "example.com",
+		Params: pcfg.ProbeParams{ResolverServer: "1.1.1.1"}}, "")
+	if got[telemetry.DNSResolverLabel] != "1.1.1.1:53" {
+		t.Fatalf("configured resolver was withheld: %v", got)
+	}
+}
+
+// TestResolverLabelsAreNotShared guards the aliasing hazard in withDetail: it
+// returns its input UNCHANGED when the detail is empty, so a cached/shared map
+// would let one cycle's detail leak onto another cycle's labels.
+func TestResolverLabelsAreNotShared(t *testing.T) {
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com", Params: pcfg.ProbeParams{ResolverServer: "1.1.1.1"}}
+	first := c.resolverLabels(target, "")
+	withDetail(first, "SERVFAIL") // a cycle that had a cause
+	second := c.resolverLabels(target, "")
+	if _, leaked := second[telemetry.ProbeReasonDetailLabel]; leaked {
+		t.Fatalf("detail leaked into a later cycle's labels: %v", second)
+	}
+	first[telemetry.DNSResolverLabel] = "mutated"
+	if second[telemetry.DNSResolverLabel] != "1.1.1.1:53" {
+		t.Fatalf("labels share backing storage across cycles: %v", second)
+	}
 }

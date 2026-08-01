@@ -342,7 +342,7 @@ func Run(ctx context.Context, cfg Config) error {
 		addProbe(collector.NewPublicPingCollector(p, guard, proxies))
 	}
 	if effective.Has(permission.ProbeDNS) {
-		addProbe(collector.NewDNSCollector(guard, proxies))
+		addProbe(collector.NewDNSCollector(guard, proxies, effective))
 	}
 	if effective.Has(permission.ProbeHTTP) {
 		addProbe(collector.NewHTTPCollector(guard, proxies, effective.Has(permission.ProbeHTTPExtended)))

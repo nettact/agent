@@ -17,8 +17,10 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/internal/proxydial"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
 
@@ -39,15 +41,34 @@ type DNSCollector struct {
 	sched      *schedState
 	guard      *netguard.Guard
 	proxies    *proxydial.Manager
+	// effective gates naming the SYSTEM resolver. Discovering it means reading the
+	// host's configured DNS servers — the very data network.interface.address.read
+	// governs — so an operator who granted DNS probing while withholding that
+	// permission must not have their resolver configuration reported anyway.
+	// A resolver the server itself configured is exempt: echoing it back discloses
+	// nothing the server did not already know.
+	effective permission.Set
 
 	// dohClients caches a DoH client per proxy generation, so a re-keyed proxy gets a
 	// fresh transport instead of keeping pooled connections on the replaced egress
 	// path. Guarded by mu.
 	mu         sync.Mutex
 	dohClients map[string]*http.Client
+
+	// sysResolvers caches the OS resolver list, refreshed at most every
+	// sysResolverTTL: naming the system resolver costs a file read on Linux and an
+	// adapter-table walk on Windows, and it is needed once per failing cycle of
+	// every system-resolver monitor. Guarded by mu.
+	sysResolvers   []string
+	sysResolversAt time.Time
 }
 
-func NewDNSCollector(guard *netguard.Guard, proxies *proxydial.Manager) *DNSCollector {
+// sysResolverTTL bounds how stale a cached system-resolver list may be. The value
+// only has to beat an operator noticing a DNS reconfiguration, and every failing
+// cycle would otherwise re-read the OS.
+const sysResolverTTL = time.Minute
+
+func NewDNSCollector(guard *netguard.Guard, proxies *proxydial.Manager, effective permission.Set) *DNSCollector {
 	// DoH transport: environment proxy disabled, dials routed through the guard so
 	// the resolver endpoint (and any redirect) is policy-checked and IP-pinned.
 	doh := &http.Transport{Proxy: nil, DialContext: guard.DialContext, ForceAttemptHTTP2: true}
@@ -57,6 +78,7 @@ func NewDNSCollector(guard *netguard.Guard, proxies *proxydial.Manager) *DNSColl
 		sched:      newSchedState(pcfg.DefaultDNSInterval),
 		guard:      guard,
 		proxies:    proxies,
+		effective:  effective,
 		dohClients: map[string]*http.Client{},
 	}
 }
@@ -119,6 +141,102 @@ func (c *DNSCollector) dialFor(proxy *proxydial.Dialer) proxydial.DialFunc {
 	return proxyDialFunc(c.guard, proxy)
 }
 
+// systemResolver returns the resolver address the OS would answer through, or ""
+// when the local policy withholds it or this platform cannot name it. Cached for
+// sysResolverTTL.
+//
+// Only the FIRST entry is reported. The stdlib resolver may fail over to a later
+// server, so this is the resolver a query most likely used, not a certainty —
+// which is why the server treats it as evidence to aim a diagnostic at, never as
+// proof of which server answered.
+func (c *DNSCollector) systemResolver() string {
+	// Field-level no-call: a denied scope must not have its data read from the OS
+	// at all, not read and then withheld. Checked before the lookup, never after.
+	if !c.effective.Has(permission.NetIfaceAddressRead) {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sysResolversAt.IsZero() || time.Since(c.sysResolversAt) > sysResolverTTL {
+		c.sysResolvers = platform.SystemResolvers()
+		c.sysResolversAt = time.Now()
+	}
+	if len(c.sysResolvers) == 0 {
+		return ""
+	}
+	return c.sysResolvers[0]
+}
+
+// resolverLabels names the resolver endpoint a target's query actually dials, for
+// the error_class sample the server freezes onto fault evidence and aims its path
+// diagnostic at (DIAG-003). The branches MIRROR Collect's protocol switch — a
+// divergence here would name an endpoint the query never touched, which is worse
+// than naming none, so both must change together.
+//
+// servedBy overrides the configured DoH URL with the endpoint that actually
+// answered, which differs when the client followed a redirect; empty means the
+// configured endpoint is the only one involved. Callers that run BEFORE any query
+// (an egress that failed to resolve) pass empty.
+//
+// A fresh map per call: withDetail returns its input unchanged when the detail is
+// empty, so a shared map would let one cycle's detail leak onto another's labels.
+// Returns nil when the endpoint is unnameable (system resolver on a platform that
+// cannot report one, or one the local policy withholds) — the server renders that
+// as an unavailable diagnostic rather than tracing a guess.
+func (c *DNSCollector) resolverLabels(t pcfg.ProbeTarget, servedBy string) map[string]string {
+	server := strings.TrimSpace(t.Params.ResolverServer)
+	proto := t.Params.ResolverProtocol
+	var addr string
+	switch proto {
+	case "doh":
+		// The endpoint that answered, else the normalized query URL — either way a
+		// URL the server can read a host and port off the same way the probe did.
+		if addr = strings.TrimSpace(servedBy); addr == "" {
+			addr = dohURL(server, t.Params.ResolverPort)
+		}
+	case "dot":
+		addr = net.JoinHostPort(server, strconv.Itoa(resolverPortOr(t.Params.ResolverPort, 853)))
+	case "tcp":
+		if server == "" {
+			addr, proto = c.systemResolverAddr()
+			break
+		}
+		addr = net.JoinHostPort(server, strconv.Itoa(resolverPortOr(t.Params.ResolverPort, 53)))
+	default:
+		if server == "" {
+			addr, proto = c.systemResolverAddr()
+			break
+		}
+		addr, proto = net.JoinHostPort(server, strconv.Itoa(resolverPortOr(t.Params.ResolverPort, 53))), "udp"
+	}
+	if addr == "" {
+		return nil
+	}
+	return map[string]string{
+		telemetry.DNSResolverLabel:         addr,
+		telemetry.DNSResolverProtocolLabel: proto,
+	}
+}
+
+// systemResolverAddr is the system-resolver arm of resolverLabels: the OS server
+// on port 53, always plain UDP (the stdlib resolver's own transport choice is not
+// observable, and it starts on UDP).
+func (c *DNSCollector) systemResolverAddr() (string, string) {
+	ns := c.systemResolver()
+	if ns == "" {
+		return "", ""
+	}
+	return net.JoinHostPort(ns, "53"), "udp"
+}
+
+// resolverPortOr applies a protocol's default resolver port.
+func resolverPortOr(port, def int) int {
+	if port <= 0 {
+		return def
+	}
+	return port
+}
+
 func (c *DNSCollector) SetTargets(targets []pcfg.ProbeTarget) {
 	var names []pcfg.ProbeTarget
 	for _, t := range targets {
@@ -158,7 +276,7 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		// would answer from a resolver the operator deliberately routed away from.
 		proxy, prerr := resolveProxy(ctx, c.proxies, t)
 		if prerr != nil {
-			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.DNSOK, telemetry.DNSErrorClass, nil, prerr)...)
+			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.DNSOK, telemetry.DNSErrorClass, c.resolverLabels(t, ""), prerr)...)
 			res.Events = append(res.Events, proxyFailureEvent(now, t, "DNS query not attempted"))
 			continue
 		}
@@ -171,6 +289,9 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		// ProxyCapable refuses the combination at save time, so this is the defensive
 		// half: a drift there must not silently leak the query.
 		if proxy != nil && strings.TrimSpace(t.Params.ResolverServer) == "" {
+			// No resolver labels here on purpose: the monitor has no configured resolver,
+			// and naming the HOST's system resolver would point the diagnostic at a server
+			// this query was specifically routed away from.
 			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.DNSOK, telemetry.DNSErrorClass, nil,
 				fmt.Errorf("%w: a proxied DNS monitor needs an explicit resolver server (the system resolver cannot be relayed)",
 					proxydial.ErrProxyKindUnsupported))...)
@@ -185,11 +306,15 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		var reason int
 		var detail string
 		var derr error
+		// The endpoint a DoH query was actually served by, when a redirect moved it
+		// off the configured URL. Empty for every other protocol and whenever no
+		// response came back.
+		var servedBy string
 		switch t.Params.ResolverProtocol {
 		case "doh":
 			// DNS over HTTPS: resolver_server is an https URL or a host we turn into
 			// the conventional /dns-query endpoint.
-			ok, reason, detail, derr = c.lookupDoH(cctx, c.dohClientFor(proxy), t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
+			ok, reason, detail, servedBy, derr = c.lookupDoH(cctx, c.dohClientFor(proxy), t.Params.ResolverServer, t.Params.ResolverPort, t.Params.RecordType, t.Target)
 		case "dot":
 			// DNS over TLS on port 853 (default). Done explicitly over a TLS stream —
 			// net.Resolver cannot be forced onto TCP framing reliably.
@@ -251,8 +376,12 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 			Value: float64(reason), Unit: telemetry.UnitCode,
 			MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial,
 		}
+		// A failing cycle also names the resolver it dialed, so the server can freeze it
+		// and aim the path diagnostic at the DNS server rather than at the queried name
+		// (which nothing dials). Success cycles stay label-free, like the detail label:
+		// only the evidence behind a fault is worth storing per sample.
 		if reason != telemetry.ProbeReasonNone {
-			ec.Labels = withDetail(nil, detail)
+			ec.Labels = withDetail(c.resolverLabels(t, servedBy), detail)
 		}
 		res.Metrics = append(res.Metrics, telemetry.Metric{
 			TS: now, Kind: telemetry.DNSOK, Target: t.Target, Layer: telemetry.LayerDNS, Value: okv, Unit: telemetry.UnitBool,
@@ -478,14 +607,21 @@ func dnsRecordResult(has bool, err error, recordType string) (bool, int, string)
 // returned as a *netguard.BlockedError. Returns true when the response is NOERROR
 // with at least one answer; a failure carries its ProbeReason* code plus the raw
 // cause (transport error text, "DoH HTTP <n>", or rcode) for the detail label.
-func (c *DNSCollector) lookupDoH(ctx context.Context, client *http.Client, server string, port int, recordType, name string) (bool, int, string, error) {
+//
+// endpoint is the URL that actually SERVED the request, which differs from the
+// configured one when the client followed a redirect. The diagnostic is aimed at
+// it, so a redirected resolver is diagnosed where the failure happened rather
+// than at a first hop that was merely passed through. It is empty when no
+// response was obtained at all — the configured URL is then the only endpoint
+// involved, and the caller falls back to it.
+func (c *DNSCollector) lookupDoH(ctx context.Context, client *http.Client, server string, port int, recordType, name string) (ok bool, reason int, detail, endpoint string, err error) {
 	query, err := buildDNSQuery(name, recordType)
 	if err != nil {
-		return false, telemetry.ProbeReasonOther, errText(err), nil
+		return false, telemetry.ProbeReasonOther, errText(err), "", nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL(server, port), bytes.NewReader(query))
 	if err != nil {
-		return false, telemetry.ProbeReasonOther, errText(err), nil
+		return false, telemetry.ProbeReasonOther, errText(err), "", nil
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
@@ -493,29 +629,34 @@ func (c *DNSCollector) lookupDoH(ctx context.Context, client *http.Client, serve
 	if err != nil {
 		var be *netguard.BlockedError
 		if errors.As(err, &be) {
-			return false, telemetry.ProbeReasonOther, "", err
+			return false, telemetry.ProbeReasonOther, "", "", err
 		}
 		// The error is returned (not dropped) so the caller's ProxyReason check can see
 		// a typed proxy failure. Previously this returned nil here, which made a dead or
 		// rejecting proxy on a DoH monitor report as a generic resolver timeout — the one
 		// thing the proxy_* family exists to prevent. classifyNetError stays as the
 		// fallback for an ordinary transport error.
-		return false, classifyNetError(err), errText(err), err
+		return false, classifyNetError(err), errText(err), "", err
 	}
 	defer resp.Body.Close()
+	// resp.Request is the request that produced this response — the redirected one
+	// when the client followed redirects.
+	if resp.Request != nil && resp.Request.URL != nil {
+		endpoint = resp.Request.URL.String()
+	}
 	if resp.StatusCode != http.StatusOK {
-		return false, telemetry.ProbeReasonOther, "DoH HTTP " + strconv.Itoa(resp.StatusCode), nil
+		return false, telemetry.ProbeReasonOther, "DoH HTTP " + strconv.Itoa(resp.StatusCode), endpoint, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
 	if err != nil {
-		return false, classifyNetError(err), errText(err), nil
+		return false, classifyNetError(err), errText(err), endpoint, nil
 	}
 	var msg dnsmessage.Message
 	if err := msg.Unpack(body); err != nil {
-		return false, telemetry.ProbeReasonOther, errText(err), nil
+		return false, telemetry.ProbeReasonOther, errText(err), endpoint, nil
 	}
-	ok, reason, detail := dnsResult(&msg, recordType)
-	return ok, reason, detail, nil
+	ok, reason, detail = dnsResult(&msg, recordType)
+	return ok, reason, detail, endpoint, nil
 }
 
 // dohURL normalizes a DoH server into a query URL. A value starting with http is

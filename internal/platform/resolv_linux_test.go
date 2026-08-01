@@ -21,15 +21,27 @@ options edns0 trust-ad
 nameserver not-an-address
 nameserver
 `
-	got := parseResolvConf(strings.NewReader(body))
+	got := parseResolvConf(strings.NewReader(body), false)
 	want := []string{"192.168.1.1", "10.0.0.53", "fe80::1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("nameservers = %v, want %v (file order, deduped, zone stripped)", got, want)
 	}
 }
 
+// The diagnostic view keeps the %zone: a link-local resolver is not reachable
+// without it, so a trace aimed at the bare address would measure a path to
+// somewhere else entirely.
+func TestParseResolvConfKeepsZoneForDiagnostics(t *testing.T) {
+	body := "nameserver fe80::1%eth0\nnameserver 10.0.0.53\n"
+	got := parseResolvConf(strings.NewReader(body), true)
+	want := []string{"fe80::1%eth0", "10.0.0.53"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("nameservers = %v, want %v (zone preserved)", got, want)
+	}
+}
+
 func TestParseResolvConfEmpty(t *testing.T) {
-	if got := parseResolvConf(strings.NewReader("search example.lan\n")); len(got) != 0 {
+	if got := parseResolvConf(strings.NewReader("search example.lan\n"), false); len(got) != 0 {
 		t.Fatalf("nameservers = %v, want none", got)
 	}
 }

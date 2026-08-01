@@ -121,6 +121,18 @@ type Platform interface {
 // New returns the platform implementation for the current OS.
 func New() Platform { return newPlatform() }
 
+// appendUnique appends v unless list already holds it, preserving order. The OS
+// tables this package reads (neighbors, resolvers, per-adapter DNS) routinely
+// repeat an entry across sources, and their order is meaningful.
+func appendUnique(list []string, v string) []string {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
 // pingPayload builds an ICMP echo payload of the requested size. size <= 0 uses
 // the default 13-byte probe marker; otherwise the marker is repeated/truncated
 // to exactly size bytes (clamped to a sane maximum).
