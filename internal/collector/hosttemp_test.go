@@ -20,7 +20,17 @@ func stubSensors(t *testing.T, stats []pshost.TemperatureStat, err error) {
 	t.Helper()
 	prev := readSensors
 	readSensors = func(context.Context) ([]pshost.TemperatureStat, error) { return stats, err }
+	// Collector behavior is platform-independent; Windows production behavior
+	// has its own build-tagged test that pins the unsupported/no-read boundary.
+	enableTemperaturePlatformForTest(t)
 	t.Cleanup(func() { readSensors = prev })
+}
+
+func enableTemperaturePlatformForTest(t *testing.T) {
+	t.Helper()
+	prev := temperaturePlatformSupported
+	temperaturePlatformSupported = func() bool { return true }
+	t.Cleanup(func() { temperaturePlatformSupported = prev })
 }
 
 func TestSanitizeSensorKey(t *testing.T) {
@@ -137,6 +147,7 @@ func TestCollectTempsTargetsStayUniqueAgainstNaturalSuffixes(t *testing.T) {
 // waits out sensorTimeout, and callers after it are refused until the stuck read
 // finally returns.
 func TestCollectTempsKeepsAtMostOneReadInFlight(t *testing.T) {
+	enableTemperaturePlatformForTest(t)
 	prevTimeout := sensorTimeout
 	sensorTimeout = 20 * time.Millisecond
 	t.Cleanup(func() { sensorTimeout = prevTimeout })
@@ -258,6 +269,7 @@ func TestHostMetricsCollectorSkipsTemperatureWhenUnreadable(t *testing.T) {
 
 // A denied family must not reach the sensors at all.
 func TestHostMetricsCollectorSkipsTemperatureWhenDenied(t *testing.T) {
+	enableTemperaturePlatformForTest(t)
 	called := false
 	prev := readSensors
 	readSensors = func(context.Context) ([]pshost.TemperatureStat, error) {

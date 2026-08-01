@@ -12,27 +12,32 @@ import (
 )
 
 // Temperature sensing is the one host metric family that a machine may simply
-// not have: server boards expose a dozen sensors, VMs and many consumer boards
-// expose none, and Windows reaches them through a WMI ACPI class that is often
-// absent or elevation-gated. So the read path here is shared by two callers —
-// the collector, and the startup capability probe that decides whether the
-// agent advertises host.temperature.read at all.
+// not have: server boards expose a dozen sensors while VMs and many consumer
+// boards expose none. The read path is shared by the collector and the startup
+// capability probe that decides whether the agent advertises
+// host.temperature.read at all.
+
+// temperaturePlatformSupported is a test seam around the build-tagged platform
+// decision. Windows deliberately returns false: its standard WMI ACPI thermal
+// zones are commonly stale, synthetic, or unrelated to CPU/mainboard sensors,
+// so reporting them as host temperature is less honest than reporting the
+// capability unsupported. Keep the check before readSensors so Windows never
+// touches WMI for this metric.
+var temperaturePlatformSupported = nativeTemperaturePlatformSupported
 
 // readSensors is the gopsutil seam, replaced in tests.
 var readSensors = pshost.SensorsTemperaturesWithContext
 
-// sensorTimeout caps how long a caller waits for a sensor read. The Windows WMI
-// provider can block for far longer than the regular collection tier if the ACPI
-// thermal zone is unhealthy, and a stuck read would stall every other host
-// metric behind it. A var so tests can shorten the wait.
+// sensorTimeout caps how long a caller waits for a sensor read. A stuck provider
+// would otherwise stall every other host metric behind it. A var so tests can
+// shorten the wait.
 var sensorTimeout = 3 * time.Second
 
 // sensorBusy is held for as long as a read is genuinely outstanding, which is
-// not the same as "a caller is waiting". gopsutil honours cancellation on
-// Windows by returning while the wmi.Query goroutine underneath it keeps
-// running, so a hung provider would otherwise strand one more query on every
-// 30s collection cycle. Skipping while the previous read is still in flight
-// bounds that at one.
+// not the same as "a caller is waiting". A provider may return from its public
+// call before all of its internal work stops, so a hung provider would otherwise
+// strand one more query on every 30s collection cycle. Skipping while the
+// previous read is still in flight bounds that at one.
 var sensorBusy atomic.Bool
 
 // tempReading is one accepted sensor: a series-safe target and its value.
@@ -49,6 +54,9 @@ type tempReading struct {
 // discard good data. The plausibility filter is the real gate — no plausible
 // reading means no temperature support, whatever err says.
 func collectTemps(ctx context.Context) []tempReading {
+	if !temperaturePlatformSupported() {
+		return nil
+	}
 	stats, ok := readSensorsGuarded(ctx)
 	if !ok {
 		return nil
@@ -149,10 +157,12 @@ func sanitizeSensorKey(k string) string {
 	return key
 }
 
-// TemperatureSupported reports whether this machine actually yields a usable
-// sensor reading right now. The agent calls it once at startup to decide
-// whether host.temperature.read belongs in its supported set, mirroring how
-// traceroute.Supported gates the traceroute permissions.
+// TemperatureSupported reports whether this build can read a usable sensor
+// value on this machine right now. It is false without reading anything where
+// the platform has no trustworthy backend (Windows), and elsewhere only if a
+// real read yields a plausible value. The agent calls it once at startup to
+// decide whether host.temperature.read belongs in its supported set, mirroring
+// how traceroute.Supported gates the traceroute permissions.
 func TemperatureSupported(ctx context.Context) bool {
 	return len(collectTemps(ctx)) > 0
 }

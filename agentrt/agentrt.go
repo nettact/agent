@@ -270,15 +270,10 @@ func Run(ctx context.Context, cfg Config) error {
 		supported.Add(permission.DiagnosticTracerouteTCP)
 	}
 	granted := cfg.Policy.Granted
-	// Temperature is a runtime capability like traceroute — a machine may expose
-	// no thermal sensor at all (most VMs, many consumer boards, and Windows ACPI
-	// thermal zones that are absent or elevation-gated) — but unlike traceroute
-	// there is no way to ask "could I?" without performing the very read the
-	// permission gates. Honouring the no-read-when-denied boundary therefore wins
-	// over reporting support precisely: without the grant the agent never touches
-	// the sensors and simply reports the capability as unsupported, which is why
-	// the permission's platform note tells the operator to grant it and restart
-	// to find out whether this machine has sensors at all.
+	// Temperature is capability-probed only after permission is granted. The
+	// collector's platform gate returns unsupported without touching a provider on
+	// Windows: ACPI WMI thermal zones are not trustworthy hardware temperatures.
+	// Other platforms advertise the permission only when a real read succeeds.
 	if granted.Has(permission.HostTemperatureRead) && collector.TemperatureSupported(ctx) {
 		supported.Add(permission.HostTemperatureRead)
 	}
