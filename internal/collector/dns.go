@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -141,14 +142,18 @@ func (c *DNSCollector) dialFor(proxy *proxydial.Dialer) proxydial.DialFunc {
 	return proxyDialFunc(c.guard, proxy)
 }
 
-// systemResolver returns the resolver address the OS would answer through, or ""
-// when the local policy withholds it or this platform cannot name it. Cached for
-// sysResolverTTL.
+// systemResolver returns the resolver address the OS answered through, or "" when
+// it cannot be identified. Cached for sysResolverTTL.
 //
-// Only the FIRST entry is reported. The stdlib resolver may fail over to a later
-// server, so this is the resolver a query most likely used, not a certainty —
-// which is why the server treats it as evidence to aim a diagnostic at, never as
-// proof of which server answered.
+// It reports an address ONLY when the host configures exactly one, because only
+// then is the answer certain. With several configured, the stdlib resolver walks
+// the list on failure (and may start anywhere under `options rotate`) — and a
+// failing lookup, the only kind this labels, is precisely when that fallthrough
+// happens. Naming the first would point the diagnostic at a server that answered
+// fine while the one that actually failed went unexamined, which is the class of
+// misleading evidence this whole subject-selection exists to eliminate. The
+// operator's remedy is to configure an explicit resolver on the monitor, which
+// the unavailable-diagnostic note tells them.
 func (c *DNSCollector) systemResolver() string {
 	// Field-level no-call: a denied scope must not have its data read from the OS
 	// at all, not read and then withheld. Checked before the lookup, never after.
@@ -161,7 +166,7 @@ func (c *DNSCollector) systemResolver() string {
 		c.sysResolvers = platform.SystemResolvers()
 		c.sysResolversAt = time.Now()
 	}
-	if len(c.sysResolvers) == 0 {
+	if len(c.sysResolvers) != 1 {
 		return ""
 	}
 	return c.sysResolvers[0]
@@ -631,12 +636,20 @@ func (c *DNSCollector) lookupDoH(ctx context.Context, client *http.Client, serve
 		if errors.As(err, &be) {
 			return false, telemetry.ProbeReasonOther, "", "", err
 		}
+		// A failed request still names the URL it was attempting, which is the
+		// REDIRECTED one when the client had already followed a redirect and the
+		// connection or handshake to that host failed. Without this the label falls
+		// back to the configured redirector — a host that answered perfectly well —
+		// and the diagnostic would trace it instead of the endpoint that broke.
+		if ue := (*url.Error)(nil); errors.As(err, &ue) {
+			endpoint = ue.URL
+		}
 		// The error is returned (not dropped) so the caller's ProxyReason check can see
 		// a typed proxy failure. Previously this returned nil here, which made a dead or
 		// rejecting proxy on a DoH monitor report as a generic resolver timeout — the one
 		// thing the proxy_* family exists to prevent. classifyNetError stays as the
 		// fallback for an ordinary transport error.
-		return false, classifyNetError(err), errText(err), "", err
+		return false, classifyNetError(err), errText(err), endpoint, err
 	}
 	defer resp.Body.Close()
 	// resp.Request is the request that produced this response — the redirected one

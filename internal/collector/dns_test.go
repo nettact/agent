@@ -1,7 +1,10 @@
 package collector
 
 import (
+	"context"
+	"errors"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
@@ -141,27 +144,63 @@ func TestResolverLabelsFollowDoHRedirect(t *testing.T) {
 	if got[telemetry.DNSResolverLabel] != "https://redirected.example/dns-query" {
 		t.Fatalf("resolver label = %v, want the endpoint that served the request", got)
 	}
-	// No response at all (transport error): the configured URL is the only endpoint
-	// involved, so it stands.
+	// No endpoint could be observed at all: the configured URL is the only one
+	// known to be involved, so it stands.
 	got = c.resolverLabels(target, "")
 	if got[telemetry.DNSResolverLabel] != "https://doh.example/dns-query" {
 		t.Fatalf("resolver label = %v, want the configured endpoint", got)
 	}
 }
 
-// TestResolverLabelsForSystemResolver covers the system-resolver arm: the label
-// names whatever the OS reports, and is ABSENT when the platform cannot name one
-// — the server must report the diagnostic unavailable rather than trace a guess.
+// A DoH request that fails AFTER following a redirect must still name the host it
+// was attempting. url.Error carries that final URL, and without it the label
+// falls back to the configured redirector — a host that answered fine — sending
+// the diagnostic to the wrong place in exactly the case it is needed.
+func TestDoHFailureNamesTheAttemptedEndpoint(t *testing.T) {
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+
+	// A client whose transport fails, reporting the redirected URL as url.Error does.
+	failing := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})}
+	_, _, _, endpoint, err := c.lookupDoH(context.Background(), failing,
+		"https://doh.example/dns-query", 0, "A", "example.com")
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if endpoint != "https://doh.example/dns-query" {
+		t.Fatalf("endpoint = %q, want the URL the request was attempting", endpoint)
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestResolverLabelsForSystemResolver covers the system-resolver arm. The label
+// appears only when the host configures exactly ONE resolver, because only then
+// is it certain which server answered: the stdlib walks the list on failure (and
+// may start anywhere under `options rotate`), and a failing lookup — the only
+// kind labelled here — is exactly when that happens. Naming the first would aim
+// the diagnostic at a server that answered fine.
 func TestResolverLabelsForSystemResolver(t *testing.T) {
 	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil,
 		permission.FromStrings([]string{string(permission.NetIfaceAddressRead)}))
 	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com"}
 
-	c.sysResolvers = []string{"192.0.2.53", "192.0.2.54"}
+	c.sysResolvers = []string{"192.0.2.53"}
 	c.sysResolversAt = time.Now()
 	got := c.resolverLabels(target, "")
 	if got[telemetry.DNSResolverLabel] != "192.0.2.53:53" || got[telemetry.DNSResolverProtocolLabel] != "udp" {
-		t.Fatalf("system resolver labels = %v, want the first server on udp/53", got)
+		t.Fatalf("system resolver labels = %v, want the sole server on udp/53", got)
+	}
+
+	c.sysResolvers = []string{"192.0.2.53", "192.0.2.54"}
+	c.sysResolversAt = time.Now()
+	if got := c.resolverLabels(target, ""); got != nil {
+		t.Fatalf("ambiguous system resolver produced labels %v, want none — the query may "+
+			"have failed over to any of them", got)
 	}
 
 	c.sysResolvers = nil

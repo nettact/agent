@@ -55,18 +55,29 @@ func parseResolvConf(r io.Reader, keepZone bool) []string {
 	return out
 }
 
-// systemNameservers reads the host's resolver list for interface inventory. A
-// missing or unreadable resolv.conf yields no servers rather than an error: DNS
-// configuration is one reported field, not a precondition for enumerating
-// interfaces.
+// systemNameservers reads the HOST's resolver list for interface inventory,
+// through hostfs so a containerized agent reports the machine an operator wants
+// monitored rather than its own namespace. A missing or unreadable resolv.conf
+// yields no servers rather than an error: DNS configuration is one reported
+// field, not a precondition for enumerating interfaces.
 func systemNameservers() []string {
-	return readResolvConf(false)
+	return readResolvConf(hostfs.EtcPath("resolv.conf"), false)
+}
+
+// processNameservers reads THIS PROCESS's resolver list — deliberately the real
+// /etc/resolv.conf rather than the hostfs redirection, because it answers a
+// different question than the inventory above: which server did net.DefaultResolver
+// just query? The stdlib reads the process's own file, so under HOST_ETC the two
+// lists can differ, and reporting the host's would name a server this probe never
+// sent a packet to.
+func processNameservers(keepZone bool) []string {
+	return readResolvConf("/etc/resolv.conf", keepZone)
 }
 
 // readResolvConf is the shared reader behind both the inventory and diagnostic
 // views of the resolver list.
-func readResolvConf(keepZone bool) []string {
-	f, err := os.Open(hostfs.EtcPath("resolv.conf"))
+func readResolvConf(path string, keepZone bool) []string {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
