@@ -294,8 +294,29 @@ func Run(ctx context.Context, cfg Config) error {
 	// fixable problem the operator would otherwise have no way to see. The probe
 	// runs the component, so it stays behind the grant for the same reason the
 	// temperature read does.
+	//
+	// "Can it work" is itself two answers, because the reads fail apart: frame
+	// timings come from the game's own presentation, while GPU and VRAM telemetry
+	// comes from a driver that may publish none. Plenty of machines capture frames
+	// perfectly and expose no adapter telemetry — an ordinary machine, not a
+	// degraded one — so the two supports have to be able to differ. Collapsing them
+	// would either withhold the capture that works or advertise a read that could
+	// never produce a number.
 	var gameSensorPath string
 	var gameProbe gamesense.ProbeResult
+	// Asking the second question is itself a read: the sensor registers a query
+	// against the adapter to answer it, so `--probe --gpu` touches the protected
+	// source that game.gpu.read exists to protect. It therefore goes out only under
+	// that grant — the same rule the outer gate applies to the frame source, one
+	// level down. Granted rather than effective, because a grant is the
+	// authorization to look and the effective set is the answer that looking
+	// produces; the dependency closure guarantees the parents came with it.
+	//
+	// The consequence is deliberate: without the grant the probe reports nothing
+	// about the adapter, so game.gpu.read stays out of supported and the console
+	// shows it unsupported rather than merely un-granted. That is the honest
+	// report — the agent genuinely does not know, and refuses to find out. Granting
+	// it and restarting re-probes with the flag and settles the question.
 	// Either grant is reason enough to ask. Unlike the temperature probe, this one
 	// captures nothing — it looks for the component and asks it whether a frame
 	// source answers — so requiring the broader permission before asking would only
@@ -305,10 +326,16 @@ func Run(ctx context.Context, cfg Config) error {
 	if granted.Has(permission.GameProcessDetect) || granted.Has(permission.GamePerformanceRead) {
 		if path, ok := gamesense.Locate(Version == "dev"); ok {
 			gameSensorPath = path
-			gameProbe = gamesense.Probe(ctx, path)
+			gameProbe = gamesense.Probe(ctx, path, granted.Has(permission.GameGPURead))
 			if gameProbe.OK {
 				supported.Add(permission.GameProcessDetect)
 				supported.Add(permission.GamePerformanceRead)
+			}
+			// The adapter read the sensor separately verified, never inferred from
+			// the capture working — and never claimed for a question that was not
+			// asked.
+			if gameProbe.OK && gameProbe.GPUOK {
+				supported.Add(permission.GameGPURead)
 			}
 		}
 	}
@@ -514,7 +541,11 @@ func Run(ctx context.Context, cfg Config) error {
 	// only to discard what it is given would be one more thing to keep honest.
 	var gameApplier conn.GameApplier
 	if gameSensor != nil {
-		gameApplier = gameConfigApplier{sensor: gameSensor}
+		// The GPU flag is a permission decision, not a pushed setting, so it is
+		// fixed for the life of the process and read off the effective set — what
+		// the site granted, narrowed to what this machine's probe verified. A
+		// re-push cannot widen it.
+		gameApplier = gameConfigApplier{sensor: gameSensor, gpu: effective.Has(permission.GameGPURead)}
 	}
 	sched := scheduler.New(tiered, selfSched, sink)
 
@@ -766,16 +797,26 @@ func platformIndependentSupported() permission.Set {
 // supervisor. It is the whole of the agent's game-configuration policy: the
 // server states what the site wants, and the translation into what the sensor is
 // told happens here, once.
-type gameConfigApplier struct{ sensor *gamesense.Supervisor }
+//
+// gpu is the effective game.gpu.read decision, carried here because the site's
+// pushed configuration says nothing about it: whether the sensor may read
+// adapter telemetry is settled once, from the grant and this machine's probe.
+type gameConfigApplier struct {
+	sensor *gamesense.Supervisor
+	gpu    bool
+}
 
 // ApplyGameConfig installs the pushed configuration. The supervisor compares it
 // against what the sensor is already running, so a re-push of an unchanged
 // configuration — which is most of them — costs nothing.
 func (a gameConfigApplier) ApplyGameConfig(cfg pcfg.GameConfig) {
-	a.sensor.SetConfig(sensorConfig(cfg))
+	a.sensor.SetConfig(sensorConfig(cfg, a.gpu))
 }
 
-// sensorConfig translates the site's game configuration into the sensor's.
+// sensorConfig translates the site's game configuration into the sensor's, under
+// the effective GPU decision — which comes from the permission set rather than
+// the push, because the site says what it wants collected and the permission
+// says what this machine is allowed and able to collect.
 //
 // The mode is derived here rather than pushed, because it is the site's
 // record-unmatched setting under another name: "do not record processes that
@@ -791,7 +832,7 @@ func (a gameConfigApplier) ApplyGameConfig(cfg pcfg.GameConfig) {
 //
 // Name and MonitorIDs are deliberately dropped: neither changes what the sensor
 // does, and a field the sensor carries without reading is a field that can drift.
-func sensorConfig(cfg pcfg.GameConfig) gs.Config {
+func sensorConfig(cfg pcfg.GameConfig, gpu bool) gs.Config {
 	mode := gs.ModeAll
 	if !cfg.RecordUnmatched {
 		mode = gs.ModeProfiles
@@ -806,9 +847,7 @@ func sensorConfig(cfg pcfg.GameConfig) gs.Config {
 		})
 	}
 	return gs.Config{
-		// GPU stays off until the adapter-telemetry work lands: the flag says the
-		// sensor may read GPU telemetry, and nothing on either side collects it yet.
-		GPU:      false,
+		GPU:      gpu,
 		Mode:     mode,
 		Profiles: profiles,
 	}

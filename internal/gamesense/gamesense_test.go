@@ -50,6 +50,32 @@ func TestParseProbeLineAcceptsAWorkingSensor(t *testing.T) {
 	}
 }
 
+// The probe answers two questions, and the narrower one is not implied by the
+// broader: a machine whose driver publishes no adapter telemetry still captures
+// frames, and that is the common case rather than a fault. The one direction that
+// is a contradiction — adapter telemetry on a sensor that cannot capture at all —
+// is resolved here rather than passed on, since the GPU read is collected on the
+// frame tick and cannot happen without it.
+func TestParseProbeLineSeparatesTheGPUAnswer(t *testing.T) {
+	tests := []struct {
+		name, line      string
+		wantOK, wantGPU bool
+	}{
+		{"frames and adapter", `{"type":"probe","proto":3,"ok":true,"gpu_ok":true}`, true, true},
+		{"frames only", `{"type":"probe","proto":3,"ok":true}`, true, false},
+		{"frames only, stated", `{"type":"probe","proto":3,"ok":true,"gpu_ok":false}`, true, false},
+		{"adapter without capture", `{"type":"probe","proto":3,"ok":false,"reason":"service_unavailable","gpu_ok":true}`, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseProbeLine([]byte(tt.line))
+			if got.OK != tt.wantOK || got.GPUOK != tt.wantGPU {
+				t.Fatalf("probe = %+v, want OK=%v GPUOK=%v", got, tt.wantOK, tt.wantGPU)
+			}
+		})
+	}
+}
+
 // A sensor that answers but cannot capture is the "blocked" state: not usable,
 // but for a reason the operator can act on. The reason must survive.
 func TestParseProbeLineKeepsBlockedReason(t *testing.T) {
@@ -1077,7 +1103,7 @@ func TestLocateFindsNothingOffWindows(t *testing.T) {
 	if _, ok := Locate(true); ok {
 		t.Fatal("Locate() found a sensor on a platform that has none")
 	}
-	if got := Probe(context.Background(), "sensor"); got.OK {
+	if got := Probe(context.Background(), "sensor", true); got.OK {
 		t.Fatalf("Probe() = %+v, want not OK", got)
 	}
 }
@@ -1592,6 +1618,202 @@ func TestSecondsNeverSplitARunOverItsProfile(t *testing.T) {
 	}
 	if len(buckets) != 3 {
 		t.Fatalf("recorded %d seconds, want all three on the one run", len(buckets))
+	}
+}
+
+// fullCapsHello is a sensor process that can measure everything. It is what
+// makes the depth rules visible: with every capability declared, what a run
+// carries is decided entirely by the tier its profile was configured with, which
+// is the situation a mixed configuration puts a real sensor in.
+const fullCapsHello = `{"type":"hello","proto":3,"sensor_version":"0.2.0",` +
+	`"source":"presentmon_service","caps":["displayed","frame_type","present_meta",` +
+	`"per_frame_complete","cpu_split","gpu_split","latency","gpu_tel","proc_vram","busiest_core"]}`
+
+// tierConfig is a configuration naming game.exe at one tier.
+func tierConfig(tier string) gs.Config {
+	return gs.Config{
+		Mode:     gs.ModeAll,
+		Profiles: []gs.ConfigProfile{{ID: "prof-a", Exe: []string{"game.exe"}, Tier: tier}},
+	}
+}
+
+// wantDepth checks that a run's capabilities describe exactly the depth it was
+// captured at: the diag ones present only for a diag run, the base ones always.
+func wantDepth(t *testing.T, run gs.Run, depth string) {
+	t.Helper()
+	hasCap := func(want string) bool {
+		for _, c := range run.Caps {
+			if c == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range []string{
+		gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency,
+		gs.CapGPUTel, gs.CapProcVRAM, gs.CapBusiestCore,
+	} {
+		if got, want := hasCap(c), depth == gs.TierDiag; got != want {
+			t.Errorf("run %q caps = %v: %q present=%v, want %v for a %s-depth run",
+				run.ProfileID, run.Caps, c, got, want, depth)
+		}
+	}
+	// The base capabilities are what every run gets, whatever its depth — the
+	// stripping is about the deeper measurements, not about the run.
+	for _, c := range []string{gs.CapDisplayed, gs.CapFrameType, gs.CapPresentMeta, gs.CapPerFrameComplete} {
+		if !hasCap(c) {
+			t.Errorf("run %q caps = %v, want the base capability %q kept", run.ProfileID, run.Caps, c)
+		}
+	}
+}
+
+// One sensor process measures every game at once, each to the depth its own
+// profile asked for. The hello therefore describes what the PROCESS can do, and
+// copying it onto every run would tell the console that the site's browser was
+// measured as deeply as the game it is diagnosing.
+//
+// The console draws its diagnostic charts from these capabilities, so a run that
+// claims one it never fills renders as "measured, nothing was wrong" — the exact
+// opposite of the truth, and worse than showing nothing.
+func TestMixedTiersGiveEachRunItsOwnDepth(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	s.SetConfig(gs.Config{Mode: gs.ModeAll, Profiles: []gs.ConfigProfile{
+		{ID: "prof-diag", Exe: []string{"cs2.exe"}, Tier: gs.TierDiag},
+		{ID: "prof-base", Exe: []string{"game.exe"}, Tier: gs.TierBase},
+	}})
+	s.consume(strings.NewReader(strings.Join([]string{
+		fullCapsHello,
+		`{"type":"status","state":"tracking","pid":1,"proc":"cs2.exe","profile_id":"prof-diag"}`,
+		secLine("2026-08-01T12:00:00Z", "cs2.exe", 1),
+		`{"type":"status","state":"tracking","pid":2,"proc":"game.exe","profile_id":"prof-base"}`,
+		secLine("2026-08-01T12:00:01Z", "game.exe", 2),
+		// Recorded under ModeAll without matching anything. Base, like every other
+		// process the site never named.
+		`{"type":"status","state":"tracking","pid":3,"proc":"chrome.exe"}`,
+		secLine("2026-08-01T12:00:02Z", "chrome.exe", 3),
+	}, "\n")))
+
+	runs, _ := s.Drain()
+	byProfile := map[string]gs.Run{}
+	for _, r := range runs {
+		byProfile[r.ProfileID] = r
+	}
+	if len(byProfile) != 3 {
+		t.Fatalf("recorded %d runs, want one per process: %+v", len(byProfile), runs)
+	}
+	wantDepth(t, byProfile["prof-diag"], gs.TierDiag)
+	wantDepth(t, byProfile["prof-base"], gs.TierBase)
+	wantDepth(t, byProfile[""], gs.TierBase)
+}
+
+// A run opened by a sec line has no profile yet, so it starts at base depth —
+// not because it was measured shallowly, but because nothing had said which game
+// it was. The status that names the profile fills in the depth with it, in
+// place: that is the first stamp rather than a change, and splitting a session
+// over its own first second would be a worse answer than the moment of
+// understatement it replaces.
+func TestTheFirstStatusStampsTheDepthWithTheProfile(t *testing.T) {
+	s := NewSupervisor("sensor", nil)
+	s.SetConfig(tierConfig(gs.TierDiag))
+	s.consume(strings.NewReader(strings.Join([]string{
+		fullCapsHello,
+		secLine("2026-08-01T12:00:00Z", "game.exe", 1),
+		`{"type":"status","state":"tracking","pid":1,"proc":"game.exe","profile_id":"prof-a"}`,
+		secLine("2026-08-01T12:00:01Z", "game.exe", 1),
+	}, "\n")))
+
+	runs, buckets := s.Drain()
+	byID := runsByID(runs)
+	if len(byID) != 1 {
+		t.Fatalf("recorded %d runs, want the seconds and the status on one: %+v", len(byID), runs)
+	}
+	for _, r := range byID {
+		if r.ProfileID != "prof-a" {
+			t.Fatalf("run = %+v, want the profile the status named", r)
+		}
+		wantDepth(t, r, gs.TierDiag)
+	}
+	if len(buckets) != 2 || buckets[0].RunID != buckets[1].RunID {
+		t.Fatalf("buckets = %+v, want both seconds on the one run", buckets)
+	}
+}
+
+// Changing a game's tier changes what its seconds contain, so it splits the run
+// exactly as reassigning its profile does. The seconds already collected keep
+// describing the depth they were recorded at; stitching the two together would
+// produce one run whose first half silently lacks the breakdowns its own
+// capabilities promise.
+//
+// Like every configuration change, it can only reach the sensor through a
+// restart, so the sequence is the restart path: consume, park, reconfigure,
+// consume.
+func TestATierEditSplitsTheRunAtTheDepthChange(t *testing.T) {
+	tests := []struct {
+		name          string
+		before, after string
+		wantRuns      int
+	}{
+		{"deepened", gs.TierBase, gs.TierDiag, 2},
+		{"shallowed", gs.TierDiag, gs.TierBase, 2},
+		// An unrelated edit re-pushes the same tier. The player is in the middle of
+		// one session and must come back to it.
+		{"unchanged", gs.TierDiag, gs.TierDiag, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewSupervisor("sensor", nil)
+			s.SetConfig(tierConfig(tt.before))
+			s.consume(strings.NewReader(strings.Join([]string{
+				fullCapsHello,
+				`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+				secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+			}, "\n")))
+			s.endRun()
+			s.SetConfig(tierConfig(tt.after))
+			s.consume(strings.NewReader(strings.Join([]string{
+				fullCapsHello,
+				`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","profile_id":"prof-a"}`,
+				secLine("2026-08-02T01:00:10Z", "game.exe", 100),
+			}, "\n")))
+
+			runs, buckets := s.Drain()
+			byID := runsByID(runs)
+			if len(byID) != tt.wantRuns {
+				t.Fatalf("recorded %d runs, want %d: %+v", len(byID), tt.wantRuns, runs)
+			}
+			if tt.wantRuns == 1 {
+				for _, r := range byID {
+					if r.EndedAt != nil {
+						t.Errorf("run = %+v, want the session resumed across the restart", r)
+					}
+					wantDepth(t, r, tt.after)
+				}
+				if len(buckets) != 2 || buckets[0].RunID != buckets[1].RunID {
+					t.Fatalf("buckets = %+v, want both seconds on the one run", buckets)
+				}
+				return
+			}
+
+			var ended, open gs.Run
+			for _, r := range byID {
+				if r.EndedAt != nil {
+					ended = r
+				} else {
+					open = r
+				}
+			}
+			if ended.ID == "" || open.ID == "" {
+				t.Fatalf("runs = %+v, want the old session ended and the new one open", runs)
+			}
+			// Each half keeps the depth it was recorded at. That is the whole point of
+			// splitting: history describes what was actually measured then, not what
+			// the site asked for afterwards.
+			wantDepth(t, ended, tt.before)
+			wantDepth(t, open, tt.after)
+			if len(buckets) != 2 || buckets[0].RunID != ended.ID || buckets[1].RunID != open.ID {
+				t.Fatalf("buckets = %+v, want each second on the run it was collected under", buckets)
+			}
+		})
 	}
 }
 

@@ -33,12 +33,23 @@ import (
 
 const mockSensorEnv = "NETTACT_AGENTRT_MOCK_SENSOR"
 
+// mockSensorGPUFlagEnv is the probe argv the policy under test must produce,
+// seen from the sensor's side: "1" when the agent is expected to pass --gpu.
+// The harness derives it from the policy, so a probe that asks about the adapter
+// without the grant — or fails to ask with it — fails at the moment it happens
+// rather than being inferred later from a capability that went missing.
+const mockSensorGPUFlagEnv = "NETTACT_AGENTRT_MOCK_SENSOR_GPU_FLAG"
+
 func TestMain(m *testing.M) {
 	switch os.Getenv(mockSensorEnv) {
 	case "":
 		os.Exit(m.Run())
 	case "ok":
-		os.Exit(runMockSensor(os.Args[1:]))
+		// Frames yes, adapter telemetry no: the common machine, and an ordinary one
+		// rather than a degraded one.
+		os.Exit(runMockSensor(os.Args[1:], false))
+	case "ok-gpu":
+		os.Exit(runMockSensor(os.Args[1:], true))
 	case "blocked":
 		fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock",` +
 			`"ok":false,"reason":"service_unavailable"}`)
@@ -53,9 +64,27 @@ func TestMain(m *testing.M) {
 // that for itself from the config it was handed.
 const mockProc = "mock-game.exe"
 
-func runMockSensor(args []string) int {
+// runMockSensor plays a sensor that can capture frames. gpu is what this machine
+// could report about its adapter if asked — the probe's second, narrower
+// question, which the real sensor answers independently of the first.
+func runMockSensor(args []string, gpu bool) int {
 	if len(args) > 0 && args[0] == "--probe" {
-		fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
+		// Answering the adapter question means registering a query against the GPU,
+		// so it is asked for explicitly and never volunteered. The agent's grant is
+		// what decides whether the flag is there, and the argv is checked against
+		// the policy the test is running under: an agent that reached for the
+		// adapter without the grant fails here, not two assertions later.
+		asked := len(args) == 2 && args[1] == "--gpu"
+		if !asked && len(args) != 1 {
+			fmt.Fprintf(os.Stderr, "mock sensor: probe argv %v, want [--probe] or [--probe --gpu]\n", args)
+			return 3
+		}
+		if want := os.Getenv(mockSensorGPUFlagEnv) == "1"; asked != want {
+			fmt.Fprintf(os.Stderr, "mock sensor: probe argv %v, want --gpu present=%v under this policy\n", args, want)
+			return 3
+		}
+		fmt.Printf(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,`+
+			`"gpu_ok":%v,"pm_version":"2.3.0"}`+"\n", gpu && asked)
 		return 0
 	}
 	// A capture run is configured before it captures: the agent writes exactly one
@@ -73,6 +102,13 @@ func runMockSensor(args []string) int {
 		fmt.Fprintf(os.Stderr, "mock sensor: bad config line %q: %v\n", line, err)
 		return 3
 	}
+	// The agent must never ask for a read this sensor's own probe declined. That
+	// holds whatever the site granted — a permission cannot conjure a capability —
+	// so it is checked here rather than left to a per-test expectation.
+	if cfg.GPU && !gpu {
+		fmt.Fprintf(os.Stderr, "mock sensor: asked for GPU telemetry after a probe that reported none\n")
+		return 3
+	}
 	// The sensor owns the matching rule and reports its verdict; the agent copies
 	// the id rather than matching the process name a second time.
 	matched, ok := cfg.Match(mockProc)
@@ -81,8 +117,29 @@ func runMockSensor(args []string) int {
 		profile = fmt.Sprintf(`,"profile_id":%q`, matched.ID)
 	}
 
-	fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
-		`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`)
+	// What a run is recorded under depends on the configuration, exactly as the
+	// real sensor's does: adapter telemetry is declared only when the config line
+	// allowed it. That makes the flag the agent sent observable from the far end —
+	// on the uploaded run — instead of only inside this process.
+	//
+	// The frame-derived diag capabilities are declared unconditionally, which is
+	// also what the real sensor does: hello says what this PROCESS can measure,
+	// while how deeply any one game is actually measured comes from its profile's
+	// tier. The agent is what has to reconcile the two per run.
+	caps := []string{
+		gs.CapDisplayed, gs.CapFrameType, gs.CapPresentMeta, gs.CapPerFrameComplete,
+		gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency,
+	}
+	if cfg.GPU {
+		caps = append(caps, gs.CapGPUTel, gs.CapProcVRAM)
+	}
+	capsJSON, err := json.Marshal(caps)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mock sensor: %v\n", err)
+		return 3
+	}
+	fmt.Printf(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",`+
+		`"pm_version":"2.3.0","caps":%s}`+"\n", capsJSON)
 	if cfg.Mode == gs.ModeProfiles && !ok {
 		// Strict tracking, and this process is not one of the site's games — so it
 		// is not watched at all. With no profiles defined that is every process,
@@ -139,6 +196,130 @@ func TestGameDataReachesTheServer(t *testing.T) {
 	}
 	runs, buckets := f.game()
 	assertGameRecords(t, runs, buckets, 1)
+
+	// This sensor's probe reported no adapter telemetry, which is the ordinary
+	// machine: frames are captured, the narrower read is not supported, and the
+	// desktop's blanket grant does not change that. Granted is asserted too, so
+	// this stays the granted-but-unsupported case rather than quietly becoming a
+	// test of a permission nobody asked for.
+	if !contains(report.Granted, string(permission.GameGPURead)) {
+		t.Fatalf("granted = %v, want %q — FullAccess grants every compiled permission",
+			report.Granted, permission.GameGPURead)
+	}
+	if contains(report.Supported, string(permission.GameGPURead)) {
+		t.Errorf("supported = %v, want %q absent when the probe verified no adapter telemetry",
+			report.Supported, permission.GameGPURead)
+	}
+	if contains(report.Effective, string(permission.GameGPURead)) {
+		t.Errorf("effective = %v, want %q dropped by the capability probe", report.Effective, permission.GameGPURead)
+	}
+	// This site named no games, so the process was recorded as an ordinary one —
+	// base depth — and the run must not advertise the deeper measurements the
+	// sensor declared it was capable of. The sensor states what the process can
+	// do; only the run knows what was done to it, and a run promising per-frame
+	// breakdowns it never carries is a console full of empty diagnostic charts
+	// that read as "measured, nothing was wrong".
+	for _, r := range runs {
+		for _, c := range []string{gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency} {
+			if contains(r.Caps, c) {
+				t.Errorf("run caps = %v, want no %q on an unprofiled base-depth run", r.Caps, c)
+			}
+		}
+		if !contains(r.Caps, gs.CapDisplayed) || !contains(r.Caps, gs.CapPerFrameComplete) {
+			t.Errorf("run caps = %v, want the base capabilities kept", r.Caps)
+		}
+	}
+}
+
+// diagProfileForMock names the mock's process as a game the site is diagnosing.
+// The adapter capabilities are only observable on a diag-depth run — a base one
+// has them stripped whatever the sensor was permitted — so a test asserting on
+// what the GPU flag did has to record under a profile that asked for depth.
+func diagProfileForMock() pcfg.GameConfig {
+	return pcfg.GameConfig{
+		Version:         1,
+		RecordUnmatched: true,
+		Profiles: []pcfg.GameProfile{{
+			ID: "prof-gpu", Name: "Mock Game", Exe: []string{mockProc}, Tier: gs.TierDiag,
+		}},
+	}
+}
+
+// The other half of the same split: a sensor whose probe did verify adapter
+// telemetry makes game.gpu.read supported, and the effective permission is what
+// the sensor is then told it may read. Everything else about the run is
+// identical to the case above — the probe's second answer is the only difference,
+// which is exactly what makes the two supports separable.
+func TestGPUCapableSensorIsGrantedTheAdapterRead(t *testing.T) {
+	t.Setenv(mockSensorEnv, "ok-gpu")
+	t.Setenv(gamesense.PathEnv, testExecutable(t))
+
+	f := newFake(t, hasGameBucket)
+	f.pushGameConfig(diagProfileForMock())
+	runAgent(t, f)
+	report, _, _ := f.snapshot()
+
+	if !contains(report.Supported, string(permission.GameGPURead)) {
+		t.Errorf("supported = %v, want %q", report.Supported, permission.GameGPURead)
+	}
+	if !contains(report.Effective, string(permission.GameGPURead)) {
+		t.Errorf("effective = %v, want %q", report.Effective, permission.GameGPURead)
+	}
+	runs, buckets := f.game()
+	assertGameRecords(t, runs, buckets, 1)
+	for _, r := range runs {
+		if !contains(r.Caps, gs.CapGPUTel) {
+			t.Errorf("run caps = %v, want %q — the sensor was never told it may read the adapter",
+				r.Caps, gs.CapGPUTel)
+		}
+	}
+}
+
+// The same capable machine under a policy that deliberately leaves the adapter
+// read out: the agent must not even ask.
+//
+// Asking is the read. The probe answers the GPU question by registering a query
+// against the adapter, so an unconditional `--probe --gpu` would touch the
+// protected source at every startup of an agent whose site said no — before any
+// permission arithmetic gets a chance to matter. The mock holds the agent to the
+// argv its policy allows; what is asserted here is the visible consequence, and
+// it is deliberate: with the question unasked the capability reads as
+// unsupported rather than merely un-granted, because the agent genuinely does
+// not know and declines to find out. Granting it and restarting re-probes and
+// settles it.
+func TestUngrantedAdapterReadIsNeverProbed(t *testing.T) {
+	t.Setenv(mockSensorEnv, "ok-gpu")
+	t.Setenv(gamesense.PathEnv, testExecutable(t))
+
+	f := newFake(t, hasGameBucket)
+	f.pushGameConfig(diagProfileForMock())
+	runAgentUnder(t, f, permission.Policy{
+		Granted: permission.Closure(permission.NewSet(permission.GamePerformanceRead)),
+		Source:  permission.SourceEnvironment,
+	}, 0)
+	report, _, _ := f.snapshot()
+
+	if contains(report.Granted, string(permission.GameGPURead)) {
+		t.Fatalf("granted = %v, want %q left out — that omission is the case under test",
+			report.Granted, permission.GameGPURead)
+	}
+	if contains(report.Supported, string(permission.GameGPURead)) {
+		t.Errorf("supported = %v, want %q absent: the machine can, but was never asked",
+			report.Supported, permission.GameGPURead)
+	}
+	// Only the adapter half is gated. The capture the site did grant is untouched,
+	// which is what makes this a split rather than a coarser switch.
+	if !contains(report.Effective, string(permission.GamePerformanceRead)) {
+		t.Errorf("effective = %v, want %q", report.Effective, permission.GamePerformanceRead)
+	}
+	runs, buckets := f.game()
+	assertGameRecords(t, runs, buckets, 1)
+	for _, r := range runs {
+		if contains(r.Caps, gs.CapGPUTel) {
+			t.Errorf("run caps = %v, want no %q — the sensor was allowed a read the site withheld",
+				r.Caps, gs.CapGPUTel)
+		}
+	}
 }
 
 // The game-profile path end to end on the agent side: a profile pushed with the
@@ -197,6 +378,18 @@ func TestPushedGameProfileStampsTheUploadedRun(t *testing.T) {
 	}
 	if !after.StartedAt.Before(time.Now()) || after.StartedAt.Before(before.StartedAt) {
 		t.Errorf("the profiled run started at %v, before the session it replaced (%v)", after.StartedAt, before.StartedAt)
+	}
+	// The profile is diag-tier, so the split is also a change of depth. Both
+	// sensor processes declared the same capabilities — what differs is how deeply
+	// each stretch was actually measured, and that is what the two runs must say.
+	for _, c := range []string{gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency} {
+		if contains(before.Caps, c) {
+			t.Errorf("pre-profile run caps = %v, want no %q on a stretch recorded as an ordinary process",
+				before.Caps, c)
+		}
+		if !contains(after.Caps, c) {
+			t.Errorf("profiled run caps = %v, want %q for a game the site is diagnosing", after.Caps, c)
+		}
 	}
 }
 
@@ -266,7 +459,9 @@ func TestBlockedSensorIsUnsupportedAndExplained(t *testing.T) {
 	runAgent(t, f)
 	report, _, events := f.snapshot()
 
-	for _, id := range []permission.ID{permission.GameProcessDetect, permission.GamePerformanceRead} {
+	for _, id := range []permission.ID{
+		permission.GameProcessDetect, permission.GamePerformanceRead, permission.GameGPURead,
+	} {
 		if contains(report.Supported, string(id)) {
 			t.Errorf("supported = %v, want %q absent for a blocked sensor", report.Supported, id)
 		}
@@ -300,7 +495,9 @@ func TestNoSensorIsSimplyUnsupported(t *testing.T) {
 	report, _, events := f.snapshot()
 	runs, buckets := f.game()
 
-	for _, id := range []permission.ID{permission.GameProcessDetect, permission.GamePerformanceRead} {
+	for _, id := range []permission.ID{
+		permission.GameProcessDetect, permission.GamePerformanceRead, permission.GameGPURead,
+	} {
 		if contains(report.Supported, string(id)) {
 			t.Errorf("supported = %v, want %q absent with no sensor", report.Supported, id)
 		}
@@ -598,8 +795,26 @@ func runAgent(t *testing.T, f *fake) {
 // met. It is how a test asserts that something never happens: the condition
 // proves the agent got far enough to upload, and the extra window is the time in
 // which the thing it must not do would have happened.
+//
+// FullAccess is what the desktop grants, so capability is the only gate — the
+// situation this feature actually ships in.
 func runAgentThenLinger(t *testing.T, f *fake, linger time.Duration) {
 	t.Helper()
+	runAgentUnder(t, f, permission.FullAccess(), linger)
+}
+
+// runAgentUnder runs the session under a specific policy, for the tests where
+// what was granted is the thing under test rather than the backdrop.
+func runAgentUnder(t *testing.T, f *fake, policy permission.Policy, linger time.Duration) {
+	t.Helper()
+	// The sensor is told what argv this policy must produce, so the mock can hold
+	// the agent to it from the other side of the process boundary.
+	flag := "0"
+	if policy.Granted.Has(permission.GameGPURead) {
+		flag = "1"
+	}
+	t.Setenv(mockSensorGPUFlagEnv, flag)
+
 	dataDir := t.TempDir()
 	if err := identity.SaveCredential(dataDir, identity.Credential{
 		AgentID: "agent-test", SiteID: "site-test", AgentToken: "test-token",
@@ -611,12 +826,10 @@ func runAgentThenLinger(t *testing.T, f *fake, linger time.Duration) {
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		// FullAccess is what the desktop grants, so capability is the only gate —
-		// the situation this feature actually ships in.
 		_ = Run(ctx, Config{
 			ServerURL: f.srv.URL, DataDir: dataDir, WireFormat: "json",
 			UploadInterval: 200 * time.Millisecond,
-			Policy:         permission.FullAccess(),
+			Policy:         policy,
 		})
 	}()
 

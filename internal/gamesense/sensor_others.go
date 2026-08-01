@@ -21,7 +21,7 @@ var errUnsupported = errors.New("gamesense: unsupported platform")
 
 // Probe reports no capability. Locate never returns a path off Windows, so the
 // agent has nothing to pass here in the first place.
-func Probe(_ context.Context, _ string) ProbeResult {
+func Probe(_ context.Context, _ string, _ bool) ProbeResult {
 	return ProbeResult{Reason: ReasonUnsupportedOS}
 }
 

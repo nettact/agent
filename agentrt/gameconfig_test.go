@@ -35,7 +35,7 @@ func TestSensorConfigDerivesTheTrackingMode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := sensorConfig(pcfg.GameConfig{
 				Version: 1, RecordUnmatched: tt.recordUnmatched, Profiles: tt.profiles,
-			})
+			}, false)
 			if got.Mode != tt.want {
 				t.Fatalf("mode = %q, want %q", got.Mode, tt.want)
 			}
@@ -53,7 +53,7 @@ func TestSensorConfigCarriesOnlyWhatTheSensorActsOn(t *testing.T) {
 			{ID: "p1", Name: "CS2", Exe: []string{"cs2.exe", "cs2_win64.exe"}, TargetFPS: 240, Tier: gs.TierDiag},
 			{ID: "p2", Name: "Deep Rock", Exe: []string{"FSD-Win64-Shipping.exe"}, Tier: gs.TierBase},
 		},
-	})
+	}, false)
 
 	if len(got.Profiles) != 2 {
 		t.Fatalf("profiles = %+v, want both", got.Profiles)
@@ -68,14 +68,27 @@ func TestSensorConfigCarriesOnlyWhatTheSensorActsOn(t *testing.T) {
 	if got.Profiles[1].ID != "p2" || got.Profiles[1].Tier != gs.TierBase {
 		t.Errorf("profile = %+v, want the second as pushed", got.Profiles[1])
 	}
-	// Adapter telemetry is not collected by anything yet, so the sensor is not
-	// given permission to read it.
-	if got.GPU {
-		t.Error("config asks the sensor for GPU telemetry nothing collects yet")
-	}
 	// The matching rule the sensor will apply is the protocol's own, so the
 	// mapping has to survive it.
 	if p, ok := got.Match("CS2.EXE"); !ok || p.ID != "p1" {
 		t.Errorf("Match(CS2.EXE) = %+v, %v; want the first profile", p, ok)
+	}
+}
+
+// The GPU flag is the one field of the sensor's configuration the site does not
+// choose: it is the effective game.gpu.read decision, and no push may raise or
+// lower it. A site editing its profiles must not be able to switch adapter
+// telemetry on for a machine whose permission set excludes it, nor off for one
+// that has it.
+func TestSensorConfigTakesTheGPUFlagFromThePermissionNotThePush(t *testing.T) {
+	pushed := pcfg.GameConfig{
+		Version:         7,
+		RecordUnmatched: true,
+		Profiles:        []pcfg.GameProfile{{ID: "p1", Name: "CS2", Exe: []string{"cs2.exe"}, Tier: gs.TierDiag}},
+	}
+	for _, gpu := range []bool{true, false} {
+		if got := sensorConfig(pushed, gpu); got.GPU != gpu {
+			t.Errorf("sensorConfig(..., %v).GPU = %v, want the effective permission", gpu, got.GPU)
+		}
 	}
 }

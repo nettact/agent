@@ -92,6 +92,26 @@ func acceptConfig(args []string) (*bufio.Reader, bool) {
 	return stdin, true
 }
 
+// acceptProbe plays the sensor's side of the probe argv contract: `--probe`
+// alone, or `--probe --gpu` when the agent is also allowed to ask whether
+// adapter telemetry is registrable. It returns whether the GPU question was
+// asked.
+//
+// Strict, like acceptConfig, and for the same kind of reason: answering the GPU
+// question means registering a query against the adapter, so a sensor that
+// accepted an unrecognised argv — or answered a question nobody asked — would
+// let the agent reach a protected source without the grant that authorises it.
+func acceptProbe(args []string) (gpu bool, ok bool) {
+	switch {
+	case len(args) == 1:
+		return false, true
+	case len(args) == 2 && args[1] == "--gpu":
+		return true, true
+	}
+	fmt.Fprintf(os.Stderr, "mock sensor: probe argv %v, want [--probe] or [--probe --gpu]\n", args)
+	return false, false
+}
+
 // runMockSensor plays one scenario as if it were nettact-sensor.exe.
 func runMockSensor(scenario string, args []string) int {
 	probing := len(args) > 0 && args[0] == "--probe"
@@ -99,6 +119,11 @@ func runMockSensor(scenario string, args []string) int {
 	switch scenario {
 	case "ok":
 		if probing {
+			// This machine presents frames and publishes no adapter telemetry, so
+			// gpu_ok is absent however it is asked — the ordinary machine.
+			if _, ok := acceptProbe(args); !ok {
+				return mockBadStartup
+			}
 			fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
 			return 0
 		}
@@ -129,8 +154,28 @@ func runMockSensor(scenario string, args []string) int {
 		_, _ = io.Copy(io.Discard, stdin)
 		return 0
 
+	// A machine whose driver does publish adapter telemetry — and which still
+	// only says so when asked, because registering that query is the read itself.
+	// It plays the probe alone: what the flag changes is the answer, not the
+	// capture that follows.
+	case "ok-gpu":
+		if !probing {
+			fmt.Fprintln(os.Stderr, "mock sensor: scenario ok-gpu plays the probe only")
+			return mockBadStartup
+		}
+		gpu, ok := acceptProbe(args)
+		if !ok {
+			return mockBadStartup
+		}
+		fmt.Printf(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,`+
+			`"gpu_ok":%v,"pm_version":"2.3.0"}`+"\n", gpu)
+		return 0
+
 	case "blocked":
 		if probing {
+			if _, ok := acceptProbe(args); !ok {
+				return mockBadStartup
+			}
 			fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":false,` +
 				`"reason":"service_unavailable"}`)
 			return 0
@@ -203,12 +248,45 @@ func TestProbeAgainstMockSensor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.scenario, func(t *testing.T) {
-			got := Probe(context.Background(), self(t, tt.scenario))
+			got := Probe(context.Background(), self(t, tt.scenario), false)
 			if got.OK != tt.wantOK {
 				t.Fatalf("Probe() = %+v, want OK=%v", got, tt.wantOK)
 			}
 			if got.Reason != tt.wantReason {
 				t.Fatalf("reason = %q, want %q", got.Reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// The adapter question is asked only when the caller says it may be. Answering
+// it means registering a query against the GPU, so the flag is the agent's
+// grant reaching the one place that acts on it: without it the sensor never
+// touches the source and reports nothing about it, and the mock rejects the
+// argv outright if the agent invents a flag of its own.
+//
+// The two rows for the capable machine are the whole point: same sensor, same
+// machine, different answer — so a missing GPUOK cannot be read as "this
+// machine cannot", only as "nobody asked".
+func TestProbeAsksAboutTheAdapterOnlyWhenAllowed(t *testing.T) {
+	tests := []struct {
+		name     string
+		scenario string
+		gpu      bool
+		want     bool
+	}{
+		{"capable machine, allowed to ask", "ok-gpu", true, true},
+		{"capable machine, not allowed to ask", "ok-gpu", false, false},
+		{"machine with no adapter telemetry", "ok", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Probe(context.Background(), self(t, tt.scenario), tt.gpu)
+			if !got.OK {
+				t.Fatalf("Probe() = %+v, want a sensor that can capture", got)
+			}
+			if got.GPUOK != tt.want {
+				t.Fatalf("Probe() = %+v, want GPUOK=%v", got, tt.want)
 			}
 		})
 	}
@@ -220,7 +298,7 @@ func TestProbeGivesUpOnAHangingSensor(t *testing.T) {
 	restoreProbeTimeout(t, 300*time.Millisecond)
 
 	start := time.Now()
-	got := Probe(context.Background(), exe)
+	got := Probe(context.Background(), exe, false)
 	if got.OK {
 		t.Fatalf("Probe() = %+v, want not OK", got)
 	}
@@ -230,7 +308,7 @@ func TestProbeGivesUpOnAHangingSensor(t *testing.T) {
 }
 
 func TestProbeReportsAMissingExecutable(t *testing.T) {
-	got := Probe(context.Background(), `C:\nettact-does-not-exist\nettact-sensor.exe`)
+	got := Probe(context.Background(), `C:\nettact-does-not-exist\nettact-sensor.exe`, false)
 	if got.OK || got.Reason != ReasonProbeFailed {
 		t.Fatalf("Probe() = %+v, want a failed probe", got)
 	}

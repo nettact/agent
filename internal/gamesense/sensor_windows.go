@@ -38,11 +38,22 @@ const stopGrace = 3 * time.Second
 // mode — a missing binary, a crash, a timeout, an unreadable answer — returns a
 // not-OK result rather than an error, because the caller's question is only ever
 // "can I collect", and a sensor that cannot answer cannot collect.
-func Probe(ctx context.Context, path string) ProbeResult {
+//
+// gpu asks the second, narrower question as well. It is a separate argument
+// rather than something the sensor always answers because answering it is
+// itself a read: the probe has to register a query against the adapter, and
+// touching a protected source is exactly what a permission decides. Without the
+// flag the sensor never goes near it and reports no GPU answer, so the caller
+// must pass the grant, not the wish.
+func Probe(ctx context.Context, path string, gpu bool) ProbeResult {
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, path, "--probe")
+	args := []string{"--probe"}
+	if gpu {
+		args = append(args, "--gpu")
+	}
+	cmd := exec.CommandContext(ctx, path, args...)
 	hideWindow(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

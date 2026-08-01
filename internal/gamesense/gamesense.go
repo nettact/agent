@@ -86,11 +86,17 @@ const (
 	ReasonSensorExited = "sensor_exited"
 )
 
-// ProbeResult is the answer to "can this machine capture frames right now". OK is
-// the only field the permission decision reads; the rest explains a negative
-// answer to a human.
+// ProbeResult is the answer to "can this machine capture frames right now". OK
+// and GPUOK are the fields the permission decision reads; the rest explains a
+// negative answer to a human.
 type ProbeResult struct {
-	OK            bool
+	OK bool
+	// GPUOK is the narrower second answer: the sensor also registered a GPU
+	// telemetry query. It is a separate capability because the two fail apart —
+	// a driver that publishes no adapter telemetry still presents frames — so a
+	// false here alongside a true OK is an ordinary machine, not a fault, and
+	// carries no reason of its own.
+	GPUOK         bool
 	Proto         int
 	Reason        string
 	SensorVersion string
@@ -117,7 +123,12 @@ func parseProbeLine(b []byte) ProbeResult {
 		return ProbeResult{Proto: p.Proto, SensorVersion: p.SensorVersion, Reason: ReasonProtoMismatch}
 	}
 	res := ProbeResult{
-		OK:            p.OK,
+		OK: p.OK,
+		// A sensor that cannot open a frame session at all cannot have registered a
+		// GPU query either, so a gpu_ok riding on a false ok is a contradiction the
+		// agent resolves rather than passes on: the narrower capability never
+		// outlives the one it is collected on.
+		GPUOK:         p.OK && p.GPUOK,
 		Proto:         p.Proto,
 		Reason:        p.Reason,
 		SensorVersion: p.SensorVersion,
@@ -158,6 +169,13 @@ type Recorder struct {
 	// they outlive the runs started from them.
 	source string
 	caps   []string
+	// tiers maps profile id to the tier the running sensor was configured with.
+	// It is what turns a run's profile into the depth it was captured at, which
+	// the hello cannot say: a sensor declares its capabilities once for the whole
+	// process, while the depth it actually collects at is decided per tracked
+	// process from this table. Fixed for the life of one sensor process, because
+	// changing it is what restarts the sensor.
+	tiers map[string]string
 
 	cur    *session
 	curPID int
@@ -191,6 +209,19 @@ type session struct {
 	// naming a different one (or none) describes a different game, and the run
 	// ends there so its seconds keep the assignment they were collected under.
 	profiled bool
+	// depth is how deeply this run's seconds were measured — gs.TierDiag when the
+	// profile it matched is configured for diagnostics, gs.TierBase otherwise,
+	// which includes every unprofiled process. It is a property of the run and
+	// not of the sensor process: one sensor collects at both depths at once, deep
+	// for the games the site is diagnosing and shallow for everything else, so a
+	// process-wide answer would be wrong for half the runs in a mixed
+	// configuration.
+	//
+	// It is immutable for the same reason the assignment is, and it is what the
+	// run's Caps are cut to: a run declaring a capability it never fills leaves
+	// the console rendering an empty diagnostic chart, which reads as "measured,
+	// nothing was wrong" rather than "never measured".
+	depth string
 }
 
 // profileClaim is what one sensor line says about which game a run belongs to. A
@@ -210,14 +241,24 @@ func claimed(id string) profileClaim { return profileClaim{id: id, known: true} 
 // unclaimed is what a sec line says about the profile: nothing.
 var unclaimed = profileClaim{}
 
-// accepts reports whether a line making this claim belongs to the session.
+// accepts reports whether a line making this claim, for a run that would now be
+// captured at depth, belongs to the session.
 //
 // A claimless line always does — a sec line says nothing about the profile and
 // must never split a run over it. A claim on a run with no assignment yet
-// establishes it. Otherwise only the identical assignment continues the run,
-// which is what makes a run's game immutable once known.
-func (s *session) accepts(c profileClaim) bool {
-	return !c.known || !s.profiled || s.run.ProfileID == c.id
+// establishes it. Otherwise only the identical assignment AT THE SAME DEPTH
+// continues the run, which is what makes both immutable once known.
+//
+// Depth is checked beside the id because the same profile can be measured two
+// ways: switching a game between base and diag changes what its seconds contain,
+// and stitching the two together would produce one run whose first half silently
+// lacks the breakdowns its capabilities promise. The change can only reach the
+// sensor through a restart, which is the same boundary a reassignment crosses.
+func (s *session) accepts(c profileClaim, depth string) bool {
+	if !c.known || !s.profiled {
+		return true
+	}
+	return s.run.ProfileID == c.id && s.depth == depth
 }
 
 // reviveWindow is how long a process that stops presenting keeps its run.
@@ -232,6 +273,63 @@ func (s *session) accepts(c profileClaim) bool {
 // unique: two windows of the same browser, or two copies of a game, are
 // different sessions that happen to share a program.
 const reviveWindow = time.Hour
+
+// diagCaps are the capabilities only a diag-depth capture fills. A sensor
+// declares them once, for the process, because it CAN collect them here; whether
+// it does is decided per tracked game from its tier. Stripping them from a run
+// the sensor was never going to collect them for is the difference between a
+// console that shows a game had no diagnostics and one that shows six charts
+// that will never draw a point.
+var diagCaps = map[string]bool{
+	gs.CapCPUSplit:    true,
+	gs.CapGPUSplit:    true,
+	gs.CapLatency:     true,
+	gs.CapGPUTel:      true,
+	gs.CapProcVRAM:    true,
+	gs.CapBusiestCore: true,
+}
+
+// setProfileTiers adopts the configuration the sensor is being run with, as the
+// table that turns a run's profile into the depth it is captured at.
+func (r *Recorder) setProfileTiers(cfg gs.Config) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tiers = nil
+	if len(cfg.Profiles) == 0 {
+		return
+	}
+	r.tiers = make(map[string]string, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		r.tiers[p.ID] = p.Tier
+	}
+}
+
+// depthFor is the depth a run matching this profile is captured at. Everything
+// the site has not asked for diagnostics on — including every process matching
+// no profile at all — is base, which is the floor rather than a guess: base is
+// what the sensor collects for anything it was not told to go deeper on.
+// Caller holds mu.
+func (r *Recorder) depthFor(profileID string) string {
+	if profileID != "" && r.tiers[profileID] == gs.TierDiag {
+		return gs.TierDiag
+	}
+	return gs.TierBase
+}
+
+// capsFor cuts the sensor's declared capabilities down to what a run at this
+// depth will actually carry. Caller holds mu.
+func (r *Recorder) capsFor(depth string) []string {
+	if depth == gs.TierDiag {
+		return append([]string(nil), r.caps...)
+	}
+	caps := make([]string, 0, len(r.caps))
+	for _, c := range r.caps {
+		if !diagCaps[c] {
+			caps = append(caps, c)
+		}
+	}
+	return caps
+}
 
 // hello records how this sensor process measures. Every run started from here on
 // carries it, so a later comparison of two runs can tell a change in the machine
@@ -273,7 +371,7 @@ func (r *Recorder) track(pid int, proc, title string, profile profileClaim) {
 		// this one by. The sec lines that follow name it, so the data is not lost.
 		return
 	}
-	if r.cur != nil && (pid == r.curPID || proc == r.cur.run.Proc) && r.cur.accepts(profile) {
+	if r.cur != nil && (pid == r.curPID || proc == r.cur.run.Proc) && r.cur.accepts(profile, r.depthFor(profile.id)) {
 		// Still the session in progress. The process id identifies it, but the
 		// program running under it also does while that session is live: a
 		// launcher handing the game off replaces the id mid-session, and treating
@@ -330,6 +428,17 @@ func (r *Recorder) stampProfile(profile profileClaim) {
 		r.cur.run.ProfileID = profile.id
 		r.markDirty(r.cur.run)
 	}
+	// The depth is stamped with the assignment, because it is derived from it. A
+	// run held at base while nothing had named its profile is not a run that was
+	// captured shallowly — it is one whose depth was not knowable yet, and the
+	// sensor was already collecting at the game's real depth for the seconds it
+	// covers. Widening here is the same first stamp, not a change: only a later,
+	// different assignment moves a run, and that splits it.
+	if depth := r.depthFor(profile.id); depth != r.cur.depth {
+		r.cur.depth = depth
+		r.cur.run.Caps = r.capsFor(depth)
+		r.markDirty(r.cur.run)
+	}
 }
 
 // switchTo makes pid the process being recorded, reopening its run when it has
@@ -341,11 +450,12 @@ func (r *Recorder) switchTo(pid int, proc, title string, profile profileClaim, n
 	r.parkCurrent(now)
 	r.sweepParked(now)
 
-	// The parked run is reopened only if it is the same program AND the same
-	// game: a process that comes back matching a different profile than it was
-	// recorded under is a new run, so the seconds either side of the restart keep
-	// the assignment each was collected with.
-	if s := r.parked[pid]; s != nil && s.run.Proc == proc && s.accepts(profile) {
+	// The parked run is reopened only if it is the same program AND the same game
+	// measured the same way: a process that comes back matching a different
+	// profile than it was recorded under — or the same profile now recorded at a
+	// different depth — is a new run, so the seconds either side of the restart
+	// keep the assignment and the depth each was collected with.
+	if s := r.parked[pid]; s != nil && s.run.Proc == proc && s.accepts(profile, r.depthFor(profile.id)) {
 		// Reopening: the end recorded when it was parked was provisional, and the
 		// server takes the newer report. Its extent grows to cover the gap, which
 		// is honest — the session did span it, with a pause in the middle that the
@@ -363,6 +473,7 @@ func (r *Recorder) switchTo(pid int, proc, title string, profile profileClaim, n
 
 // start opens a run at startedAt. Caller holds mu.
 func (r *Recorder) start(pid int, proc, title string, profile profileClaim, startedAt time.Time) {
+	depth := r.depthFor(profile.id)
 	run := &gs.Run{
 		ID:         uuid.NewString(),
 		Proc:       proc,
@@ -371,9 +482,9 @@ func (r *Recorder) start(pid int, proc, title string, profile profileClaim, star
 		StartedAt:  startedAt,
 		LastSeenAt: startedAt,
 		Source:     r.source,
-		Caps:       append([]string(nil), r.caps...),
+		Caps:       r.capsFor(depth),
 	}
-	r.cur, r.curPID = &session{run: run, profiled: profile.known}, pid
+	r.cur, r.curPID = &session{run: run, profiled: profile.known, depth: depth}, pid
 	r.lastBucketTS = time.Time{}
 	r.markDirty(run)
 }
@@ -684,6 +795,12 @@ func (s *Supervisor) SetConfig(cfg gs.Config) {
 		return
 	}
 	s.cfg, s.configured = cfg, true
+	// The recorder is told the tiers under the same lock that stores the config,
+	// so the table it describes runs by can never disagree with the configuration
+	// the next sensor is started with. A sensor is configured once at spawn, so
+	// from the recorder's side the table is fixed for the life of a process —
+	// which is what makes a run's depth immutable and a tier edit a split.
+	s.setProfileTiers(cfg)
 	restart := s.restart
 	s.reconfigured = restart != nil
 	s.cfgMu.Unlock()

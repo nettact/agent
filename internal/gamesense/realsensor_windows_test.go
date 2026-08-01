@@ -28,7 +28,9 @@ func TestRealSensorSpeaksTheContract(t *testing.T) {
 		t.Fatalf("%s=%q does not exist", PathEnv, path)
 	}
 
-	got := Probe(context.Background(), path)
+	// Asked the full question, since this is the contract test: a real build has
+	// to accept `--probe --gpu` and answer both halves.
+	got := Probe(context.Background(), path, true)
 
 	// Whatever this machine can or cannot do, the answer must be one the agent
 	// understands: a parseable line at the protocol version it speaks.
@@ -47,6 +49,14 @@ func TestRealSensorSpeaksTheContract(t *testing.T) {
 	if got.OK && got.Reason != "" {
 		t.Errorf("probe = %+v; a working sensor must not carry a failure reason", got)
 	}
-	t.Logf("real sensor %s: ok=%v pm_version=%q reason=%q",
-		got.SensorVersion, got.OK, got.PMVersion, got.Reason)
+	// The other half of the argv contract: `--probe` alone must not register the
+	// adapter query, so it can never come back with a GPU answer. A real sensor
+	// that answers anyway would be reading a protected source for an agent that
+	// was never granted it — invisible from the outside, which is why it is
+	// checked against the real build rather than only against the mock.
+	if plain := Probe(context.Background(), path, false); plain.GPUOK {
+		t.Errorf("probe without --gpu = %+v; the adapter was queried without being asked", plain)
+	}
+	t.Logf("real sensor %s: ok=%v gpu_ok=%v pm_version=%q reason=%q",
+		got.SensorVersion, got.OK, got.GPUOK, got.PMVersion, got.Reason)
 }
