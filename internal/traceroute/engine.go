@@ -59,6 +59,12 @@ const (
 	reasonProbeFailed        = "probe_failed"
 	reasonDeadlineExceeded   = "deadline_exceeded"
 	reasonCanceled           = "canceled"
+
+	// Fail-closed egress outcomes (DIAG-004): the pinned tunnel generation was
+	// not honorable, and by contract the trace refuses rather than measuring a
+	// different path.
+	reasonEgressGenerationMismatch = "egress_generation_mismatch"
+	reasonEgressNotAvailable       = "egress_not_available"
 )
 
 // errUnsupported is the sentinel a non-implementing platform probe returns; the
@@ -74,6 +80,11 @@ type Engine struct {
 	granted   permission.Set
 	supported permission.Set
 
+	// egress resolves a pinned {proxyID, configSerial} to an in-tunnel probe
+	// (DIAG-004). Nil means this runtime has no egress support at all; an egress
+	// request then fails closed with egress_not_available.
+	egress EgressResolver
+
 	sem  chan struct{} // per-Agent concurrency limiter
 	caps capabilities
 }
@@ -81,7 +92,7 @@ type Engine struct {
 // New builds an Engine. concurrency <= 0 selects DefaultConcurrency. The
 // permission views are the agent's immutable process-wide sets; supported must
 // already reflect this build+runtime's real ICMP/TCP capability (see Supported).
-func New(guard *netguard.Guard, effective, granted, supported permission.Set, concurrency int) *Engine {
+func New(guard *netguard.Guard, effective, granted, supported permission.Set, concurrency int, egress EgressResolver) *Engine {
 	if concurrency <= 0 {
 		concurrency = DefaultConcurrency
 	}
@@ -90,6 +101,7 @@ func New(guard *netguard.Guard, effective, granted, supported permission.Set, co
 		effective: effective,
 		granted:   granted,
 		supported: supported,
+		egress:    egress,
 		sem:       make(chan struct{}, concurrency),
 		caps:      detectCapabilities(),
 	}
@@ -112,9 +124,25 @@ func Supported() (icmp bool, tcp bool) {
 func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult {
 	res := telemetry.TraceResult{ReportID: req.ReportID, Mode: req.Mode}
 
+	// The attestation is stamped before anything can fail, so EVERY terminal
+	// result — including the fail-closed ones — declares which path plan it
+	// answers and that no other path was used.
+	egress := req.EgressProxyID != ""
+	res.PathScope = telemetry.TracePathDirect
+	if egress {
+		res.PathScope = telemetry.TracePathWireGuardInner
+		res.EgressProxyID = req.EgressProxyID
+		res.EgressConfigSerial = req.EgressConfigSerial
+	}
+
 	// Validate + clamp locally. Invalid mode/port/destination send no probes.
 	mode := req.Mode
 	if mode != pcfg.TraceModeICMP && mode != pcfg.TraceModeTCP {
+		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode)
+	}
+	if egress && mode != pcfg.TraceModeICMP {
+		// In-tunnel probing is ICMP echo only; the server never plans otherwise,
+		// so this is defense against a malformed push.
 		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode)
 	}
 	if req.DestinationHost == "" {
@@ -128,14 +156,21 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 	attempts := clampInt(req.AttemptsPerHop, defaultAttempts, 1, maxAttempts)
 	totalTimeout := clampTotalTimeout(req.TotalTimeoutMs)
 
-	// Permission/capability gate. effective already = granted∩supported, and
-	// supported reflects the real platform/runtime capability, so a missing
-	// effective permission is either a policy denial or a capability gap.
+	// Permission/capability gate. For a host-stack trace, effective already =
+	// granted∩supported and supported reflects the real platform capability, so
+	// a missing effective permission is a policy denial or a capability gap. An
+	// egress trace runs in pure userspace — no raw socket, no elevation — so the
+	// platform capability is irrelevant and only the GRANT is checked: a host
+	// that cannot send host-stack ICMP can still probe inside its tunnel.
 	permID := permission.DiagnosticTracerouteICMP
 	if mode == pcfg.TraceModeTCP {
 		permID = permission.DiagnosticTracerouteTCP
 	}
-	if !e.effective.Has(permID) {
+	if egress {
+		if !e.granted.Has(permID) {
+			return terminal(res, telemetry.TraceStatusUnsupported, reasonPermissionDenied)
+		}
+	} else if !e.effective.Has(permID) {
 		return terminal(res, telemetry.TraceStatusUnsupported, e.capabilityReason(permID, mode))
 	}
 
@@ -150,7 +185,27 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 		return terminal(res, telemetry.TraceStatusCanceled, reasonCanceled)
 	}
 
-	// Resolve the destination exactly once through the guard; report the actual IP.
+	// Resolve the pinned egress before the destination: the egress reference is
+	// the path's identity, so a rotated or vanished tunnel must be reported as
+	// such even when the destination would not have resolved either — and the
+	// lookup is cheap while resolution does DNS I/O. Resolution may lazily build
+	// the tunnel; that is honoring the pinned generation, not extra work.
+	var egressProbe EgressProbeFunc
+	if egress {
+		p, err := e.resolveEgress(ctx, req.EgressProxyID, req.EgressConfigSerial)
+		if err != nil {
+			if errors.Is(err, ErrEgressGenerationMismatch) {
+				return terminal(res, telemetry.TraceStatusFailed, reasonEgressGenerationMismatch)
+			}
+			return terminal(res, telemetry.TraceStatusFailed, reasonEgressNotAvailable)
+		}
+		egressProbe = p
+	}
+
+	// Resolve the destination exactly once through the guard; report the actual
+	// IP. The host-stack resolution path is correct for in-tunnel traces too:
+	// WireGuard monitors resolve their targets the same way (DNS mode is forced
+	// local for the tunnel transport).
 	dest, reason := e.resolveDestination(ctx, req.DestinationHost)
 	if reason != "" {
 		return terminal(res, telemetry.TraceStatusFailed, reason)
@@ -176,6 +231,9 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 	defer cancel()
 
 	probe := e.proberFor(mode)
+	if egress {
+		probe = tunnelProber(egressProbe)
+	}
 	perAttempt := perAttemptBudget(totalTimeout, maxHops)
 
 	out := e.walk(ctx, runCtx, probe, dest, port, maxHops, attempts, perAttempt, runDeadline)
@@ -286,6 +344,16 @@ func (e *Engine) acquire(ctx context.Context, deadline time.Time) (status, reaso
 	case <-timer.C:
 		return telemetry.TraceStatusTimedOut, reasonDeadlineExceeded, false
 	}
+}
+
+// resolveEgress resolves the pinned egress through the injected resolver. A nil
+// resolver (a runtime without egress support) is the same fail-closed outcome
+// as an unknown proxy: the trace refuses rather than measuring the host stack.
+func (e *Engine) resolveEgress(ctx context.Context, proxyID string, configSerial int) (EgressProbeFunc, error) {
+	if e.egress == nil {
+		return nil, ErrEgressNotAvailable
+	}
+	return e.egress(ctx, proxyID, configSerial)
 }
 
 // capabilityReason explains a missing effective permission: a policy denial

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -470,7 +471,37 @@ func Run(ctx context.Context, cfg Config) error {
 			Version:  Version,
 		},
 	}
-	traceEngine := traceroute.New(guard, effective, granted, supported, cfg.Limits.MaxTraceConcurrency)
+	// The egress resolver bridges the engine to the proxy manager without the
+	// traceroute package depending on proxydial. It enforces the DIAG-004
+	// fail-closed contract: the pinned {id, generation} resolves to the exact
+	// tunnel the fault was observed on, or the trace refuses — never a newer
+	// generation, never the host stack. The transport check runs up front so a
+	// relay proxy that matched id+serial fails at trace start with the dedicated
+	// code instead of probe_failed at TTL 1.
+	traceEgress := func(ctx context.Context, proxyID string, serial int) (traceroute.EgressProbeFunc, error) {
+		d, derr := proxies.DialerForGeneration(ctx, proxyID, serial)
+		switch {
+		case errors.Is(derr, proxydial.ErrProxyGeneration):
+			return nil, fmt.Errorf("%w: %v", traceroute.ErrEgressGenerationMismatch, derr)
+		case derr != nil:
+			return nil, fmt.Errorf("%w: %v", traceroute.ErrEgressNotAvailable, derr)
+		case d.Spec.Type != pcfg.ProxyTypeWireGuard:
+			return nil, fmt.Errorf("%w: %s cannot carry in-tunnel probes", traceroute.ErrEgressNotAvailable, d.Spec.Type)
+		}
+		return func(ctx context.Context, dest netip.Addr, ttl int, timeout time.Duration) (traceroute.EgressReply, error) {
+			r, perr := d.TraceProbe(ctx, dest, ttl, timeout)
+			if perr != nil {
+				return traceroute.EgressReply{}, perr
+			}
+			return traceroute.EgressReply{
+				Responder: r.Responder,
+				Reached:   r.Reached,
+				Timeout:   r.Timeout,
+				RTTMs:     float64(r.RTT.Microseconds()) / 1000,
+			}, nil
+		}, nil
+	}
+	traceEngine := traceroute.New(guard, effective, granted, supported, cfg.Limits.MaxTraceConcurrency, traceEgress)
 
 	err = conn.Run(runCtx, conn.Options{
 		ServerURL: cfg.ServerURL,

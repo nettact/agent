@@ -73,9 +73,21 @@ func (m *Manager) newWireGuard(ctx context.Context, spec pcfg.ProxySpec) (*Diale
 	if err != nil {
 		return nil, fmt.Errorf("create tunnel device: %w", err)
 	}
+	// The mux between netstack and wireguard-go is what carries in-tunnel
+	// traceroute probes (netstack itself exposes no TTL control and drops
+	// Time-Exceeded). Probing is IPv4-only, so a v6-only tunnel gets a mux that
+	// merely relays and a Dialer without the capability.
+	var localV4 netip.Addr
+	for _, a := range localAddrs {
+		if a.Is4() {
+			localV4 = a
+			break
+		}
+	}
+	mux := newTraceMux(tunDev, localV4)
 	// Silent logger: a tunnel logs per-packet at higher levels, and the agent's
 	// diagnosis surface is the probe's error class, not a wireguard trace.
-	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "wg:"+spec.ID+" "))
+	dev := device.NewDevice(mux, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "wg:"+spec.ID+" "))
 	if err := dev.IpcSet(uapi); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("apply tunnel config: %w", err)
@@ -112,6 +124,7 @@ func (m *Manager) newWireGuard(ctx context.Context, spec pcfg.ProxySpec) (*Diale
 			}
 			return c, nil
 		},
+		traceProbe: traceProbeFor(mux, localV4),
 		closeFn: func() {
 			// Closing the device stops its goroutines and releases the UDP socket. It is
 			// what makes a re-keyed or deleted proxy actually stop carrying traffic.

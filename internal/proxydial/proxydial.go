@@ -44,7 +44,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/nettact/agent/internal/netguard"
 	pcfg "github.com/nettact/protocol/config"
@@ -63,6 +65,11 @@ var (
 	// ErrProxyKindUnsupported means this transport cannot carry this probe kind
 	// (e.g. an ICMP echo through a CONNECT tunnel).
 	ErrProxyKindUnsupported = errors.New("pinned proxy cannot carry this probe kind")
+	// ErrProxyGeneration means the caller pinned a specific config generation and
+	// the live entry is a different one. Only generation-pinned lookups
+	// (DialerForGeneration) return it: running a diagnostic over a config the
+	// fault was not observed on would answer a different question.
+	ErrProxyGeneration = errors.New("pinned proxy generation does not match")
 )
 
 // DialFunc dials a target through a proxy. address is "host:port"; host is a
@@ -83,6 +90,10 @@ type Dialer struct {
 	// listenPacket opens an UNCONNECTED datagram socket inside the tunnel. Nil for
 	// the relay transports, which carry TCP only.
 	listenPacket ListenPacketFunc
+	// traceProbe sends one TTL'd ICMP echo from inside the tunnel and waits for
+	// its correlated reply — the traceroute primitive. Nil for the relay
+	// transports (no raw IP) and for a tunnel without an IPv4 address.
+	traceProbe TraceProbeFunc
 	// closeFn releases transport-owned resources (the WireGuard device). Nil for
 	// the stateless relay transports.
 	closeFn func()
@@ -94,6 +105,10 @@ type PingFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // ListenPacketFunc opens an unconnected datagram socket inside a tunnel.
 type ListenPacketFunc func() (net.PacketConn, error)
+
+// TraceProbeFunc sends one TTL'd ICMP echo inside a tunnel and waits for the
+// correlated reply. A missing reply is a Timeout result, not an error.
+type TraceProbeFunc func(ctx context.Context, dest netip.Addr, ttl int, timeout time.Duration) (TraceProbeReply, error)
 
 // DialContext routes a TCP connection to address through this proxy.
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -125,6 +140,18 @@ func (d *Dialer) ListenPacket() (net.PacketConn, error) {
 		return nil, fmt.Errorf("%w: %s cannot carry UDP", ErrProxyKindUnsupported, d.Spec.Type)
 	}
 	return d.listenPacket()
+}
+
+// TraceProbe sends one TTL'd ICMP echo from inside the tunnel — the in-tunnel
+// traceroute primitive. It returns ErrProxyKindUnsupported for a transport that
+// cannot carry raw IP (or a tunnel without IPv4), so a caller that reached here
+// through a capability-check drift fails closed rather than probing from the
+// host stack and reporting a path the probe never used.
+func (d *Dialer) TraceProbe(ctx context.Context, dest netip.Addr, ttl int, timeout time.Duration) (TraceProbeReply, error) {
+	if d.traceProbe == nil {
+		return TraceProbeReply{}, fmt.Errorf("%w: %s cannot carry in-tunnel probes", ErrProxyKindUnsupported, d.Spec.Type)
+	}
+	return d.traceProbe(ctx, dest, ttl, timeout)
 }
 
 // ResolvesRemotely reports whether the TARGET hostname is resolved by the proxy
@@ -293,6 +320,41 @@ func (m *Manager) Dialer(ctx context.Context, proxyID string) (*Dialer, error) {
 	}
 	cur.dialer = built
 	return built, nil
+}
+
+// DialerForGeneration returns the live dialer for a proxy id ONLY if its config
+// generation matches the pinned serial, building lazily like Dialer. It is the
+// lookup for generation-pinned diagnostics (an in-tunnel trace must run over
+// the exact config the fault was observed on): an absent id is ErrUnknownProxy,
+// a different generation is ErrProxyGeneration, and neither ever falls back to
+// the current generation or a direct path.
+func (m *Manager) DialerForGeneration(ctx context.Context, proxyID string, serial int) (*Dialer, error) {
+	if proxyID == "" {
+		return nil, fmt.Errorf("%w: empty id", ErrUnknownProxy)
+	}
+	m.mu.Lock()
+	e, ok := m.entries[proxyID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrUnknownProxy, proxyID)
+	}
+	if e.serial != serial {
+		live := e.serial
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s is at generation %d, not %d", ErrProxyGeneration, proxyID, live, serial)
+	}
+	m.mu.Unlock()
+
+	d, err := m.Dialer(ctx, proxyID)
+	if err != nil {
+		return nil, err
+	}
+	// A concurrent Apply may have replaced the generation while we built; the
+	// returned dialer carries the spec it was built from, so re-check it.
+	if d.Spec.ConfigSerial != serial {
+		return nil, fmt.Errorf("%w: %s replaced during initialization", ErrProxyGeneration, proxyID)
+	}
+	return d, nil
 }
 
 // invalidConfigError marks an initialization failure that no retry can fix, because
