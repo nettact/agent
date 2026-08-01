@@ -25,11 +25,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	pshost "github.com/shirou/gopsutil/v3/host"
 
 	"github.com/nettact/agent/internal/collector"
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/enroll"
+	"github.com/nettact/agent/internal/gamesense"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/incidentscene"
 	"github.com/nettact/agent/internal/monitoreval"
@@ -48,6 +50,31 @@ import (
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 )
+
+// blockedSensor remembers which blocked-sensor outcome this process has already
+// reported, so a supervisor that re-runs Run does not re-report an unchanged
+// one. Keyed by path and reason: a sensor that becomes blocked for a different
+// reason, or a different sensor, is a new fact worth an event.
+var blockedSensor struct {
+	sync.Mutex
+	reported map[string]bool
+}
+
+// blockedSensorUnreported records this outcome and reports whether it is the
+// first time this process has seen it.
+func blockedSensorUnreported(path, reason string) bool {
+	blockedSensor.Lock()
+	defer blockedSensor.Unlock()
+	key := path + "\x00" + reason
+	if blockedSensor.reported[key] {
+		return false
+	}
+	if blockedSensor.reported == nil {
+		blockedSensor.reported = map[string]bool{}
+	}
+	blockedSensor.reported[key] = true
+	return true
+}
 
 // Version is the agent version reported at enrollment and in the Hello frame.
 // A var so release builds stamp the real tag via
@@ -255,6 +282,31 @@ func Run(ctx context.Context, cfg Config) error {
 	if granted.Has(permission.HostTemperatureRead) && collector.TemperatureSupported(ctx) {
 		supported.Add(permission.HostTemperatureRead)
 	}
+	// Frame metrics come from a separate sensor component that most installs do
+	// not ship, so the capability question is first "is it here at all" and only
+	// then "can it work". Both answers are needed: a missing component is the
+	// ordinary state and says nothing, while an installed one that cannot open a
+	// trace session is a fixable problem the operator would otherwise have no way
+	// to see. The probe runs the component, so it stays behind the grant for the
+	// same reason the temperature read does.
+	var gameSensorPath string
+	var gameProbe gamesense.ProbeResult
+	// Either grant is reason enough to ask. Unlike the temperature probe, this one
+	// performs no part of what the permissions gate — it opens and closes an empty
+	// trace session and looks for a file — so requiring the broader permission
+	// before asking would only make a policy that grants detection alone report
+	// detection as unsupported on a machine that can do it. EffectiveFrom still
+	// removes whatever was not granted.
+	if granted.Has(permission.GameProcessDetect) || granted.Has(permission.GamePerformanceRead) {
+		if path, ok := gamesense.Locate(Version == "dev"); ok {
+			gameSensorPath = path
+			gameProbe = gamesense.Probe(ctx, path)
+			if gameProbe.OK {
+				supported.Add(permission.GameProcessDetect)
+				supported.Add(permission.GamePerformanceRead)
+			}
+		}
+	}
 	effective := permission.EffectiveFrom(granted, supported)
 
 	guard := netguard.New(cfg.ProbeAccess, cfg.Policy.FullAccess)
@@ -312,6 +364,32 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		cancel()
 		return fmt.Errorf("open wal: %w", err)
+	}
+
+	// An installed sensor that cannot collect looks identical to no sensor at all
+	// in the permission report — both are simply unsupported. One of the two is
+	// fixable, so it gets an event carrying the reason.
+	//
+	// Reported once per process for a given outcome, not once per Run: a
+	// supervisor re-runs this function in the same process after a revoked or
+	// dropped session, and an unchanged sensor is not news each time. Cancellation
+	// is excluded outright — a probe interrupted by shutdown failed to answer,
+	// which is not the same as answering "blocked", and persisting that would
+	// leave a warning to be uploaded on the next start.
+	if gameSensorPath != "" && !gameProbe.OK && ctx.Err() == nil && blockedSensorUnreported(gameSensorPath, gameProbe.Reason) {
+		log.Printf("game sensor at %s unavailable: %s", gameSensorPath, gameProbe.Reason)
+		_, _ = outbox.Append(nil, []telemetry.Event{{
+			ID:       uuid.NewString(),
+			TS:       time.Now().UTC(),
+			Type:     telemetry.EventGameSensorBlocked,
+			Layer:    telemetry.LayerLocal,
+			Severity: telemetry.SeverityWarn,
+			Message:  "game sensor installed but unavailable",
+			Attrs: map[string]string{
+				"reason": gameProbe.Reason,
+				"path":   gameSensorPath,
+			},
+		}}, nil, nil)
 	}
 
 	// Construct collectors gated by effective permissions. A denied collector is
@@ -408,6 +486,18 @@ func Run(ctx context.Context, cfg Config) error {
 			effective.Has(permission.HostTemperatureRead),
 		))
 	}
+	// The game sensor is a child process streaming a line per second, so unlike
+	// the collectors above it does not do its work on a tier: the supervisor
+	// buffers what arrives and the collector only drains that buffer. Built here
+	// so its collector joins this round of tiered collectors; started below, once
+	// the run context and shutdown wait group exist.
+	var gameSensor *gamesense.Supervisor
+	if effective.Has(permission.GamePerformanceRead) && gameProbe.OK {
+		gameSensor = gamesense.NewSupervisor(gameSensorPath, func(ev telemetry.Event) {
+			_, _ = outbox.Append(nil, []telemetry.Event{ev}, nil, nil)
+		})
+		tiered = append(tiered, gamesense.NewCollector(gameSensor))
+	}
 	sched := scheduler.New(tiered, selfSched, sink)
 
 	// Ordered shutdown, in this exact order: cancel runCtx so the scheduler and
@@ -419,6 +509,17 @@ func Run(ctx context.Context, cfg Config) error {
 		hbWG.Wait()
 		_ = outbox.Close()
 	}()
+
+	// Start the sensor. It joins the same wait group as the heartbeat so shutdown
+	// stops it and waits for it before the WAL closes underneath the events it may
+	// still be appending — and so the child process is gone before Run returns.
+	if gameSensor != nil {
+		hbWG.Add(1)
+		go func() {
+			defer hbWG.Done()
+			gameSensor.Run(runCtx)
+		}()
+	}
 
 	sched.Run(runCtx)
 
@@ -562,7 +663,10 @@ func platformIndependentSupported() permission.Set {
 		permission.ProbeNAT,
 		// Host metrics — gopsutil cpu/mem/disk/load/host/net, compiled everywhere.
 		// HostTemperatureRead is deliberately absent: sensors are a per-machine
-		// capability, so Run probes for one and adds the permission there.
+		// capability, so Run probes for one and adds the permission there. The
+		// game.* permissions are absent for the same reason and one more — they
+		// need a component this repository does not build, which most installs do
+		// not ship at all.
 		permission.HostCPURead,
 		permission.HostMemoryRead,
 		permission.HostDiskRead,

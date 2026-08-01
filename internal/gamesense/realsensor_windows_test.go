@@ -1,0 +1,52 @@
+//go:build windows
+
+package gamesense
+
+import (
+	"context"
+	"os"
+	"testing"
+)
+
+// The mock in mocksensor_windows_test.go encodes what the contract says. This
+// test checks the other thing that matters: that a real build of the component
+// actually emits it. The two can drift — the mock is written from the same
+// document as the agent, so a shared misreading would pass both — and the only
+// way to catch that is to run the real executable.
+//
+// It is opt-in because the component is closed and this repository never builds
+// it. Point NETTACT_SENSOR_PATH at a published nettact-sensor.exe to run it:
+//
+//	$env:NETTACT_SENSOR_PATH = "...\sensor-win\dist\nettact-sensor.exe"
+//	go test ./internal/gamesense/ -run TestRealSensor -v
+func TestRealSensorSpeaksTheContract(t *testing.T) {
+	path := os.Getenv(PathEnv)
+	if path == "" {
+		t.Skipf("set %s to a published sensor to run this", PathEnv)
+	}
+	if !fileExists(path) {
+		t.Fatalf("%s=%q does not exist", PathEnv, path)
+	}
+
+	got := Probe(context.Background(), path)
+
+	// Whatever this machine can or cannot do, the answer must be one the agent
+	// understands: a parseable line at the protocol version it speaks.
+	if got.Proto != ProtoVersion {
+		t.Fatalf("probe = %+v; want proto %d — the agent would reject this sensor", got, ProtoVersion)
+	}
+	if got.SensorVersion == "" {
+		t.Error("probe carries no sensor version")
+	}
+	// The three states are distinguishable, and a negative one always says why.
+	// An empty reason on a not-OK probe is the failure mode this whole design
+	// exists to avoid: unusable, with nothing to act on.
+	if !got.OK && got.Reason == "" {
+		t.Errorf("probe = %+v; a sensor that cannot collect must say why", got)
+	}
+	if got.OK && got.Reason != "" {
+		t.Errorf("probe = %+v; a working sensor must not carry a failure reason", got)
+	}
+	t.Logf("real sensor %s: ok=%v presentmon=%v etw=%v reason=%q",
+		got.SensorVersion, got.OK, got.PresentMon, got.ETWSession, got.Reason)
+}

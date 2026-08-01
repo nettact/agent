@@ -101,7 +101,7 @@ func (s *Scheduler) selfLoop(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			if len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 && len(res.Blocked) == 0 {
+			if empty(res) {
 				continue
 			}
 			// A self-scheduled probe reporting 100% loss is still a burst signal
@@ -122,6 +122,16 @@ func (s *Scheduler) selfLoop(ctx context.Context) {
 	}
 }
 
+// empty reports whether a Result carries nothing at all. Passing one to the
+// sink is not free: an Append opens a transaction and consumes a group id
+// whatever it is given, so a collector that legitimately has nothing to say —
+// the game sensor while no game runs — would otherwise write to durable storage
+// on every tick, forever.
+func empty(res collector.Result) bool {
+	return len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 &&
+		len(res.Blocked) == 0 && res.InterfaceSnapshot == nil
+}
+
 func (s *Scheduler) tierLoop(ctx context.Context, cols []collector.Collector, isBase bool) {
 	if len(cols) == 0 {
 		return
@@ -135,6 +145,9 @@ func (s *Scheduler) tierLoop(ctx context.Context, cols []collector.Collector, is
 			}
 			if isBase && faultDetected(res) {
 				faulted = true
+			}
+			if empty(res) {
+				continue
 			}
 			s.sink(res)
 		}

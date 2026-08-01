@@ -61,7 +61,12 @@ func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 					return
 				}
 				defer c.CloseNow() //nolint:errcheck
-				readCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				// Generous on purpose. This bounds how long the test waits for two
+				// frames the agent sends immediately; it is not a latency the agent
+				// promises, so the only thing a tight value buys is a failure
+				// whenever the machine is busy — which `go test ./...` makes it,
+				// by running other packages alongside this one.
+				readCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 				defer cancel()
 				if _, _, err := c.Read(readCtx); err != nil {
 					t.Errorf("read hello: %v", err)
@@ -96,11 +101,23 @@ func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			// An upper bound, not a schedule: the run ends when the server closes
+			// with 4004, which normally takes well under a second. Sizing it to
+			// how long that usually takes only produces a graceful shutdown
+			// mid-handshake — and a failure about the revocation step never being
+			// reached — whenever the machine is under load.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			err := Run(ctx, Config{
-				ServerURL: srv.URL, DataDir: dataDir, WireFormat: "json", UploadInterval: time.Hour,
-				Policy: permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
+				ServerURL: srv.URL, DataDir: dataDir, WireFormat: "json",
+				// Short, not long. The session drains once on connect and then on
+				// this interval; an hour-long one means that if the first drain
+				// happens to run before the heartbeat has written anything, the
+				// packet this handler waits for does not exist for an hour. That
+				// ordering is a race the machine's load decides, which is why it
+				// showed up as an occasional failure rather than a constant one.
+				UploadInterval: 200 * time.Millisecond,
+				Policy:         permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
 			})
 			select {
 			case <-mutated:
