@@ -176,6 +176,42 @@ func TestRunEgressTraceFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRunEgressSentinelMidSweepKeepsItsOwnReason(t *testing.T) {
+	// A generation can rotate WHILE the sweep runs: the manager closes the
+	// superseded tunnel and the in-flight probe fails. The sentinel must survive
+	// that path too — reporting probe_failed would blame the machinery for a
+	// re-keyed tunnel, which is a different answer to "what do I do next".
+	guard := netguard.New(probepolicy.Policy{}, true)
+	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
+
+	for _, tc := range []struct {
+		name   string
+		err    error
+		reason string
+	}{
+		{"generation_mismatch", ErrEgressGenerationMismatch, reasonEgressGenerationMismatch},
+		{"not_available", ErrEgressNotAvailable, reasonEgressNotAvailable},
+		{"unclassified", errors.New("tunnel device closed"), reasonProbeFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := func(context.Context, string, int) (EgressProbeFunc, error) {
+				return func(_ context.Context, d netip.Addr, ttl int, _ time.Duration) (EgressReply, error) {
+					if ttl == 1 {
+						return EgressReply{Responder: netip.MustParseAddr("10.7.0.1"), RTTMs: 1}, nil
+					}
+					return EgressReply{}, fmt.Errorf("%w: mid-sweep", tc.err)
+				}, nil
+			}
+			e := New(guard, granted, granted, granted, 1, resolver)
+			res := e.Run(context.Background(), egressRequest(), time.Now())
+			if res.Status != telemetry.TraceStatusFailed || res.Reason != tc.reason {
+				t.Fatalf("result = %s/%s, want failed/%s", res.Status, res.Reason, tc.reason)
+			}
+			assertAttestation(t, res)
+		})
+	}
+}
+
 func TestRunEgressPermissionAndModeGates(t *testing.T) {
 	guard := netguard.New(probepolicy.Policy{}, true)
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
@@ -218,11 +254,14 @@ func TestRunEgressPermissionAndModeGates(t *testing.T) {
 }
 
 func TestTraceBoundsClampDeterministically(t *testing.T) {
+	if got := clampTotalTimeout(0); got != 300*time.Second {
+		t.Fatalf("default timeout = %v, want 300s", got)
+	}
 	if got := clampInt(1000, defaultMaxHops, 1, maxHopsCeiling); got != maxHopsCeiling {
 		t.Fatalf("max hops clamp = %d", got)
 	}
-	if got := clampTotalTimeout(999999); got != maxTotalTimeout {
-		t.Fatalf("timeout clamp = %v", got)
+	if got := clampTotalTimeout(999999); got != 600*time.Second {
+		t.Fatalf("timeout clamp = %v, want 600s", got)
 	}
 	if got := perAttemptBudget(time.Second, 64); got != minPerAttempt {
 		t.Fatalf("minimum per-attempt budget = %v", got)

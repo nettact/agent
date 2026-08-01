@@ -1,4 +1,4 @@
-package proxydial
+package proxydial_test
 
 // End-to-end tests over a REAL WireGuard tunnel, both ends in this process.
 //
@@ -24,7 +24,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -41,7 +40,11 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
+	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/internal/proxydial"
+	"github.com/nettact/agent/internal/traceegress"
 	"github.com/nettact/agent/internal/traceroute"
+	"github.com/nettact/agent/probepolicy"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
@@ -57,7 +60,36 @@ var (
 	labOutside = netip.MustParseAddr("172.31.5.1") // outside the peer's AllowedIPs
 )
 
-const labAllowedIPs = "10.9.0.0/24"
+const (
+	labAllowedIPs = "10.9.0.0/24"
+
+	// Header sizes the lab builds packets with. Restated rather than borrowed:
+	// this harness lives outside the package it tests, and these are protocol
+	// constants, not implementation details.
+	labIPHeaderLen   = 20
+	labICMPHeaderLen = 8
+)
+
+// labGuard is the permissive target policy — the lab's addresses are private
+// and loopback, which a default policy would refuse.
+func labGuard() *netguard.Guard { return netguard.New(probepolicy.Policy{}, true) }
+
+// labIPChecksum is the RFC 791 header checksum, computed over a header whose
+// checksum field is zero. The lab needs its own: every packet it sends is also
+// injected into the agent's netstack, which validates it.
+func labIPChecksum(hdr []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(hdr); i += 2 {
+		if i == 10 {
+			continue
+		}
+		sum += uint32(binary.BigEndian.Uint16(hdr[i : i+2]))
+	}
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
+}
 
 // labRouter is one simulated hop. A silent router answers nothing, the way a
 // real one with ICMP rate limiting or a firewall does; its hop renders as `*`.
@@ -112,11 +144,11 @@ func (l *wgLab) Write(bufs [][]byte, offset int) (int, error) {
 // handle applies the topology to one echo request. Anything else the tunnel
 // carries is counted and ignored — the lab is a responder, not a stack.
 func (l *wgLab) handle(pkt []byte) {
-	if len(pkt) < ipv4HeaderLen+icmpEchoLen || pkt[0]>>4 != 4 || pkt[9] != 1 {
+	if len(pkt) < labIPHeaderLen+labICMPHeaderLen || pkt[0]>>4 != 4 || pkt[9] != 1 {
 		return
 	}
 	ihl := int(pkt[0]&0x0f) * 4
-	if len(pkt) < ihl+icmpEchoLen || pkt[ihl] != 8 {
+	if len(pkt) < ihl+labICMPHeaderLen || pkt[ihl] != 8 {
 		return
 	}
 	l.mu.Lock()
@@ -170,7 +202,7 @@ func (l *wgLab) Close() error {
 // checksums must be real: everything the lab sends is also injected into the
 // agent's netstack, which validates them (the mux's own sniffer does not).
 func labPacket(src, dst netip.Addr, body []byte) []byte {
-	pkt := make([]byte, ipv4HeaderLen+len(body))
+	pkt := make([]byte, labIPHeaderLen+len(body))
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
 	pkt[8] = 64
@@ -178,8 +210,8 @@ func labPacket(src, dst netip.Addr, body []byte) []byte {
 	s, d := src.As4(), dst.As4()
 	copy(pkt[12:16], s[:])
 	copy(pkt[16:20], d[:])
-	binary.BigEndian.PutUint16(pkt[10:12], ipv4HeaderChecksum(pkt[:ipv4HeaderLen]))
-	copy(pkt[ipv4HeaderLen:], body)
+	binary.BigEndian.PutUint16(pkt[10:12], labIPChecksum(pkt[:labIPHeaderLen]))
+	copy(pkt[labIPHeaderLen:], body)
 	return pkt
 }
 
@@ -191,7 +223,7 @@ func labEchoReply(req []byte) []byte {
 	msg := icmp.Message{Type: ipv4.ICMPTypeEchoReply, Body: &icmp.Echo{
 		ID:   int(binary.BigEndian.Uint16(b[4:6])),
 		Seq:  int(binary.BigEndian.Uint16(b[6:8])),
-		Data: append([]byte(nil), b[icmpEchoLen:]...),
+		Data: append([]byte(nil), b[labICMPHeaderLen:]...),
 	}}
 	body, err := msg.Marshal(nil)
 	if err != nil {
@@ -207,7 +239,7 @@ func labEchoReply(req []byte) []byte {
 func labTimeExceeded(req []byte, from netip.Addr) []byte {
 	ihl := int(req[0]&0x0f) * 4
 	msg := icmp.Message{Type: ipv4.ICMPTypeTimeExceeded, Body: &icmp.TimeExceeded{
-		Data: append([]byte(nil), req[:ihl+icmpEchoLen]...),
+		Data: append([]byte(nil), req[:ihl+labICMPHeaderLen]...),
 	}}
 	body, err := msg.Marshal(nil)
 	if err != nil {
@@ -292,9 +324,9 @@ func labListenPort(t *testing.T, dev *device.Device) int {
 
 // labManager builds the dialer the way an agent does: through Apply +
 // DialerForGeneration, so the generation pin is exercised too.
-func labManager(t *testing.T, spec pcfg.ProxySpec) (*Manager, *Dialer) {
+func labManager(t *testing.T, spec pcfg.ProxySpec) (*proxydial.Manager, *proxydial.Dialer) {
 	t.Helper()
-	m := newTestManager()
+	m := proxydial.NewManager(labGuard())
 	t.Cleanup(m.Close)
 	m.Apply([]pcfg.ProxySpec{spec})
 	d, err := m.DialerForGeneration(context.Background(), spec.ID, spec.ConfigSerial)
@@ -306,7 +338,7 @@ func labManager(t *testing.T, spec pcfg.ProxySpec) (*Manager, *Dialer) {
 
 // waitTunnelUp probes until the far side answers, absorbing the handshake. It
 // doubles as the assertion that the tunnel came up at all.
-func waitTunnelUp(t *testing.T, d *Dialer) {
+func waitTunnelUp(t *testing.T, d *proxydial.Dialer) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -410,7 +442,7 @@ func TestWireGuardLoopbackProbesCoexistWithNetstackTraffic(t *testing.T) {
 	waitTunnelUp(t, d)
 
 	type probeResult struct {
-		r   TraceProbeReply
+		r   proxydial.TraceProbeReply
 		err error
 	}
 	probeCh := make(chan probeResult, 1)
@@ -436,7 +468,7 @@ func TestWireGuardLoopbackProbesCoexistWithNetstackTraffic(t *testing.T) {
 // labTunnelPing sends one echo through netstack's own ping socket, exactly as
 // collector.tunnelPingOnce does, and matches the reply on sequence + payload
 // (the stack owns the ICMP id).
-func labTunnelPing(d *Dialer, seq int) error {
+func labTunnelPing(d *proxydial.Dialer, seq int) error {
 	c, err := d.DialPing(context.Background(), "ping4", labDest.String())
 	if err != nil {
 		return fmt.Errorf("dial ping: %w", err)
@@ -472,36 +504,6 @@ func labTunnelPing(d *Dialer, seq int) error {
 	}
 }
 
-// labEgressResolver mirrors the runtime bridge in agentrt: it is what turns a
-// pinned {id, generation} into an in-tunnel probe, and its error mapping IS the
-// fail-closed contract. Mirrored rather than imported because agentrt depends
-// on this package; the engine tests below drive the real Manager through it.
-func labEgressResolver(m *Manager) traceroute.EgressResolver {
-	return func(ctx context.Context, proxyID string, serial int) (traceroute.EgressProbeFunc, error) {
-		d, err := m.DialerForGeneration(ctx, proxyID, serial)
-		switch {
-		case errors.Is(err, ErrProxyGeneration):
-			return nil, fmt.Errorf("%w: %v", traceroute.ErrEgressGenerationMismatch, err)
-		case err != nil:
-			return nil, fmt.Errorf("%w: %v", traceroute.ErrEgressNotAvailable, err)
-		case d.Spec.Type != pcfg.ProxyTypeWireGuard:
-			return nil, fmt.Errorf("%w: %s cannot carry in-tunnel probes", traceroute.ErrEgressNotAvailable, d.Spec.Type)
-		}
-		return func(ctx context.Context, dest netip.Addr, ttl int, timeout time.Duration) (traceroute.EgressReply, error) {
-			r, perr := d.TraceProbe(ctx, dest, ttl, timeout)
-			if perr != nil {
-				return traceroute.EgressReply{}, perr
-			}
-			return traceroute.EgressReply{
-				Responder: r.Responder,
-				Reached:   r.Reached,
-				Timeout:   r.Timeout,
-				RTTMs:     float64(r.RTT.Microseconds()) / 1000,
-			}, nil
-		}, nil
-	}
-}
-
 func labTraceRequest(spec pcfg.ProxySpec, serial int) pcfg.TraceRequest {
 	return pcfg.TraceRequest{
 		ReportID: "trace-lab", Mode: pcfg.TraceModeICMP, DestinationHost: labDest.String(),
@@ -523,7 +525,7 @@ func TestWireGuardLoopbackEngineProducesAnAttestedInTunnelTrace(t *testing.T) {
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
 	// supported is EMPTY on purpose: this host cannot raw-socket its way to a
 	// host-stack traceroute, and the in-tunnel path must not care.
-	e := traceroute.New(bypassGuard(), permission.Set{}, granted, permission.Set{}, 2, labEgressResolver(m))
+	e := traceroute.New(labGuard(), permission.Set{}, granted, permission.Set{}, 2, traceegress.Resolver(m))
 
 	res := e.Run(context.Background(), labTraceRequest(spec, spec.ConfigSerial), time.Now())
 	if res.Status != telemetry.TraceStatusSucceeded {
@@ -568,7 +570,7 @@ func TestWireGuardLoopbackEngineFailsClosedOnRotatedGeneration(t *testing.T) {
 	before := lab.echoesSeen()
 
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
-	e := traceroute.New(bypassGuard(), granted, granted, granted, 2, labEgressResolver(m))
+	e := traceroute.New(labGuard(), granted, granted, granted, 2, traceegress.Resolver(m))
 
 	res := e.Run(context.Background(), labTraceRequest(spec, spec.ConfigSerial), time.Now())
 	if res.Status != telemetry.TraceStatusFailed || res.Reason != "egress_generation_mismatch" {
@@ -584,5 +586,40 @@ func TestWireGuardLoopbackEngineFailsClosedOnRotatedGeneration(t *testing.T) {
 	}
 	if res.PathScope != telemetry.TracePathWireGuardInner || res.EgressProxyID != spec.ID {
 		t.Fatalf("attestation = %s/%s, want wireguard_inner/%s", res.PathScope, res.EgressProxyID, spec.ID)
+	}
+}
+
+func TestWireGuardLoopbackEngineNamesAGenerationRotatedMidSweep(t *testing.T) {
+	// The narrow race the pre-flight pin check cannot cover: the rotation lands
+	// while the sweep is already running. Applying it closes the tunnel device
+	// under the in-flight probe, which fails with a generic "device closed" — and
+	// reporting THAT would blame the diagnostic machinery for a re-keyed tunnel.
+	// The refusal must still name the rotation.
+	lab, spec := startWGLab(t, labRouter{addr: labHop1, silent: true})
+	m, d := labManager(t, spec)
+	waitTunnelUp(t, d)
+
+	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
+	e := traceroute.New(labGuard(), granted, granted, granted, 2, traceegress.Resolver(m))
+
+	// The first hop is silent, so the sweep parks on it for its per-attempt
+	// budget. Rotating once that probe has demonstrably reached the far side puts
+	// the change strictly inside the sweep, with no sleep-and-hope.
+	before := lab.echoesSeen()
+	rotated := spec
+	rotated.ConfigSerial = spec.ConfigSerial + 1
+	go func() {
+		for lab.echoesSeen() == before {
+			time.Sleep(time.Millisecond)
+		}
+		m.Apply([]pcfg.ProxySpec{rotated})
+	}()
+
+	res := e.Run(context.Background(), labTraceRequest(spec, spec.ConfigSerial), time.Now())
+	if res.Status != telemetry.TraceStatusFailed || res.Reason != "egress_generation_mismatch" {
+		t.Fatalf("result = %s/%s, want failed/egress_generation_mismatch", res.Status, res.Reason)
+	}
+	if res.PathScope != telemetry.TracePathWireGuardInner || res.EgressConfigSerial != spec.ConfigSerial {
+		t.Fatalf("attestation = %s/%d, want wireguard_inner/%d", res.PathScope, res.EgressConfigSerial, spec.ConfigSerial)
 	}
 }

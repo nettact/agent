@@ -20,11 +20,11 @@ import (
 const (
 	maxHopsCeiling  = 64
 	maxAttempts     = 5
-	maxTotalTimeout = 120 * time.Second
+	maxTotalTimeout = 600 * time.Second
 
 	defaultMaxHops      = 30
 	defaultAttempts     = 3
-	defaultTotalTimeout = 90 * time.Second
+	defaultTotalTimeout = 300 * time.Second
 
 	// Per-attempt probe budget bounds, derived from the total timeout and hop
 	// count and then clamped into this window so one slow hop cannot starve the
@@ -315,9 +315,20 @@ sweep:
 	case out.reached:
 		out.status = telemetry.TraceStatusSucceeded
 	case hardErr != nil:
-		if errors.Is(hardErr, errUnsupported) {
+		// The egress sentinels mean the same thing here as they do at resolution:
+		// the pinned tunnel stopped being the one the fault was observed on. A
+		// generation can rotate MID-sweep, and reporting that as probe_failed
+		// would blame the diagnostic machinery for a re-keyed tunnel. Hops
+		// already collected are kept — they were measured on the pinned
+		// generation, before it went away.
+		switch {
+		case errors.Is(hardErr, errUnsupported):
 			out.status, out.reason = telemetry.TraceStatusUnsupported, reasonUnsupportedPlat
-		} else {
+		case errors.Is(hardErr, ErrEgressGenerationMismatch):
+			out.status, out.reason = telemetry.TraceStatusFailed, reasonEgressGenerationMismatch
+		case errors.Is(hardErr, ErrEgressNotAvailable):
+			out.status, out.reason = telemetry.TraceStatusFailed, reasonEgressNotAvailable
+		default:
 			out.status, out.reason = telemetry.TraceStatusFailed, reasonProbeFailed
 		}
 	case canceled:
