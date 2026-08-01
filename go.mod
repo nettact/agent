@@ -37,7 +37,7 @@ require (
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/crypto v0.53.0
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/time v0.7.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
