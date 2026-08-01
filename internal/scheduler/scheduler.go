@@ -125,8 +125,8 @@ func (s *Scheduler) selfLoop(ctx context.Context) {
 // empty reports whether a Result carries nothing at all. Passing one to the
 // sink is not free: an Append opens a transaction and consumes a group id
 // whatever it is given, so a collector that legitimately has nothing to say —
-// the game sensor while no game runs — would otherwise write to durable storage
-// on every tick, forever.
+// a probe whose targets are all still waiting out their own intervals — would
+// otherwise write to durable storage on every tick, forever.
 func empty(res collector.Result) bool {
 	return len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 &&
 		len(res.Blocked) == 0 && res.InterfaceSnapshot == nil

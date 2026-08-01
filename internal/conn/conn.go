@@ -507,6 +507,8 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 			Events:                batch.Events,
 			InventoryDelta:        batch.Inventory,
 			InterfaceSnapshots:    batch.Snapshots,
+			GameRuns:              batch.GameRuns,
+			GameBuckets:           batch.GameBuckets,
 			ReportedConfigVersion: r.appliedConfigVersion,
 		}
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {

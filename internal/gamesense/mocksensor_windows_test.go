@@ -36,14 +36,26 @@ func runMockSensor(scenario string, args []string) int {
 	switch scenario {
 	case "ok":
 		if probing {
-			fmt.Println(`{"type":"probe","proto":1,"sensor_version":"0.1.0-mock","caps":{"presentmon":true,"etw_session":true},"reason":""}`)
+			fmt.Println(`{"type":"probe","proto":2,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
 			return 0
 		}
-		fmt.Println(`{"type":"hello","proto":1,"sensor_version":"0.1.0-mock","caps":{"presentmon":true,"etw_session":true}}`)
-		fmt.Println(`{"type":"status","state":"tracking","pid":4242,"proc":"mock.exe"}`)
+		// The capabilities are stated, not promised: hello is written once the
+		// frame source is open and its query registered, so by here the sensor
+		// knows which optional fields its seconds will carry.
+		fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+			`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`)
+		fmt.Println(`{"type":"status","state":"tracking","pid":4242,"proc":"mock.exe","title":"Mock Game"}`)
 		for i := 0; i < 3; i++ {
-			fmt.Printf(`{"type":"fps","ts":"2026-08-01T12:00:0%dZ","pid":4242,"proc":"mock.exe","fps":%d,"frames":%d,"ft_avg_ms":16.7,"ft_p95_ms":19.2,"presented":%d,"dropped":0}`+"\n",
-				i, 60+i, 60+i, 60+i)
+			// A complete second: counts by outcome, within-second frame-time
+			// statistics, and the full 24-bin histogram those statistics cannot
+			// replace when the seconds are later merged into a whole run.
+			fmt.Printf(`{"type":"sec","ts":"2026-08-01T12:00:0%dZ","pid":4242,"proc":"mock.exe",`+
+				`"frames":{"presented":%d,"displayed":%d,"dropped":1,"app":%d,"generated":0},`+
+				`"ft":{"avg":16.667,"p50":16.6,"p95":19.2,"p99":22.1,"max":31.4,"sd":2.2},`+
+				`"ft_hist":{"layout":"log24_v1","counts":[0,0,0,0,0,0,0,0,0,0,0,0,%d,2,0,0,0,0,0,0,0,0,0,0]},`+
+				`"disp_ft":{"avg":16.9,"p95":20.1},`+
+				`"present":{"mode":"hardware_independent_flip","sync":0,"tearing":false,"api":"dxgi"}}`+"\n",
+				i, 60+i, 59+i, 60+i, 58+i)
 		}
 		// Wait for the agent to close stdin — the documented stop signal.
 		_, _ = os.Stdin.Read(make([]byte, 1))
@@ -51,15 +63,18 @@ func runMockSensor(scenario string, args []string) int {
 
 	case "blocked":
 		if probing {
-			fmt.Println(`{"type":"probe","proto":1,"sensor_version":"0.1.0-mock","caps":{"presentmon":true,"etw_session":false},"reason":"etw_access_denied"}`)
+			fmt.Println(`{"type":"probe","proto":2,"sensor_version":"0.2.0-mock","ok":false,` +
+				`"reason":"service_unavailable"}`)
 			return 0
 		}
-		fmt.Println(`{"type":"hello","proto":1,"caps":{"presentmon":true,"etw_session":false}}`)
-		fmt.Println(`{"type":"status","state":"error","reason":"etw_access_denied"}`)
+		// A hello with no source is a run that failed to start; the status that
+		// follows carries the reason, and the sensor gives up.
+		fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock"}`)
+		fmt.Println(`{"type":"status","state":"error","reason":"service_unavailable"}`)
 		return 4
 
 	case "future":
-		fmt.Println(`{"type":"probe","proto":99,"sensor_version":"9.9.9","caps":{"presentmon":true,"etw_session":true}}`)
+		fmt.Println(`{"type":"probe","proto":99,"sensor_version":"9.9.9","ok":true}`)
 		return 0
 
 	case "garbage":
@@ -74,8 +89,13 @@ func runMockSensor(scenario string, args []string) int {
 		return 0
 
 	case "runcrash":
-		fmt.Println(`{"type":"hello","proto":1,"caps":{"presentmon":true,"etw_session":true}}`)
-		fmt.Println(`{"type":"fps","ts":"2026-08-01T12:00:00Z","pid":1,"proc":"mock.exe","fps":42,"ft_avg_ms":23.8,"ft_p95_ms":25.0}`)
+		fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+			`"caps":["displayed"]}`)
+		fmt.Println(`{"type":"status","state":"tracking","pid":1,"proc":"mock.exe","title":"Mock Game"}`)
+		fmt.Println(`{"type":"sec","ts":"2026-08-01T12:00:00Z","pid":1,"proc":"mock.exe",` +
+			`"frames":{"presented":42,"displayed":42,"dropped":0},` +
+			`"ft":{"avg":23.8,"p50":23.5,"p95":25.0,"p99":27.0,"max":30.0,"sd":1.5},` +
+			`"ft_hist":{"layout":"log24_v1","counts":[0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,0,0,0,0,0]}}`)
 		return 4
 
 	default:
@@ -102,7 +122,7 @@ func TestProbeAgainstMockSensor(t *testing.T) {
 		wantReason string
 	}{
 		{"ok", true, ""},
-		{"blocked", false, ReasonETWAccessDenied},
+		{"blocked", false, ReasonServiceUnavailable},
 		{"future", false, ReasonProtoMismatch},
 		{"garbage", false, ReasonProbeFailed},
 		{"crash", false, ReasonProbeFailed},
@@ -144,7 +164,7 @@ func TestProbeReportsAMissingExecutable(t *testing.T) {
 
 // The full spawn path: the agent starts the sensor, reads its stream, and stops
 // it by closing stdin.
-func TestRunOnceCollectsFromMockSensor(t *testing.T) {
+func TestRunOnceRecordsFromMockSensor(t *testing.T) {
 	s := NewSupervisor(self(t, "ok"), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -160,9 +180,9 @@ func TestRunOnceCollectsFromMockSensor(t *testing.T) {
 		}
 		select {
 		case err := <-done:
-			t.Fatalf("sensor exited early (%v) with %d samples", err, len(s.peek()))
+			t.Fatalf("sensor exited early (%v) with %d buckets", err, len(s.peek()))
 		case <-deadline:
-			t.Fatalf("timed out with %d samples", len(s.peek()))
+			t.Fatalf("timed out with %d buckets", len(s.peek()))
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -174,28 +194,42 @@ func TestRunOnceCollectsFromMockSensor(t *testing.T) {
 		t.Fatal("runOnce did not return after cancellation")
 	}
 
-	got := s.Drain()
-	if len(got) != 3 {
-		t.Fatalf("collected %d samples, want 3", len(got))
+	runs, buckets := s.Drain()
+	if len(runs) != 1 {
+		t.Fatalf("recorded %d runs, want 1: %+v", len(runs), runs)
 	}
-	if got[0].Proc != "mock.exe" || got[0].PID != 4242 || got[0].FPS != 60 {
-		t.Fatalf("first sample = %+v", got[0])
+	if runs[0].Proc != "mock.exe" || runs[0].Title != "Mock Game" {
+		t.Fatalf("run = %+v", runs[0])
+	}
+	if runs[0].Source != "presentmon_service" || len(runs[0].Caps) != 4 {
+		t.Fatalf("run = %+v, want the hello's source and capabilities", runs[0])
+	}
+	if len(buckets) != 3 {
+		t.Fatalf("recorded %d buckets, want 3", len(buckets))
+	}
+	if buckets[0].RunID != runs[0].ID || buckets[0].Frames.Presented != 60 {
+		t.Fatalf("first bucket = %+v", buckets[0])
+	}
+	if buckets[0].Hist.Layout != "log24_v1" || len(buckets[0].Hist.Counts) != 24 {
+		t.Fatalf("first bucket histogram = %+v", buckets[0].Hist)
 	}
 }
 
-// A sensor that dies mid-stream keeps what it already produced: the samples are
-// real seconds that happened, and discarding them would widen the chart gap for
-// no reason.
-func TestRunOnceKeepsSamplesFromACrashedSensor(t *testing.T) {
+// A sensor that dies mid-stream keeps what it already produced: the seconds are
+// real and discarding them would widen the chart gap for no reason.
+func TestRunOnceKeepsBucketsFromACrashedSensor(t *testing.T) {
 	s := NewSupervisor(self(t, "runcrash"), nil)
 
 	err := s.runOnce(context.Background())
 	if err == nil {
 		t.Fatal("runOnce() = nil, want the non-zero exit reported")
 	}
-	got := s.Drain()
-	if len(got) != 1 || got[0].FPS != 42 {
-		t.Fatalf("collected %+v, want the one sample emitted before the crash", got)
+	runs, buckets := s.Drain()
+	if len(runs) != 1 || len(buckets) != 1 {
+		t.Fatalf("recorded %+v / %+v, want the one run and second emitted before the crash", runs, buckets)
+	}
+	if buckets[0].Frames.Presented != 42 {
+		t.Fatalf("bucket = %+v", buckets[0])
 	}
 }
 

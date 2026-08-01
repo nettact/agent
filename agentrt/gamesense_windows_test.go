@@ -17,6 +17,7 @@ import (
 	"github.com/nettact/agent/internal/gamesense"
 	"github.com/nettact/agent/internal/identity"
 	pcfg "github.com/nettact/protocol/config"
+	gs "github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
@@ -24,7 +25,7 @@ import (
 
 // The sensor component is closed and not built here, so the test binary plays it:
 // TestMain sees the scenario variable and runs as nettact-sensor.exe instead of a
-// test. That makes the whole path testable — probe, spawn, collect, upload —
+// test. That makes the whole path testable — probe, spawn, record, upload —
 // without the component, which is exactly the situation the agent's own CI is in.
 
 const mockSensorEnv = "NETTACT_AGENTRT_MOCK_SENSOR"
@@ -36,8 +37,8 @@ func TestMain(m *testing.M) {
 	case "ok":
 		os.Exit(runMockSensor(os.Args[1:]))
 	case "blocked":
-		fmt.Println(`{"type":"probe","proto":1,"sensor_version":"0.1.0-mock",` +
-			`"caps":{"presentmon":true,"etw_session":false},"reason":"etw_access_denied"}`)
+		fmt.Println(`{"type":"probe","proto":2,"sensor_version":"0.2.0-mock",` +
+			`"ok":false,"reason":"service_unavailable"}`)
 		os.Exit(0)
 	default:
 		os.Exit(2)
@@ -46,20 +47,23 @@ func TestMain(m *testing.M) {
 
 func runMockSensor(args []string) int {
 	if len(args) > 0 && args[0] == "--probe" {
-		fmt.Println(`{"type":"probe","proto":1,"sensor_version":"0.1.0-mock",` +
-			`"caps":{"presentmon":true,"etw_session":true},"reason":""}`)
+		fmt.Println(`{"type":"probe","proto":2,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
 		return 0
 	}
-	fmt.Println(`{"type":"hello","proto":1,"sensor_version":"0.1.0-mock",` +
-		`"caps":{"presentmon":true,"etw_session":true}}`)
-	fmt.Println(`{"type":"status","state":"tracking","pid":4242,"proc":"mock-game.exe"}`)
+	fmt.Println(`{"type":"hello","proto":2,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+		`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`)
+	fmt.Println(`{"type":"status","state":"tracking","pid":4242,"proc":"mock-game.exe","title":"Mock Game"}`)
 	// One line per second, the cadence the contract specifies, so the volume the
 	// agent buffers and uploads here is the volume it will see in production.
 	go func() {
 		for i := 0; ; i++ {
-			fmt.Printf(`{"type":"fps","ts":"%s","pid":4242,"proc":"mock-game.exe",`+
-				`"fps":%d,"frames":%d,"ft_avg_ms":16.7,"ft_p95_ms":19.2,"presented":%d,"dropped":0}`+"\n",
-				time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), 60+i%3, 60+i%3, 60+i%3)
+			fmt.Printf(`{"type":"sec","ts":"%s","pid":4242,"proc":"mock-game.exe",`+
+				`"frames":{"presented":%d,"displayed":%d,"dropped":1,"app":%d,"generated":0},`+
+				`"ft":{"avg":16.667,"p50":16.6,"p95":19.2,"p99":22.1,"max":31.4,"sd":2.2},`+
+				`"ft_hist":{"layout":"log24_v1","counts":[0,0,0,0,0,0,0,0,0,0,0,0,58,2,0,0,0,0,0,0,0,0,0,0]},`+
+				`"disp_ft":{"avg":16.9,"p95":20.1},`+
+				`"present":{"mode":"hardware_independent_flip","sync":0,"tearing":false,"api":"dxgi"}}`+"\n",
+				time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), 60+i%3, 59+i%3, 60+i%3)
 			time.Sleep(time.Second)
 		}
 	}()
@@ -68,16 +72,16 @@ func runMockSensor(args []string) int {
 	return 0
 }
 
-// TestGameMetricsReachTheServer is the end-to-end proof for the agent half: a
-// sensor beside the agent turns into game.* metrics in an uploaded packet, and
-// the permission report says so.
-func TestGameMetricsReachTheServer(t *testing.T) {
+// TestGameDataReachesTheServer is the end-to-end proof for the agent half: a
+// sensor beside the agent turns into runs and per-second buckets on an uploaded
+// packet, and the permission report says so.
+func TestGameDataReachesTheServer(t *testing.T) {
 	t.Setenv(mockSensorEnv, "ok")
 	t.Setenv(gamesense.PathEnv, testExecutable(t))
 
-	f := newFake(t, hasGameMetric)
+	f := newFake(t, hasGameBucket)
 	runAgent(t, f)
-	report, metrics, _ := f.snapshot()
+	report, _, _ := f.snapshot()
 
 	for _, id := range []permission.ID{permission.GameProcessDetect, permission.GamePerformanceRead} {
 		if !contains(report.Supported, string(id)) {
@@ -87,7 +91,8 @@ func TestGameMetricsReachTheServer(t *testing.T) {
 			t.Errorf("effective = %v, want %q", report.Effective, id)
 		}
 	}
-	assertGameSeries(t, metrics)
+	runs, buckets := f.game()
+	assertGameRecords(t, runs, buckets)
 }
 
 // A sensor that is installed but cannot collect must not be reported as capable,
@@ -113,8 +118,8 @@ func TestBlockedSensorIsUnsupportedAndExplained(t *testing.T) {
 			continue
 		}
 		found++
-		if ev.Attrs["reason"] != gamesense.ReasonETWAccessDenied {
-			t.Errorf("reason = %q, want %q", ev.Attrs["reason"], gamesense.ReasonETWAccessDenied)
+		if ev.Attrs["reason"] != gamesense.ReasonServiceUnavailable {
+			t.Errorf("reason = %q, want %q", ev.Attrs["reason"], gamesense.ReasonServiceUnavailable)
 		}
 		if ev.Attrs["path"] == "" {
 			t.Error("event does not say which sensor is blocked")
@@ -132,17 +137,16 @@ func TestNoSensorIsSimplyUnsupported(t *testing.T) {
 
 	f := newFake(t, hasAnyPacket)
 	runAgent(t, f)
-	report, metrics, events := f.snapshot()
+	report, _, events := f.snapshot()
+	runs, buckets := f.game()
 
 	for _, id := range []permission.ID{permission.GameProcessDetect, permission.GamePerformanceRead} {
 		if contains(report.Supported, string(id)) {
 			t.Errorf("supported = %v, want %q absent with no sensor", report.Supported, id)
 		}
 	}
-	for _, m := range metrics {
-		if m.Kind == telemetry.GameFPS {
-			t.Errorf("game metric %+v produced without a sensor", m)
-		}
+	if len(runs) != 0 || len(buckets) != 0 {
+		t.Errorf("uploaded %d runs and %d buckets without a sensor", len(runs), len(buckets))
 	}
 	// Nothing installed is the ordinary state, not a problem to report.
 	for _, ev := range events {
@@ -152,51 +156,68 @@ func TestNoSensorIsSimplyUnsupported(t *testing.T) {
 	}
 }
 
-func assertGameSeries(t *testing.T, metrics []telemetry.Metric) {
+// assertGameRecords checks what the server can actually do with an upload: a run
+// it can name and address buckets to, and seconds that carry both their own
+// summary and the histogram a whole-run figure is later computed from.
+func assertGameRecords(t *testing.T, runs []gs.Run, buckets []gs.Bucket) {
 	t.Helper()
-	seen := map[telemetry.MetricKind]bool{}
-	for _, m := range metrics {
-		switch m.Kind {
-		case telemetry.GameFPS, telemetry.GameFrameTimeAvg, telemetry.GameFrameTimeP95:
-		default:
-			continue
-		}
-		seen[m.Kind] = true
-		if m.Target != "mock-game.exe" {
-			t.Errorf("%s target = %q, want the process name", m.Kind, m.Target)
-		}
-		if m.Layer != telemetry.LayerLocal {
-			t.Errorf("%s layer = %q, want %q", m.Kind, m.Layer, telemetry.LayerLocal)
-		}
-		if m.MonitorID != "" {
-			t.Errorf("%s carries monitor id %q, want none", m.Kind, m.MonitorID)
-		}
-		if m.TS.IsZero() {
-			t.Errorf("%s has no timestamp", m.Kind)
-		}
+	if len(runs) == 0 {
+		t.Fatal("no game run in the uploaded packets")
 	}
-	for _, kind := range []telemetry.MetricKind{
-		telemetry.GameFPS, telemetry.GameFrameTimeAvg, telemetry.GameFrameTimeP95,
-	} {
-		if !seen[kind] {
-			t.Errorf("no %s metric in the uploaded packet", kind)
-		}
+	if len(buckets) == 0 {
+		t.Fatal("no game bucket in the uploaded packets")
 	}
-	if u := unitOf(metrics, telemetry.GameFPS); u != telemetry.UnitFPS {
-		t.Errorf("%s unit = %q, want %q", telemetry.GameFPS, u, telemetry.UnitFPS)
-	}
-	if u := unitOf(metrics, telemetry.GameFrameTimeP95); u != telemetry.UnitMs {
-		t.Errorf("%s unit = %q, want %q", telemetry.GameFrameTimeP95, u, telemetry.UnitMs)
-	}
-}
 
-func unitOf(metrics []telemetry.Metric, kind telemetry.MetricKind) string {
-	for _, m := range metrics {
-		if m.Kind == kind {
-			return m.Unit
+	byID := map[string]gs.Run{}
+	for _, r := range runs {
+		if r.ID == "" {
+			t.Fatalf("run %+v has no id; buckets cannot be addressed to it", r)
+		}
+		if r.Proc != "mock-game.exe" {
+			t.Errorf("run proc = %q, want the process name", r.Proc)
+		}
+		if r.Title != "Mock Game" {
+			t.Errorf("run title = %q, want the window title", r.Title)
+		}
+		if r.Source != gs.SourcePresentMonService {
+			t.Errorf("run source = %q, want %q", r.Source, gs.SourcePresentMonService)
+		}
+		if len(r.Caps) == 0 {
+			t.Error("run records no capabilities; two runs cannot be compared without them")
+		}
+		if r.StartedAt.IsZero() || r.LastSeenAt.IsZero() {
+			t.Errorf("run %+v is not bounded in time", r)
+		}
+		byID[r.ID] = r
+	}
+	// The mock plays one game, so every second belongs to the same run however
+	// many times that run was re-sent.
+	if len(byID) != 1 {
+		t.Errorf("got %d distinct runs for one game: %+v", len(byID), runs)
+	}
+
+	for _, b := range buckets {
+		if _, ok := byID[b.RunID]; !ok {
+			t.Fatalf("bucket %+v hangs off a run the server was never sent", b)
+		}
+		if b.TS.IsZero() {
+			t.Errorf("bucket %+v has no timestamp", b)
+		}
+		if b.Frames.Presented == 0 {
+			t.Errorf("bucket %+v records no presented frames", b)
+		}
+		// Absent means "not measured". The mock declares the displayed capability,
+		// so these must have arrived rather than defaulted.
+		if b.Frames.Displayed == nil || b.Frames.Dropped == nil {
+			t.Errorf("bucket %+v lost the displayed/dropped counts the sensor sent", b)
+		}
+		if b.Hist.Layout != gs.HistLayoutLog24V1 || len(b.Hist.Counts) != gs.HistBins {
+			t.Errorf("bucket histogram = %+v, want a full %s histogram", b.Hist, gs.HistLayoutLog24V1)
+		}
+		if b.Present == nil || b.Present.Sync == nil || b.Present.Tearing == nil {
+			t.Errorf("bucket %+v lost the presentation detail, where zero and false are observations", b)
 		}
 	}
-	return ""
 }
 
 // fake is a server that speaks just enough of the protocol to observe one agent:
@@ -210,6 +231,8 @@ type fake struct {
 	report  permission.PermissionReport
 	metrics []telemetry.Metric
 	events  []telemetry.Event
+	runs    []gs.Run
+	buckets []gs.Bucket
 }
 
 // newFake starts the server. want is called for every frame; the first true ends
@@ -267,6 +290,8 @@ func newFake(t *testing.T, want func(wire.Frame) bool) *fake {
 				f.mu.Lock()
 				f.metrics = append(f.metrics, fr.Packet.Metrics...)
 				f.events = append(f.events, fr.Packet.Events...)
+				f.runs = append(f.runs, fr.Packet.GameRuns...)
+				f.buckets = append(f.buckets, fr.Packet.GameBuckets...)
 				f.mu.Unlock()
 				if err := write(wire.Frame{Ack: &wire.Ack{HighestSequence: fr.Packet.Sequence}}); err != nil {
 					return
@@ -287,17 +312,19 @@ func (f *fake) snapshot() (permission.PermissionReport, []telemetry.Metric, []te
 	return f.report, append([]telemetry.Metric(nil), f.metrics...), append([]telemetry.Event(nil), f.events...)
 }
 
-// hasGameMetric is the condition for "the whole path worked".
-func hasGameMetric(fr wire.Frame) bool {
-	if fr.Packet == nil {
-		return false
-	}
-	for _, m := range fr.Packet.Metrics {
-		if m.Kind == telemetry.GameFPS {
-			return true
-		}
-	}
-	return false
+// game returns every game record the server has received. Runs accumulate as
+// they arrive rather than being deduplicated: an upsert stream is what the agent
+// is supposed to produce, and collapsing it here would hide a run whose id
+// changed mid-session.
+func (f *fake) game() ([]gs.Run, []gs.Bucket) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]gs.Run(nil), f.runs...), append([]gs.Bucket(nil), f.buckets...)
+}
+
+// hasGameBucket is the condition for "the whole path worked".
+func hasGameBucket(fr wire.Frame) bool {
+	return fr.Packet != nil && len(fr.Packet.GameBuckets) > 0
 }
 
 func hasEvent(kind telemetry.EventType) func(wire.Frame) bool {

@@ -135,6 +135,15 @@ const (
 	EventDisconnected
 )
 
+// maxGameDrainInterval bounds how long game seconds may sit in the sensor
+// recorder before being written to the WAL.
+//
+// The recorder holds ten minutes of them, and the upload interval is
+// configurable well past that, so the drain cannot simply follow it: the oldest
+// seconds would age out of the ring before anything durable had seen them. A
+// minute leaves an order of magnitude of headroom.
+const maxGameDrainInterval = time.Minute
+
 // Event is a non-terminal lifecycle notification. Terminal outcomes are Run's
 // return value, never an Event.
 type Event struct {
@@ -277,21 +286,21 @@ func Run(ctx context.Context, cfg Config) error {
 	if granted.Has(permission.HostTemperatureRead) && collector.TemperatureSupported(ctx) {
 		supported.Add(permission.HostTemperatureRead)
 	}
-	// Frame metrics come from a separate sensor component that most installs do
-	// not ship, so the capability question is first "is it here at all" and only
-	// then "can it work". Both answers are needed: a missing component is the
-	// ordinary state and says nothing, while an installed one that cannot open a
-	// trace session is a fixable problem the operator would otherwise have no way
-	// to see. The probe runs the component, so it stays behind the grant for the
-	// same reason the temperature read does.
+	// Frame data comes from a separate sensor component that most installs do not
+	// ship, so the capability question is first "is it here at all" and only then
+	// "can it work". Both answers are needed: a missing component is the ordinary
+	// state and says nothing, while an installed one that cannot capture is a
+	// fixable problem the operator would otherwise have no way to see. The probe
+	// runs the component, so it stays behind the grant for the same reason the
+	// temperature read does.
 	var gameSensorPath string
 	var gameProbe gamesense.ProbeResult
 	// Either grant is reason enough to ask. Unlike the temperature probe, this one
-	// performs no part of what the permissions gate — it opens and closes an empty
-	// trace session and looks for a file — so requiring the broader permission
-	// before asking would only make a policy that grants detection alone report
-	// detection as unsupported on a machine that can do it. EffectiveFrom still
-	// removes whatever was not granted.
+	// captures nothing — it looks for the component and asks it whether a frame
+	// source answers — so requiring the broader permission before asking would only
+	// make a policy that grants detection alone report detection as unsupported on
+	// a machine that can do it. EffectiveFrom still removes whatever was not
+	// granted.
 	if granted.Has(permission.GameProcessDetect) || granted.Has(permission.GamePerformanceRead) {
 		if path, ok := gamesense.Locate(Version == "dev"); ok {
 			gameSensorPath = path
@@ -373,7 +382,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// leave a warning to be uploaded on the next start.
 	if gameSensorPath != "" && !gameProbe.OK && ctx.Err() == nil && blockedSensorUnreported(gameSensorPath, gameProbe.Reason) {
 		log.Printf("game sensor at %s unavailable: %s", gameSensorPath, gameProbe.Reason)
-		_, _ = outbox.Append(nil, []telemetry.Event{{
+		_, _ = outbox.Append(wal.Records{Events: []telemetry.Event{{
 			ID:       uuid.NewString(),
 			TS:       time.Now().UTC(),
 			Type:     telemetry.EventGameSensorBlocked,
@@ -384,7 +393,7 @@ func Run(ctx context.Context, cfg Config) error {
 				"reason": gameProbe.Reason,
 				"path":   gameSensorPath,
 			},
-		}}, nil, nil)
+		}}})
 	}
 
 	// Construct collectors gated by effective permissions. A denied collector is
@@ -445,7 +454,12 @@ func Run(ctx context.Context, cfg Config) error {
 		if res.InterfaceSnapshot != nil {
 			snaps = []telemetry.InterfaceSnapshot{*res.InterfaceSnapshot}
 		}
-		dropped, err := outbox.Append(res.Metrics, res.Events, res.Inventory, snaps)
+		dropped, err := outbox.Append(wal.Records{
+			Metrics:   res.Metrics,
+			Events:    res.Events,
+			Inventory: res.Inventory,
+			Snapshots: snaps,
+		})
 		if err != nil {
 			log.Printf("wal append: %v", err)
 			return
@@ -482,16 +496,15 @@ func Run(ctx context.Context, cfg Config) error {
 		))
 	}
 	// The game sensor is a child process streaming a line per second, so unlike
-	// the collectors above it does not do its work on a tier: the supervisor
-	// buffers what arrives and the collector only drains that buffer. Built here
-	// so its collector joins this round of tiered collectors; started below, once
-	// the run context and shutdown wait group exist.
+	// the collectors above it does not do its work on a tier and produces no
+	// metrics at all: the supervisor records runs and per-second buckets, and the
+	// agent drains them on the upload cadence. Built here, started below, once the
+	// run context and shutdown wait group exist.
 	var gameSensor *gamesense.Supervisor
 	if effective.Has(permission.GamePerformanceRead) && gameProbe.OK {
 		gameSensor = gamesense.NewSupervisor(gameSensorPath, func(ev telemetry.Event) {
-			_, _ = outbox.Append(nil, []telemetry.Event{ev}, nil, nil)
+			_, _ = outbox.Append(wal.Records{Events: []telemetry.Event{ev}})
 		})
-		tiered = append(tiered, gamesense.NewCollector(gameSensor))
 	}
 	sched := scheduler.New(tiered, selfSched, sink)
 
@@ -509,10 +522,67 @@ func Run(ctx context.Context, cfg Config) error {
 	// stops it and waits for it before the WAL closes underneath the events it may
 	// still be appending — and so the child process is gone before Run returns.
 	if gameSensor != nil {
+		// Game data goes into the WAL exactly like a collector's metrics and events
+		// do, rather than being attached to a packet at send time. The WAL is what
+		// makes telemetry survive an unreachable server and a crash mid-upload, and
+		// a run recorded while offline is precisely the data worth keeping — a game
+		// played during an outage is still a game that was played. Riding the same
+		// rows also puts runs and buckets under the (agent_id, sequence) dedup that
+		// makes the at-least-once upload safe to replay.
+		//
+		// One Append per drain, so the runs and the buckets that hang from them are
+		// one WAL group and therefore one packet: the server never sees a bucket
+		// whose run it has not been told about.
+		flushGame := func() {
+			runs, buckets := gameSensor.Drain()
+			if len(runs) == 0 && len(buckets) == 0 {
+				// An idle desktop produces nothing for hours. Appending anyway would
+				// consume a group id and write a transaction on every tick, forever.
+				return
+			}
+			dropped, err := outbox.Append(wal.Records{GameRuns: runs, GameBuckets: buckets})
+			if err != nil {
+				// Put them back. The drain already emptied the recorder, so
+				// returning here without this turns one failed write — a full
+				// disk, a moment of database contention — into a permanent hole
+				// in the middle of a session.
+				gameSensor.Requeue(runs, buckets)
+				log.Printf("wal append game data: %v", err)
+				return
+			}
+			if dropped > 0 {
+				log.Printf("WAL over capacity: dropped %d oldest samples (data gap)", dropped)
+			}
+		}
 		hbWG.Add(1)
 		go func() {
 			defer hbWG.Done()
 			gameSensor.Run(runCtx)
+			// Run closes the in-progress game run as it stops, so this final drain is
+			// what carries that ending — and the seconds since the last tick — into
+			// the WAL while it is still open.
+			flushGame()
+		}()
+		hbWG.Add(1)
+		go func() {
+			defer hbWG.Done()
+			// Draining on the upload cadence keeps a second at most one upload
+			// behind the moment it describes, but never less often than
+			// maxGameDrainInterval: the recorder holds ten minutes of seconds, and
+			// a configured upload interval longer than that would let the oldest
+			// ones fall out of the ring before they were ever written down. A
+			// drain that outpaces the upload costs nothing — the WAL is where they
+			// were going anyway, and arriving early is how they survive a crash.
+			t := time.NewTicker(min(cfg.UploadInterval, maxGameDrainInterval))
+			defer t.Stop()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-t.C:
+					flushGame()
+				}
+			}
 		}()
 	}
 
@@ -527,10 +597,10 @@ func Run(ctx context.Context, cfg Config) error {
 		defer t.Stop()
 		emit := func() {
 			now := time.Now().UTC()
-			_, _ = outbox.Append([]telemetry.Metric{
+			_, _ = outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 				{TS: now, Kind: telemetry.AgentUptime, Target: "agent", Layer: telemetry.LayerLocal, Value: time.Since(start).Seconds(), Unit: telemetry.UnitSec},
 				{TS: now, Kind: telemetry.AgentWALPending, Target: "agent", Layer: telemetry.LayerLocal, Value: float64(outbox.Pending()), Unit: telemetry.UnitCount},
-			}, nil, nil, nil)
+			}})
 		}
 		emit()
 		for {

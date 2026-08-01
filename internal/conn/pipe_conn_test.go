@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nettact/agent/internal/wal"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
@@ -40,9 +41,9 @@ func TestRunOverPipe(t *testing.T) {
 	deps, outbox, fc, fs := newTestDeps(t)
 
 	// Seed one batch so the session has something to drain + await an ack for.
-	if _, err := outbox.Append([]telemetry.Metric{
+	if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 		{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Layer: telemetry.LayerLocal, Value: 1, Unit: telemetry.UnitSec},
-	}, nil, nil, nil); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed wal: %v", err)
 	}
 

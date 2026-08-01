@@ -70,8 +70,9 @@ func TestWaitJoinsInFlightCollector(t *testing.T) {
 
 // A collector with nothing to report must not reach the sink. Appending is not
 // free — it opens a transaction and consumes a group id whatever it is handed —
-// so a collector that is legitimately silent most of the time (the game sensor
-// while no game runs) would otherwise write to durable storage on every tick.
+// so a collector that is legitimately silent most of the time (a probe whose
+// targets are all mid-interval) would otherwise write to durable storage on
+// every tick.
 func TestEmptyTieredResultNeverReachesSink(t *testing.T) {
 	empties := fixedCollector{result: collector.Result{}}
 	var mu sync.Mutex

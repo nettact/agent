@@ -24,7 +24,7 @@ func TestNextBatchKeepsCollectorResultWhole(t *testing.T) {
 		SampledAt: now, WiFiState: telemetry.WiFiCollectionOK,
 		Interfaces: []telemetry.InterfaceState{{Name: "wlan0", IsWireless: true, WiFi: &telemetry.WiFiInfo{State: telemetry.WiFiConnected, SSID: "home"}}},
 	}}
-	if _, err := s.Append(metrics, nil, nil, snaps); err != nil {
+	if _, err := s.Append(Records{Metrics: metrics, Snapshots: snaps}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
@@ -58,7 +58,7 @@ func TestFastForwardPreservesInflightAndAdvancesNewBatches(t *testing.T) {
 		return []telemetry.Metric{{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: v}}
 	}
 
-	if _, err := s.Append(metric(1), nil, nil, nil); err != nil {
+	if _, err := s.Append(Records{Metrics: metric(1)}); err != nil {
 		t.Fatal(err)
 	}
 	first, ok, err := s.NextBatch(10)
@@ -78,7 +78,7 @@ func TestFastForwardPreservesInflightAndAdvancesNewBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.Append(metric(2), nil, nil, nil); err != nil {
+	if _, err := s.Append(Records{Metrics: metric(2)}); err != nil {
 		t.Fatal(err)
 	}
 	advanced, ok, err := s.NextBatch(10)
@@ -93,7 +93,7 @@ func TestFastForwardPreservesInflightAndAdvancesNewBatches(t *testing.T) {
 	if err := s.FastForward(50); err != nil {
 		t.Fatalf("lower FastForward: %v", err)
 	}
-	if _, err := s.Append(metric(3), nil, nil, nil); err != nil {
+	if _, err := s.Append(Records{Metrics: metric(3)}); err != nil {
 		t.Fatal(err)
 	}
 	next, ok, err := s.NextBatch(10)

@@ -250,9 +250,9 @@ func TestHelloThenDrainAck(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			deps, outbox, _, _ := newTestDeps(t)
-			if _, err := outbox.Append([]telemetry.Metric{
+			if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 				{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 1, Unit: telemetry.UnitSec},
-			}, nil, nil, nil); err != nil {
+			}}); err != nil {
 				t.Fatalf("wal append: %v", err)
 			}
 
@@ -319,9 +319,9 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			deps, outbox, _, _ := newTestDeps(t)
-			if _, err := outbox.Append([]telemetry.Metric{{
+			if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{{
 				TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 1,
-			}}, nil, nil, nil); err != nil {
+			}}}); err != nil {
 				t.Fatalf("append first: %v", err)
 			}
 
@@ -360,9 +360,9 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("server never acknowledged first packet")
 			}
-			if _, err := outbox.Append([]telemetry.Metric{{
+			if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{{
 				TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2,
-			}}, nil, nil, nil); err != nil {
+			}}}); err != nil {
 				t.Fatalf("append second: %v", err)
 			}
 
@@ -422,9 +422,9 @@ func TestDesiredStateApplied(t *testing.T) {
 		t.Errorf("intervals = %v/%v, want 5s/60s", base, regular)
 	}
 	// A packet sent after the push must carry the applied version.
-	if _, err := outbox.Append([]telemetry.Metric{
+	if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 		{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2, Unit: telemetry.UnitSec},
-	}, nil, nil, nil); err != nil {
+	}}); err != nil {
 		t.Fatalf("wal append: %v", err)
 	}
 	select {

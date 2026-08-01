@@ -17,7 +17,7 @@ import (
 // It is opt-in because the component is closed and this repository never builds
 // it. Point NETTACT_SENSOR_PATH at a published nettact-sensor.exe to run it:
 //
-//	$env:NETTACT_SENSOR_PATH = "...\sensor-win\dist\nettact-sensor.exe"
+//	$env:NETTACT_SENSOR_PATH = "...\desktop\dist\nettact-sensor.exe"
 //	go test ./internal/gamesense/ -run TestRealSensor -v
 func TestRealSensorSpeaksTheContract(t *testing.T) {
 	path := os.Getenv(PathEnv)
@@ -47,6 +47,6 @@ func TestRealSensorSpeaksTheContract(t *testing.T) {
 	if got.OK && got.Reason != "" {
 		t.Errorf("probe = %+v; a working sensor must not carry a failure reason", got)
 	}
-	t.Logf("real sensor %s: ok=%v presentmon=%v etw=%v reason=%q",
-		got.SensorVersion, got.OK, got.PresentMon, got.ETWSession, got.Reason)
+	t.Logf("real sensor %s: ok=%v pm_version=%q reason=%q",
+		got.SensorVersion, got.OK, got.PMVersion, got.Reason)
 }

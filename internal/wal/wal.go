@@ -16,14 +16,17 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/telemetry"
 )
 
 const (
-	kindMetric    = "m"
-	kindEvent     = "e"
-	kindInventory = "i"
-	kindSnapshot  = "n" // telemetry.InterfaceSnapshot (authoritative interface set)
+	kindMetric     = "m"
+	kindEvent      = "e"
+	kindInventory  = "i"
+	kindSnapshot   = "n" // telemetry.InterfaceSnapshot (authoritative interface set)
+	kindGameRun    = "g" // gamesense.Run
+	kindGameBucket = "b" // gamesense.Bucket
 )
 
 // Store is the SQLite-backed outbox.
@@ -65,10 +68,26 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// Append durably stores one collect result's items and enforces caps. It
-// returns the number of untagged samples dropped for over-capacity (>0 means a
-// data gap the caller should surface).
-func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv []telemetry.InventoryItem, snaps []telemetry.InterfaceSnapshot) (dropped int, err error) {
+// Records is one Append's worth of telemetry. A struct rather than a parameter
+// per payload kind because the kinds are added to over time and every caller
+// fills two or three of them: naming the ones it has beats counting nils.
+//
+// Everything in one Records is stored as one indivisible group, so a caller that
+// puts related records together — a run and the buckets that hang from it — is
+// guaranteed they reach the server in the same packet.
+type Records struct {
+	Metrics     []telemetry.Metric
+	Events      []telemetry.Event
+	Inventory   []telemetry.InventoryItem
+	Snapshots   []telemetry.InterfaceSnapshot
+	GameRuns    []gamesense.Run
+	GameBuckets []gamesense.Bucket
+}
+
+// Append durably stores one batch of records and enforces caps. It returns the
+// number of untagged samples dropped for over-capacity (>0 means a data gap the
+// caller should surface).
+func (s *Store) Append(r Records) (dropped int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -103,23 +122,33 @@ func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv
 		_, e := stmt.Exec(now, kind, string(b), grp)
 		return e
 	}
-	for i := range metrics {
-		if err = ins(kindMetric, metrics[i]); err != nil {
+	for i := range r.Metrics {
+		if err = ins(kindMetric, r.Metrics[i]); err != nil {
 			return 0, err
 		}
 	}
-	for i := range events {
-		if err = ins(kindEvent, events[i]); err != nil {
+	for i := range r.Events {
+		if err = ins(kindEvent, r.Events[i]); err != nil {
 			return 0, err
 		}
 	}
-	for i := range inv {
-		if err = ins(kindInventory, inv[i]); err != nil {
+	for i := range r.Inventory {
+		if err = ins(kindInventory, r.Inventory[i]); err != nil {
 			return 0, err
 		}
 	}
-	for i := range snaps {
-		if err = ins(kindSnapshot, snaps[i]); err != nil {
+	for i := range r.Snapshots {
+		if err = ins(kindSnapshot, r.Snapshots[i]); err != nil {
+			return 0, err
+		}
+	}
+	for i := range r.GameRuns {
+		if err = ins(kindGameRun, r.GameRuns[i]); err != nil {
+			return 0, err
+		}
+	}
+	for i := range r.GameBuckets {
+		if err = ins(kindGameBucket, r.GameBuckets[i]); err != nil {
 			return 0, err
 		}
 	}
@@ -170,11 +199,13 @@ func (s *Store) Append(metrics []telemetry.Metric, events []telemetry.Event, inv
 
 // Batch is a packet to upload.
 type Batch struct {
-	Sequence  uint64
-	Metrics   []telemetry.Metric
-	Events    []telemetry.Event
-	Inventory []telemetry.InventoryItem
-	Snapshots []telemetry.InterfaceSnapshot
+	Sequence    uint64
+	Metrics     []telemetry.Metric
+	Events      []telemetry.Event
+	Inventory   []telemetry.InventoryItem
+	Snapshots   []telemetry.InterfaceSnapshot
+	GameRuns    []gamesense.Run
+	GameBuckets []gamesense.Bucket
 }
 
 // NextBatch returns the next packet to send. A pending (previously-tagged)
@@ -359,6 +390,16 @@ func (s *Store) loadBatch(seq uint64) (Batch, bool, error) {
 			var s telemetry.InterfaceSnapshot
 			if json.Unmarshal([]byte(data), &s) == nil {
 				b.Snapshots = append(b.Snapshots, s)
+			}
+		case kindGameRun:
+			var r gamesense.Run
+			if json.Unmarshal([]byte(data), &r) == nil {
+				b.GameRuns = append(b.GameRuns, r)
+			}
+		case kindGameBucket:
+			var bk gamesense.Bucket
+			if json.Unmarshal([]byte(data), &bk) == nil {
+				b.GameBuckets = append(b.GameBuckets, bk)
 			}
 		}
 	}
