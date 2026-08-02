@@ -54,6 +54,14 @@ func TestMain(m *testing.M) {
 		fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock",` +
 			`"ok":false,"reason":"service_unavailable"}`)
 		os.Exit(0)
+	case "stale":
+		// A sensor left over from an older install, speaking a protocol this agent
+		// no longer implements. It reports that everything is fine, and cannot know
+		// otherwise — a sensor has no idea what it is talking to. The mismatch is
+		// therefore the agent's own diagnosis, which is exactly why it has to
+		// survive the trip to the console.
+		fmt.Println(`{"type":"probe","proto":1,"sensor_version":"0.1.0-mock","ok":true}`)
+		os.Exit(0)
 	default:
 		os.Exit(2)
 	}
@@ -213,6 +221,12 @@ func TestGameDataReachesTheServer(t *testing.T) {
 	if contains(report.Effective, string(permission.GameGPURead)) {
 		t.Errorf("effective = %v, want %q dropped by the capability probe", report.Effective, permission.GameGPURead)
 	}
+	// It was asked and answered, so the answer travels. Without it this machine is
+	// indistinguishable from one whose sensor is broken, and the remedy offered
+	// for the two could not be more different — there is nothing to fix here.
+	if got := report.UnsupportedReasons[string(permission.GameGPURead)]; got != gs.ReasonGPUTelemetryUnavailable {
+		t.Errorf("reason for %s = %q, want %q", permission.GameGPURead, got, gs.ReasonGPUTelemetryUnavailable)
+	}
 	// This site named no games, so the process was recorded as an ordinary one —
 	// base depth — and the run must not advertise the deeper measurements the
 	// sensor declared it was capable of. The sensor states what the process can
@@ -306,6 +320,12 @@ func TestUngrantedAdapterReadIsNeverProbed(t *testing.T) {
 	if contains(report.Supported, string(permission.GameGPURead)) {
 		t.Errorf("supported = %v, want %q absent: the machine can, but was never asked",
 			report.Supported, permission.GameGPURead)
+	}
+	// No entry either, which is the other half of the same statement: the report
+	// spells an unasked question as an absent key, and a code here would name a
+	// cause for a failure that never happened.
+	if got, ok := report.UnsupportedReasons[string(permission.GameGPURead)]; ok {
+		t.Errorf("reason for %s = %q, want no entry at all", permission.GameGPURead, got)
 	}
 	// Only the adapter half is gated. The capture the site did grant is untouched,
 	// which is what makes this a split rather than a coarser switch.
@@ -485,6 +505,38 @@ func TestBlockedSensorIsUnsupportedAndExplained(t *testing.T) {
 	}
 }
 
+// The reason a sensor cannot be used reaches the server, not just the fact.
+//
+// This is the case that shipped broken: a stale sensor beside a PresentMon that
+// was installed and running. The agent diagnosed the protocol mismatch correctly
+// and wrote it to its log, the report carried only "supported: false", and the
+// console — knowing one remedy — sent the operator to install software they
+// already had. The event says it happened at this moment; the report says it is
+// the state now, and the console can only act on the second.
+func TestStaleSensorReportsTheProtocolMismatch(t *testing.T) {
+	t.Setenv(mockSensorEnv, "stale")
+	t.Setenv(gamesense.PathEnv, testExecutable(t))
+
+	f := newFake(t, hasEvent(telemetry.EventGameSensorBlocked))
+	runAgent(t, f)
+	report, _, _ := f.snapshot()
+
+	// All three, because FullAccess granted the adapter read too: the probe that
+	// would have answered that question is the one that could not run, so it is
+	// the same cause one level down rather than a question left unasked.
+	for _, id := range []permission.ID{
+		permission.GameProcessDetect, permission.GamePerformanceRead, permission.GameGPURead,
+	} {
+		if contains(report.Supported, string(id)) {
+			t.Errorf("supported = %v, want %q absent for a sensor that cannot answer", report.Supported, id)
+		}
+		if got := report.UnsupportedReasons[string(id)]; got != gamesense.ReasonProtoMismatch {
+			t.Errorf("reason for %s = %q, want %q — the console has no other way to know",
+				id, got, gamesense.ReasonProtoMismatch)
+		}
+	}
+}
+
 // With no sensor installed — every build that does not ship one — the agent must
 // behave exactly as it did before the feature existed.
 func TestNoSensorIsSimplyUnsupported(t *testing.T) {
@@ -500,6 +552,12 @@ func TestNoSensorIsSimplyUnsupported(t *testing.T) {
 	} {
 		if contains(report.Supported, string(id)) {
 			t.Errorf("supported = %v, want %q absent with no sensor", report.Supported, id)
+		}
+		// Ordinary is not the same as unexplained. Nothing here is wrong with the
+		// machine and there is nothing on it to install, which the console can only
+		// say if the agent says so.
+		if got := report.UnsupportedReasons[string(id)]; got != gs.ReasonSensorMissing {
+			t.Errorf("reason for %s = %q, want %q", id, got, gs.ReasonSensorMissing)
 		}
 	}
 	if len(runs) != 0 || len(buckets) != 0 {

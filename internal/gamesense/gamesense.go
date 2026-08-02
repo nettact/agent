@@ -164,6 +164,22 @@ const maxBuffered = 600
 // on reconnect rather than left open forever.
 type Recorder struct {
 	mu sync.Mutex
+	// now is where this component reads the wall clock. Every moment that decides
+	// a run's lifetime comes from here: when a parked run falls out of
+	// reviveWindow, the ending given to a run that produced no seconds, and the
+	// stamp put on a second the sensor did not date.
+	//
+	// It is a seam for the tests, and specifically so a test can state where its
+	// fixture seconds sit relative to reviveWindow instead of inheriting that from
+	// the hour the suite happens to run at. Fixtures are written with fixed
+	// timestamps; measured against a real time.Now they are inside the window on
+	// the day they are written and outside it forever after, which turned the
+	// run-continuity tests into a suite that went red the following morning.
+	//
+	// Set once, at construction, before anything is fed to the recorder — so
+	// reading it needs no lock, which matters because sec stamps its second before
+	// taking one.
+	now func() time.Time
 	// source and caps describe how the current sensor process measures, taken
 	// from its hello. They belong to the sensor run, not to any one game run, so
 	// they outlive the runs started from them.
@@ -359,7 +375,7 @@ func (r *Recorder) status(st gs.Status) {
 		// long enough to be called over is exactly the one a person returns to,
 		// and the same process id coming back inside the window is the same
 		// session resuming. The ending recorded here stands unless it does.
-		r.parkCurrent(time.Now().UTC())
+		r.parkCurrent(r.now().UTC())
 	}
 }
 
@@ -394,7 +410,7 @@ func (r *Recorder) track(pid int, proc, title string, profile profileClaim) {
 		r.stampProfile(profile)
 		return
 	}
-	r.switchTo(pid, proc, title, profile, time.Now().UTC())
+	r.switchTo(pid, proc, title, profile, r.now().UTC())
 }
 
 func (r *Recorder) retitle(title string) {
@@ -531,7 +547,7 @@ func (r *Recorder) closeRun() {
 	if ended.IsZero() {
 		// Tracking began and stopped without a single second of frames. There is
 		// no observed moment to end at, so the agent's own clock is all there is.
-		ended = time.Now().UTC()
+		ended = r.now().UTC()
 	}
 	r.cur.run.EndedAt = &ended
 	r.markDirty(r.cur.run)
@@ -548,7 +564,7 @@ func (r *Recorder) closeRun() {
 func (r *Recorder) endRun() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.parkCurrent(time.Now().UTC())
+	r.parkCurrent(r.now().UTC())
 }
 
 // sec records one second of presentation.
@@ -557,7 +573,7 @@ func (r *Recorder) sec(m gs.Sec) {
 	if ts.IsZero() {
 		// A second with no timestamp would land at the zero time and sort before
 		// every real point in the run.
-		ts = time.Now()
+		ts = r.now()
 	}
 	ts = ts.UTC()
 
@@ -761,6 +777,7 @@ func NewSupervisor(path string, emit func(telemetry.Event)) *Supervisor {
 		cfg:          gs.Config{Type: gs.TypeConfig, Proto: ProtoVersion, Mode: gs.ModeAll},
 		configuredCh: make(chan struct{}),
 	}
+	s.now = time.Now
 	s.run = s.runOnce
 	return s
 }
@@ -896,7 +913,7 @@ func (s *Supervisor) event(t telemetry.EventType, sev telemetry.Severity, msg st
 	}
 	s.emit(telemetry.Event{
 		ID:       uuid.NewString(),
-		TS:       time.Now().UTC(),
+		TS:       s.now().UTC(),
 		Type:     t,
 		Layer:    telemetry.LayerLocal,
 		Severity: sev,
@@ -909,6 +926,14 @@ func (s *Supervisor) event(t telemetry.EventType, sev telemetry.Severity, msg st
 // driver reset, a display topology change — so the first retries are quick and
 // only a persistent failure backs off to the ceiling. Vars so tests can compress
 // the schedule rather than wait it out.
+//
+// These deliberately do NOT run on the recorder's clock. They are waits, not
+// readings: nothing here asks what time it is, and no value derived from them
+// reaches a Run, a Bucket or an event, so no test outcome can depend on the date
+// through them. Driving them from a func() time.Time would not work either —
+// real timers have to fire — and compressing the schedule is already the seam
+// tests need, so putting them on the clock would be a second mechanism for a job
+// one already does.
 var (
 	backoffMin = 1 * time.Second
 	backoffMax = 60 * time.Second
@@ -1101,7 +1126,7 @@ func locateBeside(exePath string) string {
 // whoever controls it choose that program. The same guard, and the same reason,
 // as the desktop console's dev dist lookup.
 func Locate(dev bool) (string, bool) {
-	if !platformSupported {
+	if !PlatformSupported {
 		return "", false
 	}
 	if p := os.Getenv(PathEnv); p != "" {

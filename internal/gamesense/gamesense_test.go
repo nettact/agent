@@ -36,6 +36,34 @@ func secLine(ts, proc string, pid int) string {
 		ts, pid, proc)
 }
 
+// fixtureStart is the instant the lifecycle fixtures below stamp their first
+// second at. Their later seconds are offsets from it, so naming it lets a test
+// put the recorder's own clock in the same era as the sensor lines it is being
+// fed — which is the relationship a real agent is always in, and the one the
+// revive window is measured across.
+var fixtureStart = time.Date(2026, 8, 2, 1, 0, 0, 0, time.UTC)
+
+// restartGap is how far the fixtures' second half sits past their first. It is
+// the length of a sensor restart as these tests model it: long enough to be a
+// real interruption, far short of reviveWindow.
+const restartGap = 10 * time.Second
+
+// fakeClock points s at a hand-driven clock reading start, and returns the
+// function that moves it.
+//
+// A test that involves parking a run must install one. The recorder decides
+// whether a parked run is still revivable by comparing its own clock against the
+// second the run was last seen at, so a fixture with fixed timestamps read
+// against the real time.Now answers that question differently depending on when
+// the suite is run: inside the window on the day the fixture was written, and
+// outside it every day after. Driving the clock is what makes each test state
+// the gap it means rather than inherit one from the calendar.
+func fakeClock(s *Supervisor, start time.Time) func(time.Duration) {
+	now := start
+	s.now = func() time.Time { return now }
+	return func(d time.Duration) { now = now.Add(d) }
+}
+
 func TestParseProbeLineAcceptsAWorkingSensor(t *testing.T) {
 	got := parseProbeLine([]byte(`{"type":"probe","proto":3,"sensor_version":"0.2.0",` +
 		`"ok":true,"pm_version":"2.3.0"}`))
@@ -332,18 +360,20 @@ func TestIdleEndsTheRun(t *testing.T) {
 // clock is the only moment there is.
 func TestRunWithoutBucketsEndsAtTheAgentClock(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
-	before := time.Now().UTC().Add(-time.Second)
-	s.consume(strings.NewReader(strings.Join([]string{
-		`{"type":"status","state":"tracking","pid":1,"proc":"game.exe"}`,
-		`{"type":"status","state":"idle"}`,
-	}, "\n")))
+	advance := fakeClock(s, fixtureStart)
+	s.consume(strings.NewReader(`{"type":"status","state":"tracking","pid":1,"proc":"game.exe"}`))
+	// Whatever the gap was, the ending is the moment the agent noticed — the one
+	// piece of information it has, since the sensor never reported a second.
+	advance(90 * time.Second)
+	s.consume(strings.NewReader(`{"type":"status","state":"idle"}`))
 
 	runs, buckets := s.Drain()
 	if len(runs) != 1 || len(buckets) != 0 {
 		t.Fatalf("Drain() = %+v, %+v; want one run and no buckets", runs, buckets)
 	}
-	if runs[0].EndedAt == nil || runs[0].EndedAt.Before(before) {
-		t.Fatalf("EndedAt = %v, want a recent time", runs[0].EndedAt)
+	want := fixtureStart.Add(90 * time.Second)
+	if runs[0].EndedAt == nil || !runs[0].EndedAt.Equal(want) {
+		t.Fatalf("EndedAt = %v, want the agent clock at the idle (%v)", runs[0].EndedAt, want)
 	}
 }
 
@@ -376,11 +406,21 @@ func TestSecWithoutStatusStartsARun(t *testing.T) {
 // row per switch, each holding a fragment nobody played.
 func TestReturningToTheSameProcessReopensItsRun(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
+	// The agent's clock moves with the seconds it is being shown, which is what a
+	// real one does. Twenty seconds in another window is nowhere near reviveWindow,
+	// so the game's run is still there to come back to.
+	advance := fakeClock(s, fixtureStart)
 	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","title":"A Game"}`,
 		secLine("2026-08-02T01:00:00Z", "game.exe", 100),
+	}, "\n")))
+	advance(20 * time.Second)
+	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":200,"proc":"chrome.exe","title":"A Wiki"}`,
 		secLine("2026-08-02T01:00:20Z", "chrome.exe", 200),
+	}, "\n")))
+	advance(20 * time.Second)
+	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","title":"A Game"}`,
 		secLine("2026-08-02T01:00:40Z", "game.exe", 100),
 	}, "\n")))
@@ -424,10 +464,17 @@ func TestReturningToTheSameProcessReopensItsRun(t *testing.T) {
 // here, and all of them are one session to the person who played it.
 func TestASessionResumesAfterBeingDeclaredOver(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
+	advance := fakeClock(s, fixtureStart)
 	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","title":"A Game"}`,
 		secLine("2026-08-02T01:00:00Z", "game.exe", 100),
 		`{"type":"status","state":"idle"}`,
+	}, "\n")))
+
+	// Two minutes away — a loading screen, or a step out of the room. Well inside
+	// reviveWindow, so the same process id is the same session coming back.
+	advance(2 * time.Minute)
+	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe","title":"A Game"}`,
 		secLine("2026-08-02T01:02:00Z", "game.exe", 100),
 	}, "\n")))
@@ -456,10 +503,16 @@ func TestASessionResumesAfterBeingDeclaredOver(t *testing.T) {
 // second copy of a game — or a second browser window — into the first.
 func TestADifferentProcessIdIsADifferentSession(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
+	// Inside the window, so the split is the identity rule doing its job and not
+	// the first run having quietly aged out.
+	advance := fakeClock(s, fixtureStart)
 	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
 		secLine("2026-08-02T01:00:00Z", "game.exe", 100),
 		`{"type":"status","state":"idle"}`,
+	}, "\n")))
+	advance(20 * time.Second)
+	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":300,"proc":"game.exe"}`,
 		secLine("2026-08-02T01:00:20Z", "game.exe", 300),
 	}, "\n")))
@@ -479,20 +532,16 @@ func TestADifferentProcessIdIsADifferentSession(t *testing.T) {
 // briefly is still reopenable however long it had been going.
 func TestAProcessQuietPastTheWindowStartsFresh(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
+	advance := fakeClock(s, fixtureStart)
 	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
 		secLine("2026-08-02T01:00:00Z", "game.exe", 100),
 	}, "\n")))
 	s.Drain()
+	s.endRun() // the sensor stopped; the run is parked, not forgotten
 
-	// Park it, then move the clock past the window before it returns.
-	s.mu.Lock()
-	s.parkCurrent(time.Now().UTC())
-	for _, parked := range s.parked {
-		parked.run.LastSeenAt = time.Now().UTC().Add(-2 * reviveWindow)
-	}
-	s.mu.Unlock()
-
+	// Two hours of silence — twice the window — before the same process returns.
+	advance(2 * reviveWindow)
 	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
 		secLine("2026-08-02T03:00:00Z", "game.exe", 100),
@@ -509,6 +558,112 @@ func TestAProcessQuietPastTheWindowStartsFresh(t *testing.T) {
 	}
 	if live != 1 || finished != 1 {
 		t.Fatalf("drained %d live and %d finished runs, want the old one left ended and a new one started: %+v", live, finished, runs)
+	}
+}
+
+// reviveBases are the instants the window is measured from below. The rule is
+// about a duration and nothing else, so it must hold identically at all three —
+// and a test that passes at instants a century apart cannot be passing because
+// of what today's date happens to be.
+//
+// That is what this table is here to prove. The wall clock used to supply these
+// answers silently: fixtures stamped at a fixed moment sit inside reviveWindow on
+// the day they are written and outside it every day after, which made the
+// continuity tests go green for an afternoon and red every morning since.
+var reviveBases = []struct {
+	name string
+	at   time.Time
+}{
+	{"2001", time.Date(2001, 3, 4, 5, 6, 7, 0, time.UTC)},
+	{"2026", fixtureStart},
+	{"2099", time.Date(2099, 12, 31, 23, 0, 0, 0, time.UTC)},
+}
+
+// reviveWindow is a boundary, and a boundary has two sides. A parked run whose
+// process comes back at the last moment resumes; one that comes back a second
+// later does not, and gets a session of its own.
+//
+// Both sides matter and neither was pinned before: the near side was asserted
+// only by tests that happened to be inside the window, and the far side by a test
+// that back-dated the run's own data rather than moving the clock. What was
+// missing is the edge itself — the assertion that the window is exactly as wide
+// as it says, rather than merely wide or narrow.
+func TestTheReviveWindowIsAnEdge(t *testing.T) {
+	cases := []struct {
+		name     string
+		away     time.Duration
+		wantRuns int
+	}{
+		{"back at the last moment", reviveWindow, 1},
+		{"back a second too late", reviveWindow + time.Second, 2},
+	}
+	for _, base := range reviveBases {
+		for _, tc := range cases {
+			t.Run(base.name+"/"+tc.name, func(t *testing.T) {
+				back := base.at.Add(tc.away)
+				s := NewSupervisor("sensor", nil)
+				advance := fakeClock(s, base.at)
+				s.consume(strings.NewReader(strings.Join([]string{
+					`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
+					secLine(base.at.Format(time.RFC3339), "game.exe", 100),
+					`{"type":"status","state":"idle"}`,
+				}, "\n")))
+
+				advance(tc.away)
+				s.consume(strings.NewReader(strings.Join([]string{
+					`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
+					secLine(back.Format(time.RFC3339), "game.exe", 100),
+				}, "\n")))
+
+				runs, buckets := s.Drain()
+				byID := runsByID(runs)
+				if len(byID) != tc.wantRuns {
+					t.Fatalf("away %v from a run last seen at %v: recorded %d runs, want %d: %+v",
+						tc.away, base.at, len(byID), tc.wantRuns, runs)
+				}
+				if len(buckets) != 2 {
+					t.Fatalf("recorded %d seconds, want both: %+v", len(buckets), buckets)
+				}
+
+				if tc.wantRuns == 1 {
+					var only gs.Run
+					for _, r := range byID {
+						only = r
+					}
+					if only.EndedAt != nil {
+						t.Errorf("run = %+v, want the ending withdrawn by the revival", only)
+					}
+					if !only.LastSeenAt.Equal(back) {
+						t.Errorf("last seen = %v, want the run to span the pause to %v", only.LastSeenAt, back)
+					}
+					if buckets[0].RunID != buckets[1].RunID {
+						t.Errorf("buckets = %+v, want both seconds on the one run", buckets)
+					}
+					return
+				}
+
+				var ended, live gs.Run
+				for _, r := range byID {
+					if r.EndedAt != nil {
+						ended = r
+					} else {
+						live = r
+					}
+				}
+				if ended.ID == "" || live.ID == "" {
+					t.Fatalf("runs = %+v, want the aged-out one ended and a new one open", runs)
+				}
+				if !ended.EndedAt.Equal(base.at) {
+					t.Errorf("EndedAt = %v, want the last second it was seen (%v)", ended.EndedAt, base.at)
+				}
+				if !live.StartedAt.Equal(back) {
+					t.Errorf("StartedAt = %v, want the moment the process came back (%v)", live.StartedAt, back)
+				}
+				if buckets[0].RunID != ended.ID || buckets[1].RunID != live.ID {
+					t.Errorf("buckets = %+v, want each second on the session it was collected in", buckets)
+				}
+			})
+		}
 	}
 }
 
@@ -601,26 +756,46 @@ func TestRequeueKeepsTheEndingOfAFinishedRun(t *testing.T) {
 	}
 }
 
-// After an idle, seconds that keep arriving belong to a new session rather than
-// to the one that was declared over.
-func TestSecAfterIdleStartsAFreshRun(t *testing.T) {
+// Seconds that keep arriving after an idle belong to the session that was
+// declared over. It is the revive rule reached through a sec line rather than a
+// status: the sensor said nothing was presenting, and then the same process id
+// was, which is one person coming back to one game. Only a gap past reviveWindow
+// makes them a new session — see TestTheReviveWindowIsAnEdge.
+//
+// This asserted the opposite until the recorder's clock became injectable, and
+// passed for a reason that had nothing to do with the rule: the fixture's seconds
+// were far enough into the machine's past that the parked run was swept before
+// the later second arrived, so the test was reading pre-revive behaviour off a
+// stale wall clock.
+func TestSecAfterIdleResumesTheParkedRun(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	advance := fakeClock(s, base)
 	s.consume(strings.NewReader(strings.Join([]string{
 		`{"type":"status","state":"tracking","pid":1,"proc":"game.exe"}`,
 		secLine("2026-08-01T12:00:00Z", "game.exe", 1),
 		`{"type":"status","state":"idle"}`,
-		secLine("2026-08-01T12:00:30Z", "game.exe", 1),
 	}, "\n")))
+	advance(30 * time.Second)
+	s.consume(strings.NewReader(secLine("2026-08-01T12:00:30Z", "game.exe", 1)))
 
 	runs, buckets := s.Drain()
-	if len(runs) != 2 {
-		t.Fatalf("got %d runs, want 2: %+v", len(runs), runs)
+	byID := runsByID(runs)
+	if len(byID) != 1 {
+		t.Fatalf("got %d runs, want the session resumed by its own seconds: %+v", len(byID), runs)
 	}
-	if runs[0].ID == runs[1].ID {
-		t.Fatal("the second run reused the ended run's id")
+	var only gs.Run
+	for _, r := range byID {
+		only = r
 	}
-	if len(buckets) != 2 || buckets[1].RunID != runs[1].ID {
-		t.Fatalf("buckets = %+v, want the later second on the new run", buckets)
+	if only.EndedAt != nil {
+		t.Errorf("run = %+v, want the ending withdrawn by the second that resumed it", only)
+	}
+	if want := base.Add(30 * time.Second); !only.LastSeenAt.Equal(want) {
+		t.Errorf("last seen = %v, want the second that reopened it (%v)", only.LastSeenAt, want)
+	}
+	if len(buckets) != 2 || buckets[0].RunID != buckets[1].RunID {
+		t.Fatalf("buckets = %+v, want both seconds on the one run", buckets)
 	}
 }
 
@@ -694,7 +869,7 @@ func TestConsumeReturnsNilAtACleanEnd(t *testing.T) {
 // the zero time and sort before every real point in the run.
 func TestConsumeStampsUndatedSeconds(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
-	before := time.Now().UTC().Add(-time.Second)
+	fakeClock(s, fixtureStart)
 	s.consume(strings.NewReader(`{"type":"sec","proc":"game.exe","frames":{"presented":30},` +
 		`"ft":{"avg":33.3,"p50":33.2,"p95":40,"p99":45,"max":51,"sd":4},` +
 		`"ft_hist":{"layout":"log24_v1","counts":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,30,0,0,0,0,0,0,0,0]}}`))
@@ -702,8 +877,8 @@ func TestConsumeStampsUndatedSeconds(t *testing.T) {
 	if len(buckets) != 1 {
 		t.Fatalf("Drain() returned %d buckets, want 1", len(buckets))
 	}
-	if buckets[0].TS.Before(before) {
-		t.Fatalf("TS = %v, want a recent time", buckets[0].TS)
+	if !buckets[0].TS.Equal(fixtureStart) {
+		t.Fatalf("TS = %v, want the agent clock (%v)", buckets[0].TS, fixtureStart)
 	}
 }
 
@@ -1025,7 +1200,7 @@ func TestSupervisorStopsOnCancel(t *testing.T) {
 // is the ordinary case, and a false positive would turn "unsupported" into a
 // spawn failure on every restart.
 func TestLocateHonoursTheDevelopmentOverride(t *testing.T) {
-	if !platformSupported {
+	if !PlatformSupported {
 		t.Skip("no sensor component off Windows")
 	}
 	dir := t.TempDir()
@@ -1061,7 +1236,7 @@ func TestLocateHonoursTheDevelopmentOverride(t *testing.T) {
 // all. A release build must not do this search: the file it finds is a program
 // this agent spawns, and the working directory is not ours to trust.
 func TestLocateSearchesTheWorkspaceOnlyForDevBuilds(t *testing.T) {
-	if !platformSupported {
+	if !PlatformSupported {
 		t.Skip("no sensor component off Windows")
 	}
 	root := t.TempDir()
@@ -1097,7 +1272,7 @@ func TestLocateSearchesTheWorkspaceOnlyForDevBuilds(t *testing.T) {
 }
 
 func TestLocateFindsNothingOffWindows(t *testing.T) {
-	if platformSupported {
+	if PlatformSupported {
 		t.Skip("Windows ships a sensor")
 	}
 	if _, ok := Locate(true); ok {
@@ -1417,10 +1592,17 @@ func TestRunCarriesTheProfileTheSensorMatched(t *testing.T) {
 // consume, endRun (park), then the next sensor's first status.
 //
 // restartWith replays that sequence and returns everything drained afterwards.
+// The recorder's clock is anchored to the fixtures' own era and moved by the gap
+// their second half is stamped at, so the restart is the ten-second interruption
+// it is written as. Every case below turns on whether the run survives that
+// interruption or is split by something else about the second sensor, and neither
+// answer may depend on what today's date is.
 func restartWith(t *testing.T, s *Supervisor, first, second string) ([]gs.Run, []gs.Bucket) {
 	t.Helper()
+	advance := fakeClock(s, fixtureStart)
 	s.consume(strings.NewReader(first))
 	s.endRun()
+	advance(restartGap)
 	s.consume(strings.NewReader(second))
 	return s.Drain()
 }
@@ -1762,6 +1944,9 @@ func TestATierEditSplitsTheRunAtTheDepthChange(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := NewSupervisor("sensor", nil)
+			// Same ten-second restart as restartWith models, so the only thing that
+			// can split the run here is the tier.
+			advance := fakeClock(s, fixtureStart)
 			s.SetConfig(tierConfig(tt.before))
 			s.consume(strings.NewReader(strings.Join([]string{
 				fullCapsHello,
@@ -1769,6 +1954,7 @@ func TestATierEditSplitsTheRunAtTheDepthChange(t *testing.T) {
 				secLine("2026-08-02T01:00:00Z", "game.exe", 100),
 			}, "\n")))
 			s.endRun()
+			advance(restartGap)
 			s.SetConfig(tierConfig(tt.after))
 			s.consume(strings.NewReader(strings.Join([]string{
 				fullCapsHello,

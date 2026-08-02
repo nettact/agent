@@ -13,8 +13,11 @@ import (
 // sensor, so the game.* permissions never enter the supported set and nothing
 // below is ever reached. It exists so the agent cross-compiles unchanged.
 
-// platformSupported gates discovery: there is no sensor to find here.
-const platformSupported = false
+// PlatformSupported gates discovery: there is no sensor to find here, and none
+// could be. Exported because the permission report reads it too — the absence of
+// game capture here is a property of the build, which a console already knows
+// statically, and not a finding about this machine.
+const PlatformSupported = false
 
 // errUnsupported is returned by paths that only exist to satisfy the compiler.
 var errUnsupported = errors.New("gamesense: unsupported platform")

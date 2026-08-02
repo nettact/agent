@@ -317,27 +317,19 @@ func Run(ctx context.Context, cfg Config) error {
 	// shows it unsupported rather than merely un-granted. That is the honest
 	// report — the agent genuinely does not know, and refuses to find out. Granting
 	// it and restarting re-probes with the flag and settles the question.
-	// Either grant is reason enough to ask. Unlike the temperature probe, this one
-	// captures nothing — it looks for the component and asks it whether a frame
-	// source answers — so requiring the broader permission before asking would only
-	// make a policy that grants detection alone report detection as unsupported on
-	// a machine that can do it. EffectiveFrom still removes whatever was not
-	// granted.
-	if granted.Has(permission.GameProcessDetect) || granted.Has(permission.GamePerformanceRead) {
+	if gameProbeGranted(granted) {
 		if path, ok := gamesense.Locate(Version == "dev"); ok {
 			gameSensorPath = path
 			gameProbe = gamesense.Probe(ctx, path, granted.Has(permission.GameGPURead))
-			if gameProbe.OK {
-				supported.Add(permission.GameProcessDetect)
-				supported.Add(permission.GamePerformanceRead)
-			}
-			// The adapter read the sensor separately verified, never inferred from
-			// the capture working — and never claimed for a question that was not
-			// asked.
-			if gameProbe.OK && gameProbe.GPUOK {
-				supported.Add(permission.GameGPURead)
-			}
 		}
+	}
+	// What the probe settled, and — for whatever it left unsupported — why. The
+	// reason is the half the three sets cannot carry, and the agent is the only
+	// place that has it. A path is what Locate produces when it finds a component,
+	// so holding one is the same statement as having found one.
+	gameSupported, gameReasons := gameSupport(granted, gamesense.PlatformSupported, gameSensorPath != "", gameProbe)
+	for id := range gameSupported {
+		supported.Add(id)
 	}
 	effective := permission.EffectiveFrom(granted, supported)
 
@@ -349,6 +341,11 @@ func Run(ctx context.Context, cfg Config) error {
 		Effective:  effective.Strings(),
 		Source:     string(cfg.Policy.Source),
 		PolicyHash: hash,
+		// Game capture is the only capability probe with anything to explain today.
+		// A second one would merge its ids into this map rather than replace it —
+		// the field describes every unsupported permission that was actually asked
+		// about, not one probe's answer.
+		UnsupportedReasons: gameReasons,
 	}
 
 	cred, enrolled, err := identity.LoadCredential(cfg.DataDir)
@@ -791,6 +788,112 @@ func platformIndependentSupported() permission.Set {
 		permission.HostConnectionRemoteRead,
 		permission.HostConnectionOwnerRead,
 	)
+}
+
+// gameProbeGranted reports whether the local policy authorizes looking for the
+// sensor component and asking it what it can do.
+//
+// Either grant is reason enough to ask. Unlike the temperature probe, this one
+// captures nothing — it looks for the component and asks it whether a frame
+// source answers — so requiring the broader permission before asking would only
+// make a policy that grants detection alone report detection as unsupported on
+// a machine that can do it. EffectiveFrom still removes whatever was not
+// granted.
+func gameProbeGranted(granted permission.Set) bool {
+	return granted.Has(permission.GameProcessDetect) || granted.Has(permission.GamePerformanceRead)
+}
+
+// gameSupport settles the three game permissions from one look at the sensor
+// component: the set this machine is verified to support, and, for each one it
+// is not, the reason — keyed by permission id, ready for the report.
+//
+// platformSupported says whether a sensor component could exist on this build's
+// platform at all; found says whether one was located beside the agent; probe is
+// what it answered when there was one to ask.
+//
+// The reasons exist because "supported: false" is not enough to act on. All
+// three causes look identical in the three sets, so a console reading only those
+// can do no better than name the remedy it happens to know — which is how an
+// operator whose middleware was installed and running was told to install it,
+// when the real cause was a stale sensor speaking an older protocol. The agent
+// had already worked that out; it just had nowhere to put it.
+//
+// The map only ever holds ids left out of the returned set, and an id absent
+// from it means the question was never asked rather than "no reason" — see
+// permission.PermissionReport.UnsupportedReasons, whose contract this fills.
+func gameSupport(granted permission.Set, platformSupported, found bool, probe gamesense.ProbeResult) (permission.Set, map[string]string) {
+	supported, reasons := permission.Set{}, map[string]string{}
+	if !gameProbeGranted(granted) {
+		// Nothing was located, probed or asked, so there is nothing to explain
+		// about any of the three.
+		return supported, reasons
+	}
+	if !platformSupported {
+		// A platform with no sensor component in the world gets NO reason at all,
+		// and this is deliberate rather than an omission to tidy away later.
+		//
+		// A reason is a finding about THIS machine, produced by looking at it. Which
+		// platforms can host a sensor is a property of the build, which the console
+		// already knows statically and renders correctly on its own. Saying anything
+		// here only overrides that with something worse: a known reason outranks the
+		// console's platform tables, so "sensor_missing" on Linux would replace
+		// "Windows only" with an instruction to go and get a build that includes the
+		// component — the exact class of true-but-wrong remedy this map exists to
+		// stamp out. ReasonUnsupportedOS is no better: it describes a Windows machine
+		// with no frame source behind an installed sensor, which is not this.
+		//
+		// Keeping quiet also leaves sensor_missing its real meaning below: a build
+		// that could have shipped the component and did not.
+		return supported, reasons
+	}
+	// The adapter read is explained beside the other two only under its own grant,
+	// because that grant is what put --gpu on the probe. Without it nothing was
+	// asked about the adapter, and a cause stated for a question nobody put would
+	// be one invented here.
+	gpuAsked := granted.Has(permission.GameGPURead)
+	explain := func(reason string) {
+		reasons[string(permission.GameProcessDetect)] = reason
+		reasons[string(permission.GamePerformanceRead)] = reason
+		if gpuAsked {
+			// The same cause one level down: the probe that would have answered the
+			// adapter question is the one that could not run.
+			reasons[string(permission.GameGPURead)] = reason
+		}
+	}
+	switch {
+	case !found:
+		// A platform that can host the component, and no component beside the agent:
+		// the ordinary state of every build that ships none. Nothing about the
+		// machine is wrong, which is precisely what a console must not be left to
+		// guess at — there is nothing here to install, only a build to replace.
+		explain(gs.ReasonSensorMissing)
+	case !probe.OK:
+		// The sensor's own code where it had one, and the agent's own where the
+		// sensor was the thing that failed. Either way it is a fixable problem, and
+		// which fix depends entirely on the code.
+		explain(probe.Reason)
+	default:
+		supported.Add(permission.GameProcessDetect)
+		supported.Add(permission.GamePerformanceRead)
+		switch {
+		case probe.GPUOK:
+			// The adapter read the sensor separately verified, never inferred from
+			// the capture working — and never claimed for a question that was not
+			// asked.
+			supported.Add(permission.GameGPURead)
+		case gpuAsked:
+			// Frames capture and the adapter publishes nothing: an ordinary machine
+			// rather than a fault, and nothing to install. Saying so is the only way
+			// it reads as ordinary at the other end.
+			reasons[string(permission.GameGPURead)] = gs.ReasonGPUTelemetryUnavailable
+		default:
+			// Deliberately no entry. The probe carried no --gpu, so the sensor was
+			// never asked about the adapter, and an absent key is exactly how the
+			// report encodes an unasked question. A code here would report a failure
+			// where the agent simply declined to look.
+		}
+	}
+	return supported, reasons
 }
 
 // gameConfigApplier hands the site's pushed game configuration to the sensor

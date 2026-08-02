@@ -21,8 +21,13 @@ import (
 // file holds every part of the contract that touches a process: probing,
 // spawning, and making sure a child never outlives the agent.
 
-// platformSupported gates discovery. Off-Windows builds never look for a sensor.
-const platformSupported = true
+// PlatformSupported gates discovery. Off-Windows builds never look for a sensor.
+//
+// It is exported because the permission report needs the same answer: a machine
+// where a sensor could have existed and none was found is a different statement
+// from one where the component is not a thing, and only the first is worth
+// explaining to an operator.
+const PlatformSupported = true
 
 // probeTimeout caps the capability probe. The probe opens and closes a trace
 // session and exits; anything slower is a sensor that is not going to answer,
