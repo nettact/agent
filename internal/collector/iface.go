@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/nettact/agent/internal/platform"
@@ -46,11 +47,14 @@ func (c *InterfaceCollector) Collect(ctx context.Context) (Result, error) {
 		Gateways: c.reportGateway,
 		DNS:      c.reportAddr,
 	})
-	if err != nil {
-		// Total enumeration failure is the only error path — the scheduler skips
-		// the round. Wi-Fi classification never blocks interface reporting.
+	if err != nil && !errors.Is(err, platform.ErrRoutesUnreadable) {
+		// Total enumeration failure — the scheduler skips the round. Wi-Fi
+		// classification never blocks interface reporting.
 		return Result{}, err
 	}
+	// An unreadable routing table is partial, not fatal: every interface row is
+	// still populated and worth reporting; only the default route is unknown, and
+	// resolveIPv4Gateway finds nothing below, so DefaultRoute stays absent.
 	// Wi-Fi status is read from the OS only when granted; otherwise the subsystem
 	// is never queried and every row stays wired-shaped.
 	var wr platform.WiFiResult
@@ -77,7 +81,7 @@ func (c *InterfaceCollector) Collect(ctx context.Context) (Result, error) {
 		Interfaces: []telemetry.InterfaceState{}, // explicit empty: a zero-interface round still clears server rows
 	}
 	if c.reportGateway {
-		if gateway, interfaceName := resolveIPv4Gateway(ifaces, ""); gateway != "" {
+		if gateway, interfaceName := platform.ResolveIPv4Gateway(ifaces, ""); gateway != "" {
 			snap.DefaultRoute = &telemetry.SnapshotRoute{Gateway: gateway, Interface: interfaceName}
 		}
 	}

@@ -58,11 +58,14 @@ const (
 // reporting a DNS failure the target does not have sends the reader after the
 // wrong layer.
 const (
-	errClassInvalidTarget = "invalid_target" // the target string carries no resolvable host
-	errClassPolicyDenied  = "policy_denied"  // the agent's own target-access policy blocked it
-	errClassDNS           = "dns_error"      // the resolver answered, and the answer was a failure
-	errClassTimeout       = "timeout"        // the collection budget ran out before the resolver answered
-	errClassCanceled      = "canceled"       // the session ended before the resolver answered
+	errClassInvalidTarget    = "invalid_target"    // the target string carries no resolvable host
+	errClassPolicyDenied     = "policy_denied"     // the agent's own target-access policy blocked it
+	errClassDNS              = "dns_error"         // the resolver answered, and the answer was a failure
+	errClassTimeout          = "timeout"           // the collection budget ran out before the resolver answered
+	errClassCanceled         = "canceled"          // the session ended before the resolver answered
+	errClassNoGateway        = "no_gateway"        // kind=gateway: the routing table has no IPv4 gateway on the selected NIC
+	errClassRouteUnreadable  = "route_unreadable"  // kind=gateway: the routing table itself could not be read
+	errClassPermissionDenied = "permission_denied" // the agent lacks the permission needed to resolve this kind
 )
 
 // Identity is the detecting agent's own identity/version, fixed into the
@@ -159,9 +162,20 @@ func collectNetwork(ctx context.Context, deps Deps) (*telemetry.SnapshotNetwork,
 	gwOK := addrOK || deps.Effective.Has(permission.NetworkGatewayProbe)
 	q := platform.IfaceQuery{Addrs: addrOK, Gateways: gwOK, DNS: addrOK}
 
+	// An unreadable routing table is partial, not fatal: the interface list is
+	// fully populated, so the group is still collected and only DefaultRoute stays
+	// absent (there is nothing below to find). Failing the whole group would throw
+	// away the interface and address evidence over one missing field.
 	ifaces, err := deps.Platform.Interfaces(q)
 	if err != nil {
-		return nil, groupResult(telemetry.SnapshotGroupNetwork, telemetry.ScopeFailed, reasonCollectionFailed)
+		if !errors.Is(err, platform.ErrRoutesUnreadable) {
+			return nil, groupResult(telemetry.SnapshotGroupNetwork, telemetry.ScopeFailed, reasonCollectionFailed)
+		}
+		// Routes are UNKNOWN, so no gateway read from this table can be trusted —
+		// suppress the default route explicitly rather than relying on the platform
+		// to have left the field empty. Publishing a stale one would name an egress
+		// the host may no longer have.
+		gwOK = false
 	}
 
 	out := &telemetry.SnapshotNetwork{}
@@ -173,10 +187,6 @@ func collectNetwork(ctx context.Context, deps Deps) (*telemetry.SnapshotNetwork,
 			Up:         ifc.Up,
 			IsWireless: ifc.IsWireless,
 		})
-		// First non-loopback interface carrying a gateway defines the default route.
-		if gwOK && out.DefaultRoute == nil && !ifc.IsLoopback && len(ifc.Gateways) > 0 {
-			out.DefaultRoute = &telemetry.SnapshotRoute{Gateway: ifc.Gateways[0], Interface: ifc.Name}
-		}
 		if addrOK {
 			for _, d := range ifc.DNS {
 				if _, ok := dnsSeen[d]; ok {
@@ -185,6 +195,16 @@ func collectNetwork(ctx context.Context, deps Deps) (*telemetry.SnapshotNetwork,
 				dnsSeen[d] = struct{}{}
 				out.DNSServers = append(out.DNSServers, d)
 			}
+		}
+	}
+	// The default route comes from the shared resolver, not from "first interface
+	// with any gateway": that took a down adapter's stale route or an IPv6 one,
+	// and a gateway target in the same snapshot — resolved through
+	// ResolveIPv4Gateway — would then name a different address than the network
+	// group printed for the very same host.
+	if gwOK {
+		if gw, name := platform.ResolveIPv4Gateway(ifaces, ""); gw != "" {
+			out.DefaultRoute = &telemetry.SnapshotRoute{Gateway: gw, Interface: name}
 		}
 	}
 	return out, groupResult(telemetry.SnapshotGroupNetwork, telemetry.ScopeCollected, "")
@@ -285,7 +305,7 @@ func collectTargets(ctx context.Context, deps Deps, refs []pcfg.SnapshotTargetRe
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out[i] = resolveTarget(ctx, deps.Guard, ref)
+			out[i] = resolveTarget(ctx, deps, ref)
 		}(i, ref)
 	}
 	wg.Wait()
@@ -295,19 +315,34 @@ func collectTargets(ctx context.Context, deps Deps, refs []pcfg.SnapshotTargetRe
 // resolveTarget resolves one target's host and derives its probe endpoints and a
 // coarse error class, all through the target-access guard so a policy-denied
 // destination is reported as such rather than probed.
-func resolveTarget(ctx context.Context, guard *netguard.Guard, ref pcfg.SnapshotTargetRef) telemetry.SnapshotTargetResult {
+//
+// Not every kind resolves through DNS. A gateway monitor's target is the
+// server-normalized sentinel "gateway", which no resolver can or should answer —
+// it is resolved from the routing table instead. Handing the sentinel to the
+// resolver would report "DNS resolution failed" for an incident whose real cause
+// is a dead LAN, sending the reader after a layer that is working fine.
+func resolveTarget(ctx context.Context, deps Deps, ref pcfg.SnapshotTargetRef) telemetry.SnapshotTargetResult {
 	res := telemetry.SnapshotTargetResult{
 		MonitorID: ref.MonitorID,
 		Kind:      ref.Kind,
 		Target:    ref.Target,
 	}
+	if ref.Kind == "gateway" {
+		gw, errClass := resolveGateway(deps, ref.Iface)
+		res.ErrorClass = errClass
+		if gw != "" {
+			res.ResolvedIPs = []string{gw}
+		}
+		return res
+	}
+
 	host, port := deriveHostPort(ref)
 	if host == "" {
 		res.ErrorClass = errClassInvalidTarget
 		return res
 	}
 
-	ips, errClass := resolveHost(ctx, guard, host)
+	ips, errClass := resolveHost(ctx, deps.Guard, host)
 	res.ErrorClass = errClass
 	for _, ip := range ips {
 		res.ResolvedIPs = append(res.ResolvedIPs, ip.String())
@@ -322,6 +357,56 @@ func resolveTarget(ctx context.Context, guard *netguard.Guard, ref pcfg.Snapshot
 		}
 	}
 	return res
+}
+
+// resolveGateway resolves a gateway monitor's actual target from the routing
+// table — the same lookup the gateway probe itself performs, through the shared
+// platform.ResolveIPv4Gateway, so the address reported here is the address that
+// was pinged. iface is the monitor's NIC selection ("" = default NIC).
+//
+// The permission gate is address-read OR gateway-probe, matching collectNetwork's
+// gwOK exactly. Either one authorizes disclosing the gateway, and requiring only
+// the probe permission would let one snapshot print the default route in its
+// network group while this target claimed permission was denied for the very same
+// address.
+//
+// Every failure gets its own class: no permission, an unreadable routing table,
+// and a NIC that genuinely has no IPv4 gateway are three different faults, and
+// collapsing them (or borrowing errClassDNS) would point the reader at the wrong
+// layer. A gateway the guard denies is reported as policy_denied, matching what
+// the live probe does with the same address.
+func resolveGateway(deps Deps, iface string) (string, string) {
+	if !deps.Effective.Has(permission.NetIfaceAddressRead) && !deps.Effective.Has(permission.NetworkGatewayProbe) {
+		return "", errClassPermissionDenied
+	}
+	ifaces, err := deps.Platform.Interfaces(platform.IfaceQuery{Gateways: true})
+	if err != nil {
+		return "", errClassRouteUnreadable
+	}
+	gw, _ := platform.ResolveIPv4Gateway(ifaces, iface)
+	if gw == "" {
+		return "", errClassNoGateway
+	}
+	if a, perr := netip.ParseAddr(gw); perr == nil {
+		if dec := deps.Guard.CheckGateway(a.Unmap(), osGateways(ifaces)); !dec.Allowed {
+			return "", errClassPolicyDenied
+		}
+	}
+	return gw, ""
+}
+
+// osGateways flattens every gateway address the OS reports across all interfaces,
+// which is what CheckGateway needs to confirm the address really is a gateway.
+func osGateways(ifaces []platform.IfaceInfo) []netip.Addr {
+	var out []netip.Addr
+	for _, ifc := range ifaces {
+		for _, gw := range ifc.Gateways {
+			if a, err := netip.ParseAddr(gw); err == nil {
+				out = append(out, a.Unmap())
+			}
+		}
+	}
+	return out
 }
 
 // resolveHost runs one host through the guard exactly once: a literal IP is

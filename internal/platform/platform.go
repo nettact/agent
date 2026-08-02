@@ -7,6 +7,8 @@ package platform
 
 import (
 	"context"
+	"errors"
+	"net"
 	"time"
 
 	"github.com/nettact/protocol/permission"
@@ -118,8 +120,48 @@ type Platform interface {
 	Supports() permission.Set
 }
 
+// ErrRoutesUnreadable reports that Interfaces enumerated the NICs fine but could
+// not read the routing table, so IfaceInfo.Gateways is UNKNOWN rather than known
+// to be empty. It is returned alongside a fully populated interface list, so a
+// caller that only needs interface status/addresses should carry on; a caller
+// that needs gateways must treat it as a failure to read, never as "this host has
+// no gateway". Test it with errors.Is.
+//
+// Without this the two are indistinguishable: a Linux netlink route dump that
+// fails under a restrictive seccomp policy left an empty route table behind and
+// reported success, so an incident scene blamed the NIC for having no gateway
+// when the agent had simply been unable to look.
+var ErrRoutesUnreadable = errors.New("platform: routing table unreadable")
+
 // New returns the platform implementation for the current OS.
 func New() Platform { return newPlatform() }
+
+// ResolveIPv4Gateway returns the first IPv4 gateway on the chosen interface, plus
+// that interface's name. When iface is empty it falls back to the default: the
+// first IPv4 gateway on any up, non-loopback interface. When iface is set but not
+// found (or has no IPv4 gateway) it returns "", so the caller reports the gateway
+// as unreachable rather than silently naming a different NIC's gateway.
+//
+// This is the ONE default-egress resolver in the agent. The gateway probe, the
+// interface snapshot, and the incident-scene target resolution all call it, which
+// is what guarantees that the gateway IP the console shows for an incident is the
+// same one the monitor actually pinged.
+func ResolveIPv4Gateway(ifaces []IfaceInfo, iface string) (gateway, interfaceName string) {
+	for _, ifc := range ifaces {
+		if ifc.IsLoopback || !ifc.Up {
+			continue
+		}
+		if iface != "" && ifc.ID != iface && ifc.Name != iface {
+			continue
+		}
+		for _, gw := range ifc.Gateways {
+			if ip := net.ParseIP(gw); ip != nil && ip.To4() != nil {
+				return gw, ifc.Name
+			}
+		}
+	}
+	return "", ""
+}
 
 // appendUnique appends v unless list already holds it, preserving order. The OS
 // tables this package reads (neighbors, resolvers, per-adapter DNS) routinely

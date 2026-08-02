@@ -2,14 +2,263 @@ package incidentscene
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/probepolicy"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
+
+// fakePlatform serves a fixed interface table (or a read error) so the gateway
+// tests exercise the routing-table path without touching the host's real NICs.
+type fakePlatform struct {
+	ifaces []platform.IfaceInfo
+	err    error
+}
+
+func (f fakePlatform) Interfaces(platform.IfaceQuery) ([]platform.IfaceInfo, error) {
+	return f.ifaces, f.err
+}
+func (fakePlatform) Ping(context.Context, string, platform.PingOptions) (platform.PingResult, error) {
+	return platform.PingResult{}, errors.New("not used")
+}
+func (fakePlatform) Neighbors() ([]platform.Neighbor, error) { return nil, errors.New("not used") }
+func (fakePlatform) WiFi(bool) platform.WiFiResult           { return platform.WiFiResult{State: "ok"} }
+func (fakePlatform) Supports() permission.Set                { return permission.NewSet() }
+
+// gatewayDeps builds Deps whose platform serves ifaces and whose effective
+// permissions grant the gateway probe.
+func gatewayDeps(ifaces []platform.IfaceInfo, err error) Deps {
+	return Deps{
+		Platform:  fakePlatform{ifaces: ifaces, err: err},
+		Guard:     netguard.New(probepolicy.Default(), false),
+		Effective: permission.NewSet(permission.NetworkGatewayProbe),
+	}
+}
+
+// lanIfaces is a two-NIC host: an up Wi-Fi NIC and an up Ethernet NIC, each with
+// its own IPv4 gateway, plus a loopback that must never be chosen.
+func lanIfaces() []platform.IfaceInfo {
+	return []platform.IfaceInfo{
+		{ID: "lo", Name: "Loopback", Up: true, IsLoopback: true, Gateways: []string{"127.0.0.1"}},
+		{ID: "wifi0", Name: "Wi-Fi", Up: true, IsWireless: true, Gateways: []string{"192.168.1.1"}},
+		{ID: "eth0", Name: "以太网", Up: true, Gateways: []string{"10.0.0.1"}},
+	}
+}
+
+// A gateway monitor's target is the server-normalized sentinel "gateway", which
+// no resolver can answer. Handing it to DNS reported "dns_error" on the incident
+// detail page for a plain LAN outage — pointing the reader at a layer that was
+// working fine. It must resolve from the routing table instead.
+func TestGatewayTargetResolvesFromRoutingTableNotDNS(t *testing.T) {
+	req := pcfg.IncidentSnapshotRequest{
+		RequestID: "isnapreq_gw", IncidentID: "inc_gw",
+		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
+	}
+	tg := Collect(context.Background(), req, gatewayDeps(lanIfaces(), nil)).Targets[0]
+
+	if tg.ErrorClass != "" {
+		t.Errorf("error class = %q, want empty (the gateway resolved)", tg.ErrorClass)
+	}
+	// Default NIC selection: the first up, non-loopback IPv4 gateway.
+	if len(tg.ResolvedIPs) != 1 || tg.ResolvedIPs[0] != "192.168.1.1" {
+		t.Errorf("resolved = %v, want [192.168.1.1]", tg.ResolvedIPs)
+	}
+	// A gateway monitor pings; it has no port, so it must claim no endpoint.
+	if len(tg.Endpoints) != 0 {
+		t.Errorf("endpoints = %v, want none", tg.Endpoints)
+	}
+}
+
+// The monitor's NIC selection has to reach the snapshot, or a multi-NIC host
+// reports one NIC's gateway for an incident raised on another's.
+func TestGatewayTargetHonoursInterfaceSelection(t *testing.T) {
+	req := pcfg.IncidentSnapshotRequest{
+		RequestID: "isnapreq_gw2", IncidentID: "inc_gw2",
+		Targets: []pcfg.SnapshotTargetRef{
+			{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway", Iface: "以太网"},
+			// A NIC that no longer exists must not silently fall back to the default.
+			{MonitorID: "mon_gone", Kind: "gateway", Target: "gateway", Iface: "does-not-exist"},
+		},
+	}
+	got := Collect(context.Background(), req, gatewayDeps(lanIfaces(), nil)).Targets
+
+	if len(got[0].ResolvedIPs) != 1 || got[0].ResolvedIPs[0] != "10.0.0.1" {
+		t.Errorf("named NIC resolved = %v, want [10.0.0.1]", got[0].ResolvedIPs)
+	}
+	if got[1].ErrorClass != errClassNoGateway {
+		t.Errorf("missing NIC error class = %q, want %q", got[1].ErrorClass, errClassNoGateway)
+	}
+	if len(got[1].ResolvedIPs) != 0 {
+		t.Errorf("missing NIC resolved %v, want nothing", got[1].ResolvedIPs)
+	}
+}
+
+// Each way the gateway lookup can fail gets its own class. Collapsing them (or
+// borrowing dns_error) is the bug this whole path exists to avoid.
+func TestGatewayFailuresAreClassifiedDistinctly(t *testing.T) {
+	req := pcfg.IncidentSnapshotRequest{
+		RequestID: "isnapreq_gw3", IncidentID: "inc_gw3",
+		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
+	}
+	noGateway := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: true}}
+	// An IPv6-only gateway is not an IPv4 default route: the probe would not use
+	// it, so the snapshot must not name it either.
+	v6Only := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: true, Gateways: []string{"fe80::1"}}}
+	// A down NIC's stale gateway must not be reported as the live default route.
+	downNIC := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: false, Gateways: []string{"10.0.0.1"}}}
+
+	for _, tc := range []struct {
+		name   string
+		deps   Deps
+		want   string
+		target pcfg.SnapshotTargetRef
+	}{
+		{name: "no ipv4 gateway", deps: gatewayDeps(noGateway, nil), want: errClassNoGateway},
+		{name: "ipv6 only", deps: gatewayDeps(v6Only, nil), want: errClassNoGateway},
+		{name: "nic down", deps: gatewayDeps(downNIC, nil), want: errClassNoGateway},
+		// The platform reports an unreadable routing table alongside a populated
+		// interface list; the gateway is UNKNOWN, which is not "there is none".
+		{name: "routing table unreadable", deps: gatewayDeps(lanIfaces(), platform.ErrRoutesUnreadable), want: errClassRouteUnreadable},
+		{name: "interfaces unreadable", deps: gatewayDeps(nil, errors.New("boom")), want: errClassRouteUnreadable},
+		{name: "no permission at all", deps: Deps{
+			Platform: fakePlatform{ifaces: lanIfaces()},
+			Guard:    netguard.New(probepolicy.Default(), false),
+		}, want: errClassPermissionDenied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tg := Collect(context.Background(), req, tc.deps).Targets[0]
+			if tg.ErrorClass != tc.want {
+				t.Errorf("error class = %q, want %q", tg.ErrorClass, tc.want)
+			}
+			if tg.ErrorClass == errClassDNS {
+				t.Error("a gateway monitor must never report a DNS failure")
+			}
+		})
+	}
+}
+
+// Address-read alone authorizes gateway disclosure — collectNetwork already
+// publishes the default route under it. Demanding the probe permission here made
+// one snapshot print the default route in its network group while the gateway
+// target next to it claimed permission was denied for the same address.
+func TestGatewayResolutionAcceptsAddressReadPermission(t *testing.T) {
+	req := pcfg.IncidentSnapshotRequest{
+		RequestID: "isnapreq_gw5", IncidentID: "inc_gw5",
+		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
+	}
+	for _, tc := range []struct {
+		name string
+		set  permission.Set
+	}{
+		{name: "address read only", set: permission.NewSet(permission.NetIfaceAddressRead)},
+		{name: "gateway probe only", set: permission.NewSet(permission.NetworkGatewayProbe)},
+		{name: "both", set: permission.NewSet(permission.NetIfaceAddressRead, permission.NetworkGatewayProbe)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := Deps{
+				Platform:  fakePlatform{ifaces: lanIfaces()},
+				Guard:     netguard.New(probepolicy.Default(), false),
+				Effective: tc.set,
+			}
+			tg := Collect(context.Background(), req, deps).Targets[0]
+			if tg.ErrorClass != "" {
+				t.Errorf("error class = %q, want empty", tg.ErrorClass)
+			}
+			if len(tg.ResolvedIPs) != 1 || tg.ResolvedIPs[0] != "192.168.1.1" {
+				t.Errorf("resolved = %v, want [192.168.1.1]", tg.ResolvedIPs)
+			}
+		})
+	}
+}
+
+// An unreadable routing table must not cost the caller the interface evidence it
+// did get. The network group stays collected with its interfaces; only the
+// default route is absent.
+func TestRoutesUnreadableKeepsNetworkGroupCollected(t *testing.T) {
+	deps := Deps{
+		Platform:  fakePlatform{ifaces: lanIfaces(), err: platform.ErrRoutesUnreadable},
+		Guard:     netguard.New(probepolicy.Default(), false),
+		Effective: permission.NewSet(permission.NetIfaceStatusRead, permission.NetIfaceAddressRead),
+	}
+	snap := Collect(context.Background(), pcfg.IncidentSnapshotRequest{RequestID: "isnapreq_ru", IncidentID: "inc_ru"}, deps)
+
+	var status string
+	for _, g := range snap.Groups {
+		if g.Group == telemetry.SnapshotGroupNetwork {
+			status = g.Status
+		}
+	}
+	if status != telemetry.ScopeCollected {
+		t.Errorf("network group = %q, want %q", status, telemetry.ScopeCollected)
+	}
+	if snap.Network == nil || len(snap.Network.Interfaces) != len(lanIfaces()) {
+		t.Fatalf("interfaces were dropped: %+v", snap.Network)
+	}
+	if snap.Network.DefaultRoute != nil {
+		t.Errorf("default route = %+v, want absent when the routing table is unreadable", snap.Network.DefaultRoute)
+	}
+}
+
+// The network group's default route and a gateway target's resolution are two
+// readings of one fact and must never disagree inside a single snapshot. Taking
+// "first non-loopback interface carrying any gateway" for the group made them
+// disagree on exactly the hosts where it matters: a disconnected adapter keeps a
+// stale route, and a dual-stack NIC can list its IPv6 gateway first, while the
+// target resolves through ResolveIPv4Gateway (up, non-loopback, IPv4).
+func TestDefaultRouteAgreesWithGatewayTarget(t *testing.T) {
+	ifaces := []platform.IfaceInfo{
+		{ID: "lo", Name: "Loopback", Up: true, IsLoopback: true, Gateways: []string{"127.0.0.1"}},
+		{ID: "eth1", Name: "Dock", Up: false, Gateways: []string{"10.9.9.1"}},                // unplugged, stale route
+		{ID: "wifi0", Name: "Wi-Fi", Up: true, Gateways: []string{"fe80::1", "192.168.1.1"}}, // IPv6 first
+	}
+	deps := Deps{
+		Platform:  fakePlatform{ifaces: ifaces},
+		Guard:     netguard.New(probepolicy.Default(), false),
+		Effective: permission.NewSet(permission.NetIfaceStatusRead, permission.NetworkGatewayProbe),
+	}
+	req := pcfg.IncidentSnapshotRequest{
+		RequestID: "isnapreq_agree", IncidentID: "inc_agree",
+		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
+	}
+	snap := Collect(context.Background(), req, deps)
+
+	if snap.Network == nil || snap.Network.DefaultRoute == nil {
+		t.Fatalf("no default route in %+v", snap.Network)
+	}
+	if got := snap.Network.DefaultRoute.Gateway; got != "192.168.1.1" {
+		t.Errorf("default route gateway = %q, want 192.168.1.1 (up, IPv4)", got)
+	}
+	if got := snap.Network.DefaultRoute.Interface; got != "Wi-Fi" {
+		t.Errorf("default route interface = %q, want Wi-Fi", got)
+	}
+	if ips := snap.Targets[0].ResolvedIPs; len(ips) != 1 || ips[0] != snap.Network.DefaultRoute.Gateway {
+		t.Errorf("gateway target resolved %v, want the same address the group reports (%s)",
+			ips, snap.Network.DefaultRoute.Gateway)
+	}
+}
+
+// A spent budget must not turn a gateway lookup into a timeout either: the
+// routing table is a local read with no resolver and no network round trip, so
+// it still answers.
+func TestGatewayResolvesWithSpentBudget(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	req := pcfg.IncidentSnapshotRequest{
+		RequestID: "isnapreq_gw4", IncidentID: "inc_gw4",
+		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
+	}
+	tg := Collect(ctx, req, gatewayDeps(lanIfaces(), nil)).Targets[0]
+
+	if tg.ErrorClass != "" || len(tg.ResolvedIPs) != 1 || tg.ResolvedIPs[0] != "192.168.1.1" {
+		t.Errorf("class = %q resolved = %v, want empty class and [192.168.1.1]", tg.ErrorClass, tg.ResolvedIPs)
+	}
+}
 
 // A spent collection budget must be reported as a timeout on every target, never
 // as a DNS failure. The stdlib resolver wraps a dead context in a *net.DNSError,

@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"fmt"
 	"sync"
 	"syscall"
 
@@ -66,10 +67,19 @@ func (linuxPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 
 	// One netlink dump serves both fields: DNS is attached to the interfaces that
 	// carry a default route (see resolv_linux.go for why).
-	routes := defaultRoutes{gateways: map[int][]string{}, ifaces: map[int]bool{}}
-	if msgs, derr := netlinkDump(syscall.RTM_GETROUTE); derr == nil {
-		routes = parseDefaultRoutes(msgs)
+	//
+	// A failed dump is REPORTED, not swallowed. Leaving an empty route table
+	// behind and returning success makes "this host has no gateway" and "the agent
+	// could not read the routing table" — say, RTM_GETROUTE blocked by a seccomp
+	// policy — arrive at the caller as the same answer, and an incident scene then
+	// blames the LAN for a restriction on the agent itself. The interface list is
+	// still complete and still returned, so callers that only need status and
+	// addresses lose nothing.
+	msgs, derr := netlinkDump(syscall.RTM_GETROUTE)
+	if derr != nil {
+		return out, fmt.Errorf("%w: %v", ErrRoutesUnreadable, derr)
 	}
+	routes := parseDefaultRoutes(msgs)
 	var nameservers []string
 	if q.DNS {
 		nameservers = systemNameservers()
