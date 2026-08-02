@@ -1,32 +1,55 @@
-# agent
+# NetTact Agent
 
-NetTact 软件 Agent —— 部署在 Windows / Linux / macOS / NAS 上的**纯出站监控客户端**,绝不监听任何端口,所有数据主动上传(架构 §2.1 / §15.1)。Apache-2.0。
+English | [简体中文](./README-zh.md)
 
-M1 已实现:
-- `internal/platform/` — 平台 HAL;Windows 用 `GetAdaptersAddresses`(网卡/网关/DNS)与 `IcmpSendEcho`(网关 ping,**免管理员**、CGO-free),可交叉编译到 Linux。
-- `internal/collector/` — interface + gateway-ping collector。
-- `internal/conn/` — 到服务器的持久 WebSocket 连接(遥测上行 + 配置/快照请求下行,断线自动重连)。
-- `internal/identity/` — 本地 agent 身份(M2 起换 ed25519 注册)。
+NetTact Agent is a lightweight collector installed on monitored devices. It runs network probes from the device's actual location, collects host and network health, and actively pushes the results to NetTact Server.
 
-## 配置
+It is designed for home networks, small offices, routers, NAS devices, and machines spread across multiple locations. The Agent opens no inbound ports and only needs outbound access to NetTact Server, so it works naturally behind NAT, firewalls, and dynamic IP addresses.
 
-**推荐用 YAML 配置文件**(带注释模板见 [`agent.example.yaml`](./agent.example.yaml));
-每个键与一个 `NETTACT_AGENT_*` 环境变量一一对应,优先级:**配置文件 > 环境变量 >
-内置默认**。唯一的配置类命令行参数是 `--config`(另保留 `--help` / `--version`)。
+## Why NetTact Agent
 
-```yaml
-# nettact-agent.yaml(工作目录自动发现;建议 chmod 600)
-server_url: http://localhost:12450
-enroll_token: "<控制台签发的一次性令牌>"   # 仅首次注册需要
-```
+- **Measures the real user path**: probes see the local gateway, DNS, Wi-Fi, egress, and target services from the endpoint's perspective.
+- **Outbound only**: the Agent receives monitoring configuration and uploads results over a persistent outbound connection; it never listens on a port.
+- **Survives disconnections**: telemetry is written to a local WAL and uploaded after connectivity returns.
+- **Centrally managed**: monitoring targets are pushed from the console, so probe jobs do not need to be edited device by device.
+- **Explicit permission boundaries**: a local policy limits what the Agent may collect, while a target-access policy limits where probes may connect.
+- **Cross-platform**: Windows, Linux, and macOS are supported, with native-service and Docker deployment options.
+- **Bandwidth efficient**: telemetry is batched and sent as Protobuf by default, with JSON available for troubleshooting.
+
+## What It Can Monitor
+
+- ICMP latency, packet loss, jitter, and path diagnostics
+- DNS resolution, TCP connection time, TLS handshakes, and HTTP availability
+- Default gateways, network interfaces, routes, neighbors, and NAT behavior
+- Wi-Fi connection state, signal strength, and link rates, where supported by the OS
+- CPU, memory, disks, load, network throughput, temperature, and other host metrics
+- Process and connection snapshots, including incident-time diagnostics
+- Monitors routed through SOCKS5, HTTP CONNECT, or WireGuard egress
+
+Available capabilities depend on the operating system, the local permission policy, and process privileges. The Agent reports supported, granted, and effective capabilities to the console instead of substituting synthetic zero values for data it cannot collect.
+
+## Installation, Configuration, and Operations
+
+Agent installation and operational guidance is maintained in the NetTact documentation:
+
+- [Deploy NetTact Server](https://nettact.org/en/deploy): one-command deployment, first login, remote Agents, upgrades, backups, HTTPS, and troubleshooting.
+- [Agent configuration](https://nettact.org/en/agent-config): installation on Windows, Linux, macOS, and Docker; enrollment tokens; YAML and environment variables; updates and troubleshooting.
+- [Permission reference](https://nettact.org/en/permissions): permission presets, platform support, probe target-access controls, and every permission's meaning.
+
+An annotated configuration template is available at [`agent.example.yaml`](./agent.example.yaml). Treat the user documentation and `nettact-agent --help` as the source of truth for installation commands, configuration, and operational procedures; they are intentionally not duplicated here.
+
+## Building from Source
+
+The project requires Go 1.25. Keep the NetTact Go modules in one workspace so the root `go.work` can resolve local dependencies:
 
 ```bash
-go run ./cmd/nettact-agent            # 自动发现 ./nettact-agent.yaml
+go build ./...
+go test ./...
+go build -o nettact-agent ./cmd/nettact-agent
 ```
 
-完整参考(全部键/变量、默认值与范围、定位顺序、注册流程、权限策略
-`permissions` 的整体替换语义、探测目标访问控制 `probe_access`、平台能力差异)
-见 **[docs/agent-config.md](../docs/agent-config.md)**;单一事实来源为
-`nettact-agent --help`。
+The runtime can also be imported as the [`agentrt`](./agentrt) Go package. The standalone Agent and NetTact Desktop use the same collection runtime.
 
-依赖 [github.com/nettact/protocol](https://github.com/nettact/protocol)。本地多仓开发使用 `go.work`。
+## License
+
+[Apache License 2.0](./LICENSE)
