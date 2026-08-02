@@ -65,7 +65,7 @@ func fakeClock(s *Supervisor, start time.Time) func(time.Duration) {
 }
 
 func TestParseProbeLineAcceptsAWorkingSensor(t *testing.T) {
-	got := parseProbeLine([]byte(`{"type":"probe","proto":3,"sensor_version":"0.2.0",` +
+	got := parseProbeLine([]byte(`{"type":"probe","proto":4,"sensor_version":"0.2.0",` +
 		`"ok":true,"pm_version":"2.3.0"}`))
 	if !got.OK {
 		t.Fatalf("probe = %+v, want OK", got)
@@ -89,10 +89,10 @@ func TestParseProbeLineSeparatesTheGPUAnswer(t *testing.T) {
 		name, line      string
 		wantOK, wantGPU bool
 	}{
-		{"frames and adapter", `{"type":"probe","proto":3,"ok":true,"gpu_ok":true}`, true, true},
-		{"frames only", `{"type":"probe","proto":3,"ok":true}`, true, false},
-		{"frames only, stated", `{"type":"probe","proto":3,"ok":true,"gpu_ok":false}`, true, false},
-		{"adapter without capture", `{"type":"probe","proto":3,"ok":false,"reason":"service_unavailable","gpu_ok":true}`, false, false},
+		{"frames and adapter", `{"type":"probe","proto":4,"ok":true,"gpu_ok":true}`, true, true},
+		{"frames only", `{"type":"probe","proto":4,"ok":true}`, true, false},
+		{"frames only, stated", `{"type":"probe","proto":4,"ok":true,"gpu_ok":false}`, true, false},
+		{"adapter without capture", `{"type":"probe","proto":4,"ok":false,"reason":"service_unavailable","gpu_ok":true}`, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -115,7 +115,7 @@ func TestParseProbeLineKeepsBlockedReason(t *testing.T) {
 	} {
 		t.Run(want, func(t *testing.T) {
 			got := parseProbeLine([]byte(fmt.Sprintf(
-				`{"type":"probe","proto":3,"sensor_version":"0.2.0","ok":false,"reason":%q}`, want)))
+				`{"type":"probe","proto":4,"sensor_version":"0.2.0","ok":false,"reason":%q}`, want)))
 			if got.OK {
 				t.Fatalf("probe = %+v, want not OK", got)
 			}
@@ -131,13 +131,13 @@ func TestParseProbeLineRejectsUnusableAnswers(t *testing.T) {
 		name, line, wantReason string
 	}{
 		{"garbage", `not json at all`, ReasonProbeFailed},
-		{"wrong type", `{"type":"hello","proto":3}`, ReasonProbeFailed},
+		{"wrong type", `{"type":"hello","proto":4}`, ReasonProbeFailed},
 		{"empty", ``, ReasonProbeFailed},
 		{"newer protocol", `{"type":"probe","proto":99,"ok":true}`, ReasonProtoMismatch},
 		{"older protocol", `{"type":"probe","proto":1,"ok":true}`, ReasonProtoMismatch},
 		// The sensor says it cannot capture but does not say why. Still blocked,
 		// and still given a code rather than an empty reason.
-		{"unexplained", `{"type":"probe","proto":3,"ok":false}`, ReasonProbeFailed},
+		{"unexplained", `{"type":"probe","proto":4,"ok":false}`, ReasonProbeFailed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -155,18 +155,18 @@ func TestParseProbeLineRejectsUnusableAnswers(t *testing.T) {
 func TestConsumeBucketsSecondsAndSkipsNoise(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
 	s.consume(strings.NewReader(strings.Join([]string{
-		`{"type":"hello","proto":3,"sensor_version":"0.2.0","source":"presentmon_service",` +
+		`{"type":"hello","proto":4,"sensor_version":"0.2.0","source":"presentmon_service",` +
 			`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`,
 		`{"type":"status","state":"tracking","pid":42,"proc":"game.exe","title":"Deep Rock Galactic"}`,
 		secLine("2026-08-01T12:00:00.500Z", "game.exe", 42),
 		`{"type":"sec"`, // truncated line: skipped, must not end the stream
 		`this is not json`,
 		// A message type this build does not know is ignored, not fatal.
-		`{"type":"gpu","proto":3,"temp_c":71}`,
+		`{"type":"gpu","proto":4,"temp_c":71}`,
 		secLine("2026-08-01T12:00:01.500Z", "game.exe", 42),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("Drain() returned %d runs, want 1: %+v", len(runs), runs)
 	}
@@ -196,7 +196,7 @@ func TestConsumeBucketsSecondsAndSkipsNoise(t *testing.T) {
 		t.Errorf("run LastSeenAt = %v, want the newest second %v", run.LastSeenAt, buckets[1].TS)
 	}
 
-	if runs, buckets := s.Drain(); runs != nil || buckets != nil {
+	if runs, buckets := s.drainRB(); runs != nil || buckets != nil {
 		t.Fatalf("Drain() = %v, %v on the second call; want both cleared", runs, buckets)
 	}
 }
@@ -221,7 +221,7 @@ func TestBucketsCarryTheSampleUnchanged(t *testing.T) {
 			`"ft_hist":{"layout":"log24_v1","counts":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,30,0,0,0,0,0,0,0,0]}}`,
 	}, "\n")))
 
-	_, buckets := s.Drain()
+	_, buckets := s.drainRB()
 	if len(buckets) != 2 {
 		t.Fatalf("got %d buckets, want 2", len(buckets))
 	}
@@ -250,7 +250,7 @@ func TestRunSurvivesAPIDChange(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "game.exe", 200),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("got %d runs across a pid change, want 1: %+v", len(runs), runs)
 	}
@@ -272,7 +272,7 @@ func TestNewRunWhenTheProcessChanges(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "second.exe", 2),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 2 {
 		t.Fatalf("got %d runs for two games, want 2: %+v", len(runs), runs)
 	}
@@ -309,7 +309,7 @@ func TestTitleUpdatesTheCurrentRun(t *testing.T) {
 		`{"type":"status","state":"tracking","pid":1,"proc":"game.exe","title":"Hoxxes IV"}`,
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("got %d runs, want 1: %+v", len(runs), runs)
 	}
@@ -327,7 +327,7 @@ func TestAbsentTitleDoesNotClearAKnownOne(t *testing.T) {
 		`{"type":"status","state":"tracking","pid":2,"proc":"game.exe"}`,
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	if len(runs) != 1 || runs[0].Title != "Hoxxes IV" {
 		t.Fatalf("runs = %+v, want the title kept", runs)
 	}
@@ -344,7 +344,7 @@ func TestIdleEndsTheRun(t *testing.T) {
 		`{"type":"status","state":"idle"}`,
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("got %d runs, want 1: %+v", len(runs), runs)
 	}
@@ -367,7 +367,7 @@ func TestRunWithoutBucketsEndsAtTheAgentClock(t *testing.T) {
 	advance(90 * time.Second)
 	s.consume(strings.NewReader(`{"type":"status","state":"idle"}`))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 || len(buckets) != 0 {
 		t.Fatalf("Drain() = %+v, %+v; want one run and no buckets", runs, buckets)
 	}
@@ -384,7 +384,7 @@ func TestSecWithoutStatusStartsARun(t *testing.T) {
 	s := NewSupervisor("sensor", nil)
 	s.consume(strings.NewReader(secLine("2026-08-01T12:00:00Z", "orphan.exe", 9)))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 || len(buckets) != 1 {
 		t.Fatalf("Drain() = %+v, %+v; want one run and one bucket", runs, buckets)
 	}
@@ -425,7 +425,7 @@ func TestReturningToTheSameProcessReopensItsRun(t *testing.T) {
 		secLine("2026-08-02T01:00:40Z", "game.exe", 100),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	byID := map[string]gs.Run{}
 	for _, r := range runs {
 		byID[r.ID] = r
@@ -479,7 +479,7 @@ func TestASessionResumesAfterBeingDeclaredOver(t *testing.T) {
 		secLine("2026-08-02T01:02:00Z", "game.exe", 100),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	ids := map[string]bool{}
 	for _, r := range runs {
 		ids[r.ID] = true
@@ -517,7 +517,7 @@ func TestADifferentProcessIdIsADifferentSession(t *testing.T) {
 		secLine("2026-08-02T01:00:20Z", "game.exe", 300),
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	ids := map[string]bool{}
 	for _, r := range runs {
 		ids[r.ID] = true
@@ -537,7 +537,7 @@ func TestAProcessQuietPastTheWindowStartsFresh(t *testing.T) {
 		`{"type":"status","state":"tracking","pid":100,"proc":"game.exe"}`,
 		secLine("2026-08-02T01:00:00Z", "game.exe", 100),
 	}, "\n")))
-	s.Drain()
+	s.drainRB()
 	s.endRun() // the sensor stopped; the run is parked, not forgotten
 
 	// Two hours of silence — twice the window — before the same process returns.
@@ -547,7 +547,7 @@ func TestAProcessQuietPastTheWindowStartsFresh(t *testing.T) {
 		secLine("2026-08-02T03:00:00Z", "game.exe", 100),
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	var live, finished int
 	for _, r := range runs {
 		if r.EndedAt == nil {
@@ -615,7 +615,7 @@ func TestTheReviveWindowIsAnEdge(t *testing.T) {
 					secLine(back.Format(time.RFC3339), "game.exe", 100),
 				}, "\n")))
 
-				runs, buckets := s.Drain()
+				runs, buckets := s.drainRB()
 				byID := runsByID(runs)
 				if len(byID) != tc.wantRuns {
 					t.Fatalf("away %v from a run last seen at %v: recorded %d runs, want %d: %+v",
@@ -681,7 +681,7 @@ func TestASecondWithNoProcessNameIsDiscarded(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "game.exe", 9),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("Drain() returned %d runs, want one session rather than a nameless one plus a real one", len(runs))
 	}
@@ -707,16 +707,16 @@ func TestRequeuePutsUnpersistedRecordsBack(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "game.exe", 1),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 || len(buckets) != 2 {
 		t.Fatalf("Drain() = %d runs, %d buckets", len(runs), len(buckets))
 	}
-	s.Requeue(runs, buckets)
+	s.Requeue(Records{Runs: runs, Buckets: buckets})
 
 	// A later second arrives before the retry.
 	s.consume(strings.NewReader(secLine("2026-08-01T12:00:02Z", "game.exe", 1)))
 
-	againRuns, againBuckets := s.Drain()
+	againRuns, againBuckets := s.drainRB()
 	if len(againRuns) != 1 || againRuns[0].ID != runs[0].ID {
 		t.Fatalf("runs = %+v, want the same run offered again", againRuns)
 	}
@@ -741,13 +741,13 @@ func TestRequeueKeepsTheEndingOfAFinishedRun(t *testing.T) {
 		`{"type":"status","state":"idle"}`,
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 || runs[0].EndedAt == nil {
 		t.Fatalf("runs = %+v, want one finished run", runs)
 	}
-	s.Requeue(runs, buckets)
+	s.Requeue(Records{Runs: runs, Buckets: buckets})
 
-	again, _ := s.Drain()
+	again, _ := s.drainRB()
 	if len(again) != 1 {
 		t.Fatalf("runs = %d, want the finished run offered again", len(again))
 	}
@@ -779,7 +779,7 @@ func TestSecAfterIdleResumesTheParkedRun(t *testing.T) {
 	advance(30 * time.Second)
 	s.consume(strings.NewReader(secLine("2026-08-01T12:00:30Z", "game.exe", 1)))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	byID := runsByID(runs)
 	if len(byID) != 1 {
 		t.Fatalf("got %d runs, want the session resumed by its own seconds: %+v", len(byID), runs)
@@ -828,7 +828,7 @@ func TestAStoppedSensorEndsTheRun(t *testing.T) {
 	cancel()
 	<-done
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("got %d runs, want 1: %+v", len(runs), runs)
 	}
@@ -853,7 +853,7 @@ func TestConsumeReportsAnOversizedLine(t *testing.T) {
 		t.Fatal("consume() = nil for a line past the cap; the caller cannot know to restart")
 	}
 	// What arrived before the bad line is still real data that happened.
-	if _, buckets := s.Drain(); len(buckets) != 1 {
+	if _, buckets := s.drainRB(); len(buckets) != 1 {
 		t.Fatalf("kept %d buckets from before the oversized line, want 1", len(buckets))
 	}
 }
@@ -873,7 +873,7 @@ func TestConsumeStampsUndatedSeconds(t *testing.T) {
 	s.consume(strings.NewReader(`{"type":"sec","proc":"game.exe","frames":{"presented":30},` +
 		`"ft":{"avg":33.3,"p50":33.2,"p95":40,"p99":45,"max":51,"sd":4},` +
 		`"ft_hist":{"layout":"log24_v1","counts":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,30,0,0,0,0,0,0,0,0]}}`))
-	_, buckets := s.Drain()
+	_, buckets := s.drainRB()
 	if len(buckets) != 1 {
 		t.Fatalf("Drain() returned %d buckets, want 1", len(buckets))
 	}
@@ -894,7 +894,7 @@ func TestBufferDropsOldestWhenFull(t *testing.T) {
 			PID: 1, Proc: "game.exe",
 		})
 	}
-	_, buckets := s.Drain()
+	_, buckets := s.drainRB()
 	if len(buckets) != maxBuffered {
 		t.Fatalf("buffered %d buckets, want the cap %d", len(buckets), maxBuffered)
 	}
@@ -918,18 +918,18 @@ func TestRunIsResentWhileItChanges(t *testing.T) {
 		`{"type":"status","state":"tracking","pid":1,"proc":"game.exe"}`,
 		secLine("2026-08-01T12:00:00Z", "game.exe", 1),
 	}, "\n")))
-	first, _ := s.Drain()
+	first, _ := s.drainRB()
 	if len(first) != 1 || first[0].EndedAt != nil {
 		t.Fatalf("first drain = %+v, want one open run", first)
 	}
 
 	// Nothing happened since: there is nothing to upsert.
-	if runs, _ := s.Drain(); len(runs) != 0 {
+	if runs, _ := s.drainRB(); len(runs) != 0 {
 		t.Fatalf("second drain = %+v, want no runs for an unchanged run", runs)
 	}
 
 	s.consume(strings.NewReader(`{"type":"status","state":"idle"}`))
-	ended, _ := s.Drain()
+	ended, _ := s.drainRB()
 	if len(ended) != 1 || ended[0].ID != first[0].ID || ended[0].EndedAt == nil {
 		t.Fatalf("third drain = %+v, want the same run, now ended", ended)
 	}
@@ -1571,7 +1571,7 @@ func TestRunCarriesTheProfileTheSensorMatched(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "chrome.exe", 2),
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	if len(runs) != 2 {
 		t.Fatalf("got %d runs, want one per process: %+v", len(runs), runs)
 	}
@@ -1597,6 +1597,18 @@ func TestRunCarriesTheProfileTheSensorMatched(t *testing.T) {
 // it is written as. Every case below turns on whether the run survives that
 // interruption or is split by something else about the second sensor, and neither
 // answer may depend on what today's date is.
+// drainRB is Drain narrowed to the runs and buckets, for the tests that are
+// about run continuity and per-second frame data.
+//
+// It exists so those tests state what they are checking rather than unpacking
+// four record kinds to ignore two of them. The gap and machine-second halves
+// have their own tests below, which read the fields this one drops — so the
+// narrowing is a reading convenience and never a coverage hole.
+func (s *Supervisor) drainRB() ([]gs.Run, []gs.Bucket) {
+	rec := s.Drain()
+	return rec.Runs, rec.Buckets
+}
+
 func restartWith(t *testing.T, s *Supervisor, first, second string) ([]gs.Run, []gs.Bucket) {
 	t.Helper()
 	advance := fakeClock(s, fixtureStart)
@@ -1604,7 +1616,7 @@ func restartWith(t *testing.T, s *Supervisor, first, second string) ([]gs.Run, [
 	s.endRun()
 	advance(restartGap)
 	s.consume(strings.NewReader(second))
-	return s.Drain()
+	return s.drainRB()
 }
 
 // profileOf indexes drained runs by id, keeping the newest copy of each — the
@@ -1760,7 +1772,7 @@ func TestFirstStatusStampsARunOpenedByASecondLine(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "game.exe", 1),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	byID := runsByID(runs)
 	if len(byID) != 1 {
 		t.Fatalf("recorded %d runs, want the seconds and the status on one: %+v", len(byID), runs)
@@ -1807,9 +1819,9 @@ func TestSecondsNeverSplitARunOverItsProfile(t *testing.T) {
 // makes the depth rules visible: with every capability declared, what a run
 // carries is decided entirely by the tier its profile was configured with, which
 // is the situation a mixed configuration puts a real sensor in.
-const fullCapsHello = `{"type":"hello","proto":3,"sensor_version":"0.2.0",` +
+const fullCapsHello = `{"type":"hello","proto":4,"sensor_version":"0.2.0",` +
 	`"source":"presentmon_service","caps":["displayed","frame_type","present_meta",` +
-	`"per_frame_complete","cpu_split","gpu_split","latency","gpu_tel","proc_vram","busiest_core"]}`
+	`"per_frame_complete","cpu_split","gpu_split","latency","proc_vram"]}`
 
 // tierConfig is a configuration naming game.exe at one tier.
 func tierConfig(tier string) gs.Config {
@@ -1832,8 +1844,7 @@ func wantDepth(t *testing.T, run gs.Run, depth string) {
 		return false
 	}
 	for _, c := range []string{
-		gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency,
-		gs.CapGPUTel, gs.CapProcVRAM, gs.CapBusiestCore,
+		gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency, gs.CapProcVRAM,
 	} {
 		if got, want := hasCap(c), depth == gs.TierDiag; got != want {
 			t.Errorf("run %q caps = %v: %q present=%v, want %v for a %s-depth run",
@@ -1875,7 +1886,7 @@ func TestMixedTiersGiveEachRunItsOwnDepth(t *testing.T) {
 		secLine("2026-08-01T12:00:02Z", "chrome.exe", 3),
 	}, "\n")))
 
-	runs, _ := s.Drain()
+	runs, _ := s.drainRB()
 	byProfile := map[string]gs.Run{}
 	for _, r := range runs {
 		byProfile[r.ProfileID] = r
@@ -1904,7 +1915,7 @@ func TestTheFirstStatusStampsTheDepthWithTheProfile(t *testing.T) {
 		secLine("2026-08-01T12:00:01Z", "game.exe", 1),
 	}, "\n")))
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	byID := runsByID(runs)
 	if len(byID) != 1 {
 		t.Fatalf("recorded %d runs, want the seconds and the status on one: %+v", len(byID), runs)
@@ -1962,7 +1973,7 @@ func TestATierEditSplitsTheRunAtTheDepthChange(t *testing.T) {
 				secLine("2026-08-02T01:00:10Z", "game.exe", 100),
 			}, "\n")))
 
-			runs, buckets := s.Drain()
+			runs, buckets := s.drainRB()
 			byID := runsByID(runs)
 			if len(byID) != tt.wantRuns {
 				t.Fatalf("recorded %d runs, want %d: %+v", len(byID), tt.wantRuns, runs)

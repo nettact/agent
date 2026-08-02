@@ -124,7 +124,7 @@ func runMockSensor(scenario string, args []string) int {
 			if _, ok := acceptProbe(args); !ok {
 				return mockBadStartup
 			}
-			fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
+			fmt.Println(`{"type":"probe","proto":4,"sensor_version":"0.2.0-mock","ok":true,"pm_version":"2.3.0"}`)
 			return 0
 		}
 		stdin, ok := acceptConfig(args)
@@ -134,7 +134,7 @@ func runMockSensor(scenario string, args []string) int {
 		// The capabilities are stated, not promised: hello is written once the
 		// frame source is open and its query registered, so by here the sensor
 		// knows which optional fields its seconds will carry.
-		fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+		fmt.Println(`{"type":"hello","proto":4,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
 			`"pm_version":"2.3.0","caps":["displayed","frame_type","present_meta","per_frame_complete"]}`)
 		fmt.Println(`{"type":"status","state":"tracking","pid":4242,"proc":"mock.exe","title":"Mock Game"}`)
 		for i := 0; i < 3; i++ {
@@ -167,7 +167,7 @@ func runMockSensor(scenario string, args []string) int {
 		if !ok {
 			return mockBadStartup
 		}
-		fmt.Printf(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,`+
+		fmt.Printf(`{"type":"probe","proto":4,"sensor_version":"0.2.0-mock","ok":true,`+
 			`"gpu_ok":%v,"pm_version":"2.3.0"}`+"\n", gpu)
 		return 0
 
@@ -176,7 +176,7 @@ func runMockSensor(scenario string, args []string) int {
 			if _, ok := acceptProbe(args); !ok {
 				return mockBadStartup
 			}
-			fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":false,` +
+			fmt.Println(`{"type":"probe","proto":4,"sensor_version":"0.2.0-mock","ok":false,` +
 				`"reason":"service_unavailable"}`)
 			return 0
 		}
@@ -185,7 +185,7 @@ func runMockSensor(scenario string, args []string) int {
 		}
 		// A hello with no source is a run that failed to start; the status that
 		// follows carries the reason, and the sensor gives up.
-		fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock"}`)
+		fmt.Println(`{"type":"hello","proto":4,"sensor_version":"0.2.0-mock"}`)
 		fmt.Println(`{"type":"status","state":"error","reason":"service_unavailable"}`)
 		return 4
 
@@ -208,7 +208,7 @@ func runMockSensor(scenario string, args []string) int {
 		if _, ok := acceptConfig(args); !ok {
 			return mockBadStartup
 		}
-		fmt.Println(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
+		fmt.Println(`{"type":"hello","proto":4,"sensor_version":"0.2.0-mock","source":"presentmon_service",` +
 			`"caps":["displayed"]}`)
 		fmt.Println(`{"type":"status","state":"tracking","pid":1,"proc":"mock.exe","title":"Mock Game"}`)
 		fmt.Println(`{"type":"sec","ts":"2026-08-01T12:00:00Z","pid":1,"proc":"mock.exe",` +
@@ -346,7 +346,7 @@ func TestRunOnceRecordsFromMockSensor(t *testing.T) {
 		t.Fatal("runOnce did not return after cancellation")
 	}
 
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 {
 		t.Fatalf("recorded %d runs, want 1: %+v", len(runs), runs)
 	}
@@ -435,7 +435,7 @@ func TestRunOnceKeepsBucketsFromACrashedSensor(t *testing.T) {
 	if err == nil {
 		t.Fatal("runOnce() = nil, want the non-zero exit reported")
 	}
-	runs, buckets := s.Drain()
+	runs, buckets := s.drainRB()
 	if len(runs) != 1 || len(buckets) != 1 {
 		t.Fatalf("recorded %+v / %+v, want the one run and second emitted before the crash", runs, buckets)
 	}

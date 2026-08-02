@@ -209,7 +209,56 @@ type Recorder struct {
 
 	buckets []gs.Bucket
 	dropped int
+
+	// openGap is the silence being accumulated, if any. One at a time: the sensor
+	// watches one tracked tree and publishes at most one record per second, so two
+	// silences cannot overlap, and a change of run or of reason closes this one
+	// and opens the next.
+	//
+	// It is a pointer INTO gaps rather than a record held back until it ends. A
+	// stretch that is still going has to be visible on the server before it
+	// finishes — an hour spent minimized should not be invisible for the hour —
+	// so opening one queues it immediately and extending it re-queues the same
+	// record with a later end. Closing is then just forgetting the pointer, which
+	// is why every caller of closeGap can be a one-liner that cannot lose data.
+	openGap *gs.Gap
+	// gapLastTS is the frameless second the open gap last covered, for the
+	// contiguity test. Kept beside openGap rather than derived from its EndedAt so
+	// the interval's meaning ("this is where it reaches") stays independent of the
+	// bookkeeping that decides whether the next second joins it.
+	gapLastTS time.Time
+	gaps      []*gs.Gap
+	gapSet    map[string]bool
+	// gapOrphans counts frameless seconds that matched no session. Rate-limited
+	// into the log rather than counted quietly, the way dropped buckets are: a
+	// stream of them means the sensor and the recorder disagree about what is
+	// being tracked, which is a defect and not a quiet condition.
+	gapOrphans  int
+	gapsDropped int
+
+	// hosts is the machine-level buffer. Separate from buckets and not merged into
+	// it, because the two fill at different times: during an alt-tabbed hour there
+	// are no buckets at all and one host second per second, which is exactly when
+	// the machine's side is the only thing there is to look at.
+	hosts        []gs.HostSecond
+	hostsDropped int
 }
+
+// gapJoin is how far apart two frameless seconds may be and still be one
+// interruption.
+//
+// Not one second, because the sensor deliberately SKIPS the boundaries a stall
+// swallowed rather than publishing them ("a gap in the timestamps is the honest
+// record"), so consecutive frameless seconds are not guaranteed adjacent on a
+// machine under load. Five seconds matches the sensor's own clockStepTolerance,
+// which is the other place this system draws the line between jitter and a
+// discontinuity: past it, something happened that nothing observed, and calling
+// the two sides one continuous silence would assert coverage nobody has.
+//
+// A non-positive delta also splits, which is what a clock stepping backwards
+// looks like. The two intervals then overlap — that is what a clock step IS —
+// and the console merges touching bands geometrically, so it still draws as one.
+const gapJoin = 5 * time.Second
 
 // session is a run plus what the recorder knows about it that the record itself
 // does not carry.
@@ -296,13 +345,18 @@ const reviveWindow = time.Hour
 // the sensor was never going to collect them for is the difference between a
 // console that shows a game had no diagnostics and one that shows six charts
 // that will never draw a point.
+//
+// The machine-level readings are deliberately absent from this table and from
+// the capability vocabulary entirely. They are not a property of a run: they are
+// collected for every second the sensor is watching anything, at any tier, and
+// one second of them is read by every run that overlaps it. There is no run
+// whose capabilities could promise them and none whose capabilities could
+// explain their absence — the reading being NULL is what does that.
 var diagCaps = map[string]bool{
-	gs.CapCPUSplit:    true,
-	gs.CapGPUSplit:    true,
-	gs.CapLatency:     true,
-	gs.CapGPUTel:      true,
-	gs.CapProcVRAM:    true,
-	gs.CapBusiestCore: true,
+	gs.CapCPUSplit: true,
+	gs.CapGPUSplit: true,
+	gs.CapLatency:  true,
+	gs.CapProcVRAM: true,
 }
 
 // setProfileTiers adopts the configuration the sensor is being run with, as the
@@ -463,6 +517,11 @@ func (r *Recorder) stampProfile(profile profileClaim) {
 // The current run is parked rather than forgotten, because the person is very
 // likely coming back to it — that is what alt-tab is.
 func (r *Recorder) switchTo(pid int, proc, title string, profile profileClaim, now time.Time) {
+	// Whatever silence was accumulating belonged to the run being left. It is
+	// already queued and does not need flushing; only the pointer is dropped, so
+	// the next frameless second opens a fresh interval against whichever run is
+	// current then.
+	r.closeGap()
 	r.parkCurrent(now)
 	r.sweepParked(now)
 
@@ -534,6 +593,13 @@ func (r *Recorder) sweepParked(now time.Time) {
 	for pid, s := range r.parked {
 		if now.Sub(s.run.LastSeenAt) > reviveWindow {
 			delete(r.parked, pid)
+			// A silence still pointing at a session nobody came back to. The
+			// interval itself stands — it is already queued and describes real time
+			// — but nothing may extend it further, because the run it explains is no
+			// longer one this recorder can attribute a second to.
+			if r.openGap != nil && r.openGap.RunID == s.run.ID {
+				r.closeGap()
+			}
 		}
 	}
 }
@@ -579,6 +645,10 @@ func (r *Recorder) sec(m gs.Sec) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Frames end a silence, and this is the only thing that does. It goes first
+	// because every branch below can switch runs, and the interval that was open
+	// belongs to the run as it stood on the way in.
+	r.closeGap()
 	if m.Proc == "" && r.cur == nil {
 		// Frames arrived before anything could name the process that drew them.
 		// Opening a run here would be worse than losing the second: the run has
@@ -615,6 +685,185 @@ func (r *Recorder) sec(m gs.Sec) {
 	r.push(gs.Bucket{RunID: r.cur.run.ID, TS: ts, Sample: m.Sample})
 }
 
+// sessionFor returns the session a frameless second belongs to, which is not
+// always the one in progress.
+//
+// A silence outlives the run being current. Thirty frameless seconds make the
+// sensor report idle, which parks the run — and the person is very often still
+// there, coming back ten minutes later to the same game. The seconds between are
+// the whole point of recording gaps at all, and requiring r.cur would throw away
+// every one of them past the thirtieth: exactly the stretch a reader stares at
+// and cannot explain.
+//
+// It returns the session WITHOUT reviving it, and nothing that calls it writes
+// to the run. A gap must not clear EndedAt, must not advance LastSeenAt and must
+// not mark the run dirty: a parked session nobody returns to is a finished run,
+// and a game sitting minimized for an hour is not a game still being played.
+// Reviving is what a frame does; noticing is what this does.
+//
+// Caller holds mu.
+func (r *Recorder) sessionFor(pid int, proc string) *session {
+	if r.cur != nil && (pid == r.curPID || proc == r.cur.run.Proc) {
+		return r.cur
+	}
+	// Keyed on the process id first, and the name is then a check rather than a
+	// second key: two windows of the same browser, or two copies of a game, are
+	// different sessions that happen to share a program name, and an id that has
+	// been reused belongs to neither.
+	if s := r.parked[pid]; s != nil && s.run.Proc == proc {
+		return s
+	}
+	return nil
+}
+
+// gapSec folds one frameless second into an interval.
+//
+// A gap that finds no session is discarded, and that is right rather than merely
+// convenient. A run is a stretch of a game PRESENTING frames; a silence before
+// the first frame is not a run beginning, and one an hour after the last is not
+// a run continuing. Opening a run from a gap would produce a session whose only
+// content is that nothing happened in it.
+func (r *Recorder) gapSec(m gs.GapSec) {
+	ts := m.TS
+	if ts.IsZero() {
+		ts = r.now()
+	}
+	ts = ts.UTC()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Swept here, against THIS record's timestamp, and that is not belt and
+	// braces. A game that is minimized and never returned to produces nothing but
+	// gap and host lines from here on, so neither of the paths that normally
+	// sweep — switchTo and parkCurrent — ever runs again. Without this the parked
+	// session stays matchable forever and its interval grows for as long as the
+	// machine is on, which contradicts reviveWindow's own statement that the
+	// session is over.
+	//
+	// The record's own time rather than the wall clock, because that is what the
+	// rest of this file measures the window with, and a fixture-driven test must
+	// be able to state the gap it means.
+	r.sweepParked(ts)
+
+	s := r.sessionFor(m.PID, m.Proc)
+	if s == nil {
+		r.gapOrphans++
+		if r.gapOrphans == 1 || r.gapOrphans%600 == 0 {
+			log.Printf("gamesense: discarded %d frameless second(s) belonging to no recorded session", r.gapOrphans)
+		}
+		r.closeGap()
+		return
+	}
+
+	// Extend, when this second continues the same silence: the same run, the same
+	// reason, and close enough in time that nothing unobserved happened between.
+	if g := r.openGap; g != nil && g.RunID == s.run.ID && g.Reason == m.Reason {
+		if d := ts.Sub(r.gapLastTS); d > 0 && d <= gapJoin {
+			g.EndedAt = ts
+			r.gapLastTS = ts
+			r.markGapDirty(g)
+			return
+		}
+	}
+
+	// Otherwise this second starts a new interval. StartedAt reaches back to where
+	// the second BEGAN, so a single frameless second spans exactly one second on
+	// the same axis a bucket's point sits on.
+	g := &gs.Gap{
+		ID:        uuid.NewString(),
+		RunID:     s.run.ID,
+		Reason:    m.Reason,
+		StartedAt: ts.Add(-time.Second),
+		EndedAt:   ts,
+	}
+	r.openGap, r.gapLastTS = g, ts
+	r.markGapDirty(g)
+}
+
+// closeGap stops extending the open interval. It loses nothing: the interval was
+// queued when it opened and every extension re-queued it, so what has been
+// observed is already on its way. Caller holds mu.
+func (r *Recorder) closeGap() {
+	r.openGap, r.gapLastTS = nil, time.Time{}
+}
+
+// markGapDirty queues an interval to be sent on the next drain. Caller holds mu.
+//
+// Queued once and mutated in place afterwards, which is what makes a growing
+// silence visible before it ends: the drain copies whatever the record says at
+// that moment, and the server upserts by id and keeps the later end.
+func (r *Recorder) markGapDirty(g *gs.Gap) {
+	if r.gapSet[g.ID] {
+		return
+	}
+	if r.gapSet == nil {
+		r.gapSet = map[string]bool{}
+	}
+	// Bounded like the two second-buffers, and for the same reason. An upload path
+	// that is failing — a full disk, a locked database — leaves every drained
+	// record requeued, while a machine flipping between foreground and background
+	// can open a fresh interval every second. Without a cap that is unbounded
+	// growth in a process that is meant to run for months.
+	//
+	// The oldest go first, matching push: what a reader is coming back to is the
+	// recent end. Dropping is logged rather than silent, because an interval lost
+	// here leaves an unexplained blank on a chart — the exact thing gaps exist to
+	// prevent — and the one place that knows it happened has to say so.
+	if len(r.gaps) >= maxBuffered {
+		drop := r.gaps[0]
+		copy(r.gaps, r.gaps[1:])
+		r.gaps = r.gaps[:len(r.gaps)-1]
+		delete(r.gapSet, drop.ID)
+		r.gapsDropped++
+		if r.gapsDropped == 1 || r.gapsDropped%maxBuffered == 0 {
+			log.Printf("gamesense: dropped %d buffered interruption(s); the upload path is not keeping up", r.gapsDropped)
+		}
+	}
+	r.gapSet[g.ID] = true
+	r.gaps = append(r.gaps, g)
+}
+
+// hostSec buffers one machine-level second.
+//
+// It takes no session and touches no run, which is the point: this stream is
+// keyed by the machine and the second, it is collected for seconds no run
+// covers, and a run reads whichever of them its window overlaps. Attaching it to
+// r.cur would put it back inside the run and lose it during exactly the alt-tab
+// it exists to cover.
+//
+// A sample with nothing in it and no flag explaining why is dropped here rather
+// than sent for the server to drop: an all-empty record asserts "this second was
+// covered and nothing was readable", and a claim nobody can support is not worth
+// a row or the bytes to upload it.
+func (r *Recorder) hostSec(m gs.HostSec) {
+	if m.HostSample.Empty() {
+		return
+	}
+	ts := m.TS
+	if ts.IsZero() {
+		ts = r.now()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pushHost(gs.HostSecond{TS: ts.UTC(), HostSample: m.HostSample})
+}
+
+// pushHost records one machine second, dropping the oldest when the buffer is
+// full — the same rule and the same cap push follows, for the same reason: what
+// a live chart shows is the recent end. Caller holds mu.
+func (r *Recorder) pushHost(h gs.HostSecond) {
+	if len(r.hosts) >= maxBuffered {
+		copy(r.hosts, r.hosts[1:])
+		r.hosts = r.hosts[:len(r.hosts)-1]
+		r.hostsDropped++
+		if r.hostsDropped == 1 || r.hostsDropped%maxBuffered == 0 {
+			log.Printf("gamesense: dropped %d buffered machine second(s); the upload path is not keeping up", r.hostsDropped)
+		}
+	}
+	r.hosts = append(r.hosts, h)
+}
+
 // markDirty queues a run to be sent on the next drain. Caller holds mu.
 func (r *Recorder) markDirty(run *gs.Run) {
 	if r.dirtySet[run.ID] {
@@ -647,23 +896,54 @@ func (r *Recorder) push(b gs.Bucket) {
 	r.buckets = append(r.buckets, b)
 }
 
-// Drain removes and returns the runs that changed since the last drain and every
-// buffered bucket. A run still in progress is returned as it stands now, which is
-// what makes it visible on the server before it ends.
-func (r *Recorder) Drain() ([]gs.Run, []gs.Bucket) {
+// Records is one drain's worth of everything the recorder has assembled.
+//
+// A struct rather than four return values because the four are drained together
+// and must be requeued together: a caller that persisted two of them and dropped
+// the other two would leave a run whose seconds are on the server and whose
+// silences are not, which reads as data loss in exactly the stretch the silences
+// were recorded to explain.
+type Records struct {
+	Runs        []gs.Run
+	Buckets     []gs.Bucket
+	Gaps        []gs.Gap
+	HostSeconds []gs.HostSecond
+}
+
+// Empty reports whether a drain found nothing to send.
+func (rec Records) Empty() bool {
+	return len(rec.Runs) == 0 && len(rec.Buckets) == 0 &&
+		len(rec.Gaps) == 0 && len(rec.HostSeconds) == 0
+}
+
+// Drain removes and returns everything buffered since the last drain: the runs
+// that changed, the buffered seconds, the silences that changed, and the machine
+// seconds. A run or a silence still in progress is returned as it stands now,
+// which is what makes it visible on the server before it ends.
+func (r *Recorder) Drain() Records {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var runs []gs.Run
+	var out Records
 	if len(r.dirty) > 0 {
-		runs = make([]gs.Run, len(r.dirty))
+		out.Runs = make([]gs.Run, len(r.dirty))
 		for i, run := range r.dirty {
-			runs[i] = *run
+			out.Runs[i] = *run
 		}
 		r.dirty, r.dirtySet = nil, nil
 	}
-	buckets := r.buckets
-	r.buckets = nil
-	return runs, buckets
+	// Copied by value like the runs, and for the same reason: the open one is
+	// still being extended, so handing out the pointer would let the uploader
+	// serialize a record that changed underneath it.
+	if len(r.gaps) > 0 {
+		out.Gaps = make([]gs.Gap, len(r.gaps))
+		for i, g := range r.gaps {
+			out.Gaps[i] = *g
+		}
+		r.gaps, r.gapSet = nil, nil
+	}
+	out.Buckets, r.buckets = r.buckets, nil
+	out.HostSeconds, r.hosts = r.hosts, nil
+	return out
 }
 
 // Requeue puts drained records back after the caller failed to persist them.
@@ -674,11 +954,11 @@ func (r *Recorder) Drain() ([]gs.Run, []gs.Bucket) {
 // back at the front because they are older than anything recorded since, and the
 // buffer is ordered by time; the runs are simply marked dirty again, since the
 // recorder holds the live copy and re-sending is what the server's upsert is for.
-func (r *Recorder) Requeue(runs []gs.Run, buckets []gs.Bucket) {
+func (r *Recorder) Requeue(rec Records) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(buckets) > 0 {
-		r.buckets = append(buckets, r.buckets...)
+	if len(rec.Buckets) > 0 {
+		r.buckets = append(rec.Buckets, r.buckets...)
 		// The combined length can exceed the cap, so trim from the front, which
 		// is the same oldest-first rule push follows.
 		if extra := len(r.buckets) - maxBuffered; extra > 0 {
@@ -687,18 +967,38 @@ func (r *Recorder) Requeue(runs []gs.Run, buckets []gs.Bucket) {
 			log.Printf("gamesense: dropped %d requeued second(s) that no longer fit", extra)
 		}
 	}
-	for i := range runs {
+	if len(rec.HostSeconds) > 0 {
+		r.hosts = append(rec.HostSeconds, r.hosts...)
+		if extra := len(r.hosts) - maxBuffered; extra > 0 {
+			r.hosts = r.hosts[extra:]
+			r.hostsDropped += extra
+			log.Printf("gamesense: dropped %d requeued machine second(s) that no longer fit", extra)
+		}
+	}
+	for i := range rec.Runs {
 		var run *gs.Run
-		if r.cur != nil && r.cur.run.ID == runs[i].ID {
+		if r.cur != nil && r.cur.run.ID == rec.Runs[i].ID {
 			run = r.cur.run
 		} else {
 			// The run has already ended, so the recorder no longer holds it; keep
 			// the copy that was handed back. Without this, an ending that failed
 			// to persist would never be sent and the run would stay open forever.
-			ended := runs[i]
+			ended := rec.Runs[i]
 			run = &ended
 		}
 		r.markDirty(run)
+	}
+	for i := range rec.Gaps {
+		// The open interval is the live record and is still growing, so the copy
+		// handed back is stale; re-queueing the pointer sends whatever it says at
+		// the next drain, which is at least as much as was lost. Every other
+		// interval is finished, and its returned copy is the only remaining one.
+		if r.openGap != nil && r.openGap.ID == rec.Gaps[i].ID {
+			r.markGapDirty(r.openGap)
+			continue
+		}
+		g := rec.Gaps[i]
+		r.markGapDirty(&g)
 	}
 }
 
@@ -1084,6 +1384,25 @@ func (s *Supervisor) consume(r io.Reader) error {
 				continue
 			}
 			s.sec(m)
+		case gs.TypeGap:
+			var g gs.GapSec
+			if json.Unmarshal(line, &g) != nil {
+				continue
+			}
+			// A reason this build does not recognize is still recorded. The stretch
+			// happened either way, and dropping it would put back the unexplained
+			// blank the record exists to remove; the console renders an unknown code
+			// as an unlabelled band rather than refusing the interval.
+			if g.Reason == "" {
+				continue
+			}
+			s.gapSec(g)
+		case gs.TypeHost:
+			var h gs.HostSec
+			if json.Unmarshal(line, &h) != nil {
+				continue
+			}
+			s.hostSec(h)
 		case gs.TypeStatus:
 			var st gs.Status
 			if json.Unmarshal(line, &st) != nil {

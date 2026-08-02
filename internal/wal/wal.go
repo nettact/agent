@@ -27,6 +27,8 @@ const (
 	kindSnapshot   = "n" // telemetry.InterfaceSnapshot (authoritative interface set)
 	kindGameRun    = "g" // gamesense.Run
 	kindGameBucket = "b" // gamesense.Bucket
+	kindGameGap    = "p" // gamesense.Gap ("pause")
+	kindGameHost   = "h" // gamesense.HostSecond
 )
 
 // Store is the SQLite-backed outbox.
@@ -76,12 +78,14 @@ func (s *Store) Close() error { return s.db.Close() }
 // puts related records together — a run and the buckets that hang from it — is
 // guaranteed they reach the server in the same packet.
 type Records struct {
-	Metrics     []telemetry.Metric
-	Events      []telemetry.Event
-	Inventory   []telemetry.InventoryItem
-	Snapshots   []telemetry.InterfaceSnapshot
-	GameRuns    []gamesense.Run
-	GameBuckets []gamesense.Bucket
+	Metrics         []telemetry.Metric
+	Events          []telemetry.Event
+	Inventory       []telemetry.InventoryItem
+	Snapshots       []telemetry.InterfaceSnapshot
+	GameRuns        []gamesense.Run
+	GameBuckets     []gamesense.Bucket
+	GameGaps        []gamesense.Gap
+	GameHostSeconds []gamesense.HostSecond
 }
 
 // Append durably stores one batch of records and enforces caps. It returns the
@@ -152,6 +156,16 @@ func (s *Store) Append(r Records) (dropped int, err error) {
 			return 0, err
 		}
 	}
+	for i := range r.GameGaps {
+		if err = ins(kindGameGap, r.GameGaps[i]); err != nil {
+			return 0, err
+		}
+	}
+	for i := range r.GameHostSeconds {
+		if err = ins(kindGameHost, r.GameHostSeconds[i]); err != nil {
+			return 0, err
+		}
+	}
 
 	// Time-based eviction of stale un-acked samples. All rows of one Append share
 	// the same created_at (computed once above), so this removes whole groups —
@@ -199,13 +213,15 @@ func (s *Store) Append(r Records) (dropped int, err error) {
 
 // Batch is a packet to upload.
 type Batch struct {
-	Sequence    uint64
-	Metrics     []telemetry.Metric
-	Events      []telemetry.Event
-	Inventory   []telemetry.InventoryItem
-	Snapshots   []telemetry.InterfaceSnapshot
-	GameRuns    []gamesense.Run
-	GameBuckets []gamesense.Bucket
+	Sequence        uint64
+	Metrics         []telemetry.Metric
+	Events          []telemetry.Event
+	Inventory       []telemetry.InventoryItem
+	Snapshots       []telemetry.InterfaceSnapshot
+	GameRuns        []gamesense.Run
+	GameBuckets     []gamesense.Bucket
+	GameGaps        []gamesense.Gap
+	GameHostSeconds []gamesense.HostSecond
 }
 
 // NextBatch returns the next packet to send. A pending (previously-tagged)
@@ -400,6 +416,16 @@ func (s *Store) loadBatch(seq uint64) (Batch, bool, error) {
 			var bk gamesense.Bucket
 			if json.Unmarshal([]byte(data), &bk) == nil {
 				b.GameBuckets = append(b.GameBuckets, bk)
+			}
+		case kindGameGap:
+			var g gamesense.Gap
+			if json.Unmarshal([]byte(data), &g) == nil {
+				b.GameGaps = append(b.GameGaps, g)
+			}
+		case kindGameHost:
+			var h gamesense.HostSecond
+			if json.Unmarshal([]byte(data), &h) == nil {
+				b.GameHostSeconds = append(b.GameHostSeconds, h)
 			}
 		}
 	}

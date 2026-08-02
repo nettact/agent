@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 	case "ok-gpu":
 		os.Exit(runMockSensor(os.Args[1:], true))
 	case "blocked":
-		fmt.Println(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock",` +
+		fmt.Println(`{"type":"probe","proto":4,"sensor_version":"0.2.0-mock",` +
 			`"ok":false,"reason":"service_unavailable"}`)
 		os.Exit(0)
 	case "stale":
@@ -91,7 +91,7 @@ func runMockSensor(args []string, gpu bool) int {
 			fmt.Fprintf(os.Stderr, "mock sensor: probe argv %v, want --gpu present=%v under this policy\n", args, want)
 			return 3
 		}
-		fmt.Printf(`{"type":"probe","proto":3,"sensor_version":"0.2.0-mock","ok":true,`+
+		fmt.Printf(`{"type":"probe","proto":4,"sensor_version":"0.2.0-mock","ok":true,`+
 			`"gpu_ok":%v,"pm_version":"2.3.0"}`+"\n", gpu && asked)
 		return 0
 	}
@@ -126,9 +126,15 @@ func runMockSensor(args []string, gpu bool) int {
 	}
 
 	// What a run is recorded under depends on the configuration, exactly as the
-	// real sensor's does: adapter telemetry is declared only when the config line
-	// allowed it. That makes the flag the agent sent observable from the far end —
-	// on the uploaded run — instead of only inside this process.
+	// real sensor's does: the per-process video-memory read is declared only when
+	// the config line allowed it. That makes the flag the agent sent observable
+	// from the far end — on the uploaded run — instead of only inside this process.
+	//
+	// It is the process VRAM rather than the whole-card telemetry because the
+	// whole-card figures are no longer a run capability at all: they describe the
+	// machine, they are collected for seconds no run covers, and nothing on a run
+	// could promise or deny them. Both sit behind the same permission, so either
+	// answers the question this test asks.
 	//
 	// The frame-derived diag capabilities are declared unconditionally, which is
 	// also what the real sensor does: hello says what this PROCESS can measure,
@@ -139,14 +145,14 @@ func runMockSensor(args []string, gpu bool) int {
 		gs.CapCPUSplit, gs.CapGPUSplit, gs.CapLatency,
 	}
 	if cfg.GPU {
-		caps = append(caps, gs.CapGPUTel, gs.CapProcVRAM)
+		caps = append(caps, gs.CapProcVRAM)
 	}
 	capsJSON, err := json.Marshal(caps)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mock sensor: %v\n", err)
 		return 3
 	}
-	fmt.Printf(`{"type":"hello","proto":3,"sensor_version":"0.2.0-mock","source":"presentmon_service",`+
+	fmt.Printf(`{"type":"hello","proto":4,"sensor_version":"0.2.0-mock","source":"presentmon_service",`+
 		`"pm_version":"2.3.0","caps":%s}`+"\n", capsJSON)
 	if cfg.Mode == gs.ModeProfiles && !ok {
 		// Strict tracking, and this process is not one of the site's games — so it
@@ -282,9 +288,9 @@ func TestGPUCapableSensorIsGrantedTheAdapterRead(t *testing.T) {
 	runs, buckets := f.game()
 	assertGameRecords(t, runs, buckets, 1)
 	for _, r := range runs {
-		if !contains(r.Caps, gs.CapGPUTel) {
+		if !contains(r.Caps, gs.CapProcVRAM) {
 			t.Errorf("run caps = %v, want %q — the sensor was never told it may read the adapter",
-				r.Caps, gs.CapGPUTel)
+				r.Caps, gs.CapProcVRAM)
 		}
 	}
 }
@@ -335,9 +341,9 @@ func TestUngrantedAdapterReadIsNeverProbed(t *testing.T) {
 	runs, buckets := f.game()
 	assertGameRecords(t, runs, buckets, 1)
 	for _, r := range runs {
-		if contains(r.Caps, gs.CapGPUTel) {
+		if contains(r.Caps, gs.CapProcVRAM) {
 			t.Errorf("run caps = %v, want no %q — the sensor was allowed a read the site withheld",
-				r.Caps, gs.CapGPUTel)
+				r.Caps, gs.CapProcVRAM)
 		}
 	}
 }

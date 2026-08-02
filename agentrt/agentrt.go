@@ -568,23 +568,29 @@ func Run(ctx context.Context, cfg Config) error {
 		// rows also puts runs and buckets under the (agent_id, sequence) dedup that
 		// makes the at-least-once upload safe to replay.
 		//
-		// One Append per drain, so the runs and the buckets that hang from them are
-		// one WAL group and therefore one packet: the server never sees a bucket
-		// whose run it has not been told about.
+		// One Append per drain, so the runs, the buckets that hang from them and
+		// the silences that explain the space between are one WAL group and
+		// therefore one packet: the server never sees a bucket or a gap whose run
+		// it has not been told about.
 		flushGame := func() {
-			runs, buckets := gameSensor.Drain()
-			if len(runs) == 0 && len(buckets) == 0 {
+			rec := gameSensor.Drain()
+			if rec.Empty() {
 				// An idle desktop produces nothing for hours. Appending anyway would
 				// consume a group id and write a transaction on every tick, forever.
 				return
 			}
-			dropped, err := outbox.Append(wal.Records{GameRuns: runs, GameBuckets: buckets})
+			dropped, err := outbox.Append(wal.Records{
+				GameRuns:        rec.Runs,
+				GameBuckets:     rec.Buckets,
+				GameGaps:        rec.Gaps,
+				GameHostSeconds: rec.HostSeconds,
+			})
 			if err != nil {
 				// Put them back. The drain already emptied the recorder, so
 				// returning here without this turns one failed write — a full
 				// disk, a moment of database contention — into a permanent hole
 				// in the middle of a session.
-				gameSensor.Requeue(runs, buckets)
+				gameSensor.Requeue(rec)
 				log.Printf("wal append game data: %v", err)
 				return
 			}
