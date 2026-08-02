@@ -195,6 +195,20 @@ if $DOCKER_MODE; then
   fi
   if $CONTAINER_VIEW; then
     log "container view: this Agent reports the container's own network and processes"
+    # The host view below runs the container as root, which can read any token
+    # file; container view keeps the image's non-root user. A bind-mounted file
+    # arrives with the HOST's owner and mode, so a secret written 0600 by root is
+    # unreadable there and the Agent would fail enrollment 30 seconds from now
+    # with nothing but "permission denied" in a log the operator has to go find.
+    # Ask the image itself rather than guessing its uid.
+    if [ -n "${ABS_TOKEN_FILE:-}" ] && ! docker run --rm --entrypoint cat \
+        -v "$ABS_TOKEN_FILE:/run/secrets/agent_enroll_token:ro" "$IMG" \
+        /run/secrets/agent_enroll_token >/dev/null 2>&1; then
+      die "the Agent runs as a non-root user in container view and cannot read $ABS_TOKEN_FILE.
+  Make the FILE readable and keep its DIRECTORY private:
+    chmod 644 $ABS_TOKEN_FILE && chmod 700 $(dirname "$ABS_TOKEN_FILE")
+  or pass the token inline with --token instead of --token-file."
+    fi
   else
     log "host view: this Agent reports the Docker daemon host's network, processes and metrics"
     log "  (disk metrics still describe the container's filesystem — see the permissions docs)"

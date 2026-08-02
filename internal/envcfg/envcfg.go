@@ -271,9 +271,13 @@ func intVar(lookup Lookup, name string, def, lo, hi int, errs *[]error) int {
 }
 
 // loadTokenSource resolves the mutually-exclusive enrollment-token sources. The
-// file is preferred and read now; errors name the path, never contents. Returns
-// a TokenSource yielding the resolved token, or nil when neither is set (agentrt
-// then errors only if a first-run enrollment is actually needed).
+// file is preferred and read now; errors name the path and the underlying cause,
+// never contents — an open/read failure carries no token bytes, and "permission
+// denied" is the difference between a one-line fix and a blind restart loop (the
+// container image runs as a non-root user, so a secret file written 0600 by root
+// is unreadable to it). Returns a TokenSource yielding the resolved token, or nil
+// when neither is set (agentrt then errors only if a first-run enrollment is
+// actually needed).
 func loadTokenSource(lookup Lookup, errs *[]error) func(context.Context) (string, error) {
 	tokV, tokSet := lookup("NETTACT_AGENT_ENROLL_TOKEN")
 	fileV, fileSet := lookup("NETTACT_AGENT_ENROLL_TOKEN_FILE")
@@ -293,13 +297,15 @@ func loadTokenSource(lookup Lookup, errs *[]error) func(context.Context) (string
 		// local file cannot be slurped whole just to be rejected.
 		f, err := os.Open(path)
 		if err != nil {
-			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: reading %q failed", path))
+			// *PathError already renders as `open <path>: <cause>`, so it names
+			// the path without this repeating it.
+			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: %w", err))
 			return nil
 		}
 		data, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
 		_ = f.Close()
 		if err != nil {
-			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: reading %q failed", path))
+			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: reading %q failed: %w", path, err))
 			return nil
 		}
 		if len(data) > maxTokenFileBytes {

@@ -230,8 +230,6 @@ jobs:
             dist-bins/SHA256SUMS
             dist-out/nettact-agent-dependencies.json
             dist-out/nettact-agent-dependencies.json.sha256
-            agent/install.sh
-            agent/install.ps1
           body: |
             ## nettact-agent ${{ inputs.tag || github.ref_name }}
 
