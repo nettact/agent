@@ -12,6 +12,11 @@ DOCKER_MODE=false
 CONTAINER_VIEW=false
 PERMISSIONS=""
 TOKEN_FILE=""
+# Docker only: where the deployment's compose file, .env and enrollment token
+# live. A NATIVE install is unaffected — it stays on the platform's own paths
+# (/usr/local/bin, /etc/nettact, /var/lib/nettact-agent), because those are what
+# systemd, launchd and every uninstall instruction already refer to.
+INSTALL_DIR="${NETTACT_AGENT_INSTALL_DIR:-}"
 
 usage() {
   cat <<'EOF'
@@ -23,10 +28,15 @@ Usage:
   install.sh --update-only
 
 The same script installs a native systemd service on Linux, a launchd daemon on
-macOS, or a persistent container when --docker is selected. A full install
+macOS, or a docker compose deployment when --docker is selected. A full install
 REPLACES any previous installation — the previous Agent identity is wiped so
 the machine re-enrolls with the token given here. --update-only upgrades the
 binary in place and keeps the identity.
+
+With --docker the deployment is written to ~/nettact-agent (compose file, .env
+and the enrollment token) and started from there, so it can be managed with
+ordinary compose commands afterwards:
+  cd ~/nettact-agent && docker compose ps | logs -f | down
 
 Options:
   --auto-update        Install a daily native update timer, or an Agent-scoped
@@ -39,13 +49,30 @@ Options:
   --container-view     Docker only: monitor the CONTAINER instead of the host.
                        By default a Docker install monitors the Docker host —
                        host network and PID namespaces, the host's /proc and
-                       /sys, and NET_RAW for ICMP — because that is the machine
-                       an operator means to watch. This flag opts out.
+                       /sys, and root plus NET_RAW for path diagnostics —
+                       because that is the machine an operator means to watch.
+                       This flag opts out: the container stays non-root and
+                       keeps ICMP and gateway probing over a ping socket, but
+                       path diagnostics are unavailable there.
+
+Environment:
+  NETTACT_AGENT_INSTALL_DIR   --docker: where to write the deployment
+                              (default: ~/nettact-agent)
 EOF
 }
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
+
+# JSON quoted strings are valid YAML scalars and safely preserve URLs/paths.
+yaml_quote() {
+  printf '%s' "$1" | awk 'BEGIN { ORS=""; print "\"" } {
+    if (NR > 1) print "\\n"
+    gsub(/\\/, "\\\\")
+    gsub(/"/, "\\\"")
+    printf "%s", $0
+  } END { print "\"" }'
+}
 
 # Positive install verification: run the given check command (a test for the
 # Agent's persisted agent.json, which appears the moment enrollment succeeds)
@@ -124,15 +151,150 @@ $DOCKER_MODE && $UPDATE_ONLY && die "--update-only is for native installations; 
 
 if $DOCKER_MODE; then
   [ -n "$TOKEN_FILE" ] && [ ! -r "$TOKEN_FILE" ] && die "token file not readable: $TOKEN_FILE"
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required for --docker ('docker compose version' failed).
+  On Debian/Ubuntu: apt install docker-compose-plugin — see https://docs.docker.com/compose/install/"
 
-  IMG="ghcr.io/nettact/nettact-agent:${VERSION:-latest}"
-  log "starting Agent container from $IMG"
+  # ---------- where the deployment lives ------------------------------------------
+  # A `docker run` install left nothing on disk: reproducing, inspecting or
+  # changing it meant reconstructing a fifteen-flag command line out of `docker
+  # inspect`. The deployment is written out as a compose project instead — one
+  # directory that IS the container's definition, plus the ordinary compose verbs
+  # to manage it. Fixed location, not the current directory, because it outlives
+  # the shell that created it.
+  if [ -z "$INSTALL_DIR" ]; then
+    [ -n "${HOME:-}" ] || die "HOME is not set — pass NETTACT_AGENT_INSTALL_DIR=<dir> to choose where to install"
+    INSTALL_DIR="$HOME/nettact-agent"
+  fi
+  mkdir -p "$INSTALL_DIR" || die "cannot create the install directory $INSTALL_DIR"
+  INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
+  # The enrollment token lives in here, so the DIRECTORY is what keeps it private:
+  # the token file itself must stay other-readable (see below).
+  chmod 700 "$INSTALL_DIR" 2>/dev/null || true
+
+  IMG_REPO="${NETTACT_AGENT_IMAGE:-ghcr.io/nettact/nettact-agent}"
+  IMG="$IMG_REPO:${VERSION:-latest}"
+
+  # compose <args…> — always run from the install directory, and never let the
+  # invoking shell's own NETTACT_AGENT_* variables win over the .env we just
+  # wrote. Compose resolves interpolation from the environment FIRST, so an
+  # exported NETTACT_AGENT_SERVER_URL (the very variable this script accepts as a
+  # default for --server-url) would otherwise silently deploy a different server
+  # than the one requested on the command line.
+  compose() {
+    ( cd "$INSTALL_DIR" \
+      && env -u NETTACT_AGENT_IMAGE -u NETTACT_AGENT_VERSION -u NETTACT_AGENT_SERVER_URL \
+        docker compose "$@" )
+  }
+
+  # write_compose <sysctls?> <updater?> — regenerate docker-compose.yml. Both
+  # switches are structural (they cannot be expressed as .env values), and both
+  # are decided at install time, which is exactly why this is generated rather
+  # than shipped: the host view and the container view are different containers,
+  # not one container with different settings.
+  write_compose() {
+    local want_sysctls="$1" want_updater="$2"
+    {
+      cat <<'YAML'
+# NetTact Agent — generated by install.sh. Re-running the installer regenerates
+# this file AND wipes the Agent's identity (it re-enrolls with a fresh token), so
+# treat edits here as the way to change the deployment: adjust, then
+#   docker compose up -d
+#
+# Knobs live in .env beside this file. The enrollment token is ./enroll.token,
+# mounted read-only; it is only read on first run, when there is no credential in
+# the data volume yet.
+services:
+  agent:
+    image: ${NETTACT_AGENT_IMAGE:-ghcr.io/nettact/nettact-agent}:${NETTACT_AGENT_VERSION:-latest}
+    container_name: nettact-agent
+    restart: unless-stopped
+    environment:
+      NETTACT_AGENT_SERVER_URL: ${NETTACT_AGENT_SERVER_URL}
+      NETTACT_AGENT_DATA_DIR: /agent-data
+      NETTACT_AGENT_ENROLL_TOKEN_FILE: /run/secrets/agent_enroll_token
+YAML
+      # Only emitted when a policy was actually chosen: the Agent rejects an
+      # empty NETTACT_AGENT_PERMISSIONS outright ("set but empty; use `none` or
+      # unset it"), so an unconditional line would break every default install.
+      if [ -n "$PERMISSIONS" ]; then
+        printf '      NETTACT_AGENT_PERMISSIONS: '; yaml_quote "$PERMISSIONS"; printf '\n'
+      fi
+      if ! $CONTAINER_VIEW; then
+        cat <<'YAML'
+      HOST_PROC: /host/proc
+      HOST_SYS: /host/sys
+      HOST_ETC: /host/etc
+YAML
+      fi
+      cat <<'YAML'
+    volumes:
+      - nettact-agent-data:/agent-data
+      - ./enroll.token:/run/secrets/agent_enroll_token:ro
+YAML
+      if ! $CONTAINER_VIEW; then
+        printf '      - /proc:/host/proc:ro\n      - /sys:/host/sys:ro\n'
+        # Two individual files, not the whole /etc: os-release is what identifies
+        # the monitored machine (without it the Agent registers the CONTAINER
+        # IMAGE's distribution — "alpine" for an Ubuntu host), and resolv.conf is
+        # the resolver list it reports. Bind-mounting all of /etc would hand the
+        # container the host's shadow file and keys for two values.
+        for f in os-release resolv.conf; do
+          [ -r "/etc/$f" ] && printf '      - /etc/%s:/host/etc/%s:ro\n' "$f" "$f"
+        done
+        cat <<'YAML'
+    network_mode: host
+    pid: host
+    user: "0:0"
+    cap_add:
+      - NET_RAW
+YAML
+      elif [ "$want_sysctls" = true ]; then
+        cat <<'YAML'
+    sysctls:
+      # Opens the unprivileged ping socket for this container's own network
+      # namespace. The kernel starts every namespace with "1 0" — an empty range,
+      # no gid may ping — and dockerd does not change it, so without this line the
+      # non-root Agent reports ICMP probing and gateway probing as unsupported.
+      # It grants nothing on the host, and nothing beyond ICMP echo in here.
+      net.ipv4.ping_group_range: "0 2147483647"
+YAML
+      fi
+      if [ "$want_updater" = true ]; then
+        cat <<'YAML'
+
+  # --auto-update: watches the Agent image and restarts the container when a new
+  # one is published. It holds the Docker socket, which is root-equivalent on this
+  # host — remove this service to opt back out.
+  updater:
+    image: containrrr/watchtower:latest
+    container_name: nettact-agent-updater
+    restart: unless-stopped
+    command: --cleanup --interval 86400 nettact-agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+YAML
+      fi
+      cat <<'YAML'
+
+volumes:
+  # Holds agent.key, agent.json and the WAL outbox. Named explicitly so it does
+  # not carry the compose project prefix: the identity survives the directory
+  # being renamed, and `docker volume rm nettact-agent-data` means the same thing
+  # in every set of instructions.
+  nettact-agent-data:
+    name: nettact-agent-data
+YAML
+    } > "$INSTALL_DIR/docker-compose.yml"
+  }
+
+  log "deploying the Agent into $INSTALL_DIR"
   # Tear the previous installation down updater-FIRST: a leftover Watchtower
   # could restart the new container mid-enrollment (burning the one-time token
   # after the server marked it used but before the credential was saved), and
   # would survive a failed install holding the Docker socket. It is re-created
   # below only when --auto-update is on THIS command line and the install
-  # verified.
+  # verified. Removal is by name so it also catches containers from an older
+  # installer that started them with plain `docker run`.
   docker rm -f nettact-agent-updater >/dev/null 2>&1 || true
   docker rm -f nettact-agent >/dev/null 2>&1 || true
   # A full install replaces the previous one: the identity volume is removed so
@@ -143,18 +305,24 @@ if $DOCKER_MODE; then
   docker volume rm nettact-agent-data >/dev/null 2>&1 || true
   ! docker volume inspect nettact-agent-data >/dev/null 2>&1 || \
     die "could not remove the previous identity volume nettact-agent-data (still in use by another container?); remove it and re-run this command"
-  RUN_ARGS=(-d --name nettact-agent --restart unless-stopped
-    -e "NETTACT_AGENT_SERVER_URL=$SERVER_URL"
-    -e NETTACT_AGENT_DATA_DIR=/agent-data
-    -v nettact-agent-data:/agent-data)
+
+  # The token as a FILE for both --token and --token-file. Not an environment
+  # variable: compose would then need the value at every `up`, and a variable
+  # that resolves to empty is a hard startup error in the Agent rather than a
+  # no-op, so a later `docker compose up -d` typed by hand would break the
+  # deployment. A stale token here is harmless — it is consulted only when the
+  # data volume holds no credential.
+  #
+  # MODE 0644, not 0600: the container reads it through a bind mount, and in the
+  # container view that process is uid 100, which cannot open a file owned by
+  # whoever ran this installer. Confidentiality comes from the 0700 directory
+  # above, which the bind mount does not have to traverse.
   if [ -n "$TOKEN_FILE" ]; then
-    ABS_TOKEN_FILE="$(cd "$(dirname "$TOKEN_FILE")" && pwd)/$(basename "$TOKEN_FILE")"
-    RUN_ARGS+=(-v "$ABS_TOKEN_FILE:/run/secrets/agent_enroll_token:ro"
-      -e NETTACT_AGENT_ENROLL_TOKEN_FILE=/run/secrets/agent_enroll_token)
-  elif [ -n "$TOKEN" ]; then
-    RUN_ARGS+=(-e "NETTACT_AGENT_ENROLL_TOKEN=$TOKEN")
+    cp "$TOKEN_FILE" "$INSTALL_DIR/enroll.token" || die "cannot copy the token file into $INSTALL_DIR"
+  else
+    printf '%s' "$TOKEN" > "$INSTALL_DIR/enroll.token"
   fi
-  [ -n "$PERMISSIONS" ] && RUN_ARGS+=(-e "NETTACT_AGENT_PERMISSIONS=$PERMISSIONS")
+  chmod 644 "$INSTALL_DIR/enroll.token"
 
   # Host view (the default): share the host's network and PID namespaces and
   # expose its /proc and /sys, so the Agent reports the MACHINE rather than the
@@ -162,23 +330,17 @@ if $DOCKER_MODE; then
   # collector and the Agent's own route/resolver reads to the same mounts, so a
   # host CPU figure can never sit next to a container's default gateway.
   #
-  # --user 0:0 plus NET_RAW is what buys PATH DIAGNOSTICS specifically. ICMP
-  # probing and gateway probing do not need it: they run over an unprivileged
-  # ping socket wherever net.ipv4.ping_group_range allows, which is the Docker
-  # default — measured working in a plain non-root container. Traceroute is
-  # different because it must RECEIVE intermediate Time-Exceeded replies, and
-  # only a raw socket delivers those. The image carries no file capability on
-  # purpose (see ci/Dockerfile), so a non-root process has an empty permitted set
-  # no matter what is in the bounding set, which is why this is root rather than
-  # --cap-add alone. Root is a small addition to a container that already shares
-  # the host's network and PID namespaces; --container-view keeps the hardened
-  # non-root default and still gets ICMP probing.
+  # user 0:0 plus NET_RAW is what buys PATH DIAGNOSTICS specifically, because
+  # traceroute must RECEIVE the intermediate Time-Exceeded replies and only a raw
+  # socket delivers those. The image carries no file capability on purpose (see
+  # ci/Dockerfile), so a non-root process has an empty permitted set no matter
+  # what is in the bounding set, which is why this is root rather than cap_add
+  # alone. Root is a small addition to a container that already shares the host's
+  # network and PID namespaces.
   #
-  # Two individual files, not the whole /etc: os-release is what identifies the
-  # monitored machine (without it the Agent registers the CONTAINER IMAGE's
-  # distribution — "alpine" for an Ubuntu host), and resolv.conf is the resolver
-  # list it reports. Bind-mounting all of /etc would hand the container the host's
-  # shadow file and keys for two values.
+  # ICMP probing and gateway probing need less — an unprivileged ping socket —
+  # so the container view keeps the hardened non-root user and still gets both,
+  # via the sysctl written into the compose file.
   #
   # "Host" means the Docker DAEMON's host. On Docker Desktop that is the Linux
   # VM, not Windows or macOS — there is no way for a Linux container to observe
@@ -195,36 +357,56 @@ if $DOCKER_MODE; then
   fi
   if $CONTAINER_VIEW; then
     log "container view: this Agent reports the container's own network and processes"
-    # The host view below runs the container as root, which can read any token
-    # file; container view keeps the image's non-root user. A bind-mounted file
-    # arrives with the HOST's owner and mode, so a secret written 0600 by root is
-    # unreadable there and the Agent would fail enrollment 30 seconds from now
-    # with nothing but "permission denied" in a log the operator has to go find.
-    # Ask the image itself rather than guessing its uid.
-    if [ -n "${ABS_TOKEN_FILE:-}" ] && ! docker run --rm --entrypoint cat \
-        -v "$ABS_TOKEN_FILE:/run/secrets/agent_enroll_token:ro" "$IMG" \
-        /run/secrets/agent_enroll_token >/dev/null 2>&1; then
-      die "the Agent runs as a non-root user in container view and cannot read $ABS_TOKEN_FILE.
-  Make the FILE readable and keep its DIRECTORY private:
-    chmod 644 $ABS_TOKEN_FILE && chmod 700 $(dirname "$ABS_TOKEN_FILE")
-  or pass the token inline with --token instead of --token-file."
-    fi
+    log "  (ICMP and gateway probing via an unprivileged ping socket; no path diagnostics)"
   else
     log "host view: this Agent reports the Docker daemon host's network, processes and metrics"
     log "  (disk metrics still describe the container's filesystem — see the permissions docs)"
-    RUN_ARGS+=(--network host --pid host --cap-add NET_RAW --user 0:0
-      -v /proc:/host/proc:ro -v /sys:/host/sys:ro
-      -e HOST_PROC=/host/proc -e HOST_SYS=/host/sys -e HOST_ETC=/host/etc)
-    for f in os-release resolv.conf; do
-      [ -r "/etc/$f" ] && RUN_ARGS+=(-v "/etc/$f:/host/etc/$f:ro")
-    done
   fi
-  docker run "${RUN_ARGS[@]}" "$IMG" >/dev/null
+
+  # .env carries the values an operator would plausibly change; everything
+  # structural is in the compose file. Written fresh on every full install, like
+  # the compose file beside it.
+  {
+    printf '# NetTact Agent deployment — generated by install.sh.\n'
+    printf '# Change a value and re-apply with: docker compose up -d\n'
+    printf 'NETTACT_AGENT_IMAGE=%s\n' "$IMG_REPO"
+    printf 'NETTACT_AGENT_VERSION=%s\n' "${VERSION:-latest}"
+    printf 'NETTACT_AGENT_SERVER_URL=%s\n' "$SERVER_URL"
+  } > "$INSTALL_DIR/.env"
+  chmod 600 "$INSTALL_DIR/.env"
+
+  # An explicit pull, so re-running the installer on a :latest deployment
+  # actually upgrades: `compose up` only pulls a tag it does not already have
+  # locally, which would leave a months-old "latest" running and call it a
+  # successful reinstall.
+  log "pulling $IMG"
+  docker pull "$IMG" || die "cannot pull $IMG (check the tag and network access to the registry)"
+
+  # The ping-socket sysctl is best effort. A runtime that refuses namespaced
+  # net.* sysctls (gVisor, some managed or rootless daemons) must not turn "ICMP
+  # would be nice" into "the Agent cannot be installed at all", so a rejected
+  # start is retried without it and the loss is stated rather than discovered
+  # later in the console.
+  write_compose "$CONTAINER_VIEW" false
+  if ! START_ERR="$(compose up -d --remove-orphans 2>&1)"; then
+    printf '%s\n' "$START_ERR" >&2
+    # Only a complaint ABOUT the sysctl earns the retry. Every other failure
+    # (bad tag, port clash, daemon error) fails identically the second time, and
+    # blaming the sysctl for it sends the reader after the wrong thing.
+    case "$START_ERR" in
+      *sysctl*|*ping_group_range*) ;;
+      *) die "could not start the Agent container (see the Docker error above)" ;;
+    esac
+    log "this Docker runtime refused net.ipv4.ping_group_range (see above); starting without it"
+    log "  the Agent will report ICMP probing and gateway probing as unsupported"
+    write_compose false false
+    compose up -d --remove-orphans
+  fi
 
   log "verifying server connectivity and enrolling"
   if ! wait_enrolled docker exec nettact-agent test -f /agent-data/agent.json; then
     docker logs --tail 30 nettact-agent >&2 || true
-    docker rm -f nettact-agent >/dev/null 2>&1 || true
+    compose down --remove-orphans >/dev/null 2>&1 || true
     die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). The container was removed; fix the problem, generate a fresh token in the console, and re-run this command."
   fi
   # Enrollment succeeded, but the restart policy would also mask an Agent that
@@ -237,14 +419,20 @@ if $DOCKER_MODE; then
   if [ "$(docker inspect -f '{{.State.Running}}' nettact-agent 2>/dev/null)" != true ] || \
      [ "$(docker inspect -f '{{.State.StartedAt}}' nettact-agent 2>/dev/null)" != "$STARTED_AT" ]; then
     docker logs --tail 30 nettact-agent >&2 || true
-    docker rm -f nettact-agent >/dev/null 2>&1 || true
+    compose down --remove-orphans >/dev/null 2>&1 || true
     die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). The container was removed; fix the problem, generate a fresh token in the console, and re-run this command."
   fi
   if $AUTO_UPDATE; then
+    # Added only now, for the same reason it was torn down first: an updater
+    # running during enrollment can restart the Agent mid-flight. Rewriting the
+    # file leaves the agent service byte-identical, so compose adds the updater
+    # without recreating the container that just enrolled.
     log "enabling daily automatic Agent image updates"
-    docker run -d --name nettact-agent-updater --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:latest --cleanup --interval 86400 nettact-agent >/dev/null
+    write_compose "$CONTAINER_VIEW" true
+    compose up -d --remove-orphans >/dev/null
   fi
-  log "SUCCESS: Agent enrolled and running (logs: docker logs -f nettact-agent)"
+  log "SUCCESS: Agent enrolled and running"
+  log "  deployment: $INSTALL_DIR   (cd there for: docker compose ps | logs -f | down)"
   exit 0
 fi
 
@@ -330,15 +518,6 @@ chmod 0700 "$CONFIG_DIR" "$DATA_DIR"
 printf '%s' "$TOKEN" > "$TOKEN_FILE"
 chmod 0600 "$TOKEN_FILE"
 
-# JSON quoted strings are valid YAML scalars and safely preserve URLs/paths.
-yaml_quote() {
-  printf '%s' "$1" | awk 'BEGIN { ORS=""; print "\"" } {
-    if (NR > 1) print "\\n"
-    gsub(/\\/, "\\\\")
-    gsub(/"/, "\\\"")
-    printf "%s", $0
-  } END { print "\"" }'
-}
 # Emit the permission policy as a YAML block list, or the literal `none` scalar
 # for an empty grant. Omitting the key entirely (no --permissions) leaves the
 # Agent on its built-in default set — writing an empty list would instead mean
