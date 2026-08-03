@@ -90,10 +90,15 @@ type memBatch struct {
 // page, so per-Append transactions cost ~18 KB for ~500 bytes of telemetry, and
 // the fix is fewer transactions rather than cheaper ones.
 //
-// The cost is bounded and deliberate: a crash loses whatever is still in memory,
-// at most one upload interval's worth while connected. Durability when it
-// actually matters — the server being unreachable — is unchanged, because that
-// is exactly the case that spills.
+// The cost is bounded and deliberate: a crash loses whatever is still in
+// memory. While connected that is at most one upload interval's worth. While
+// disconnected it is BOUNDED, not zero as it used to be: the session's end
+// flushes the buffer immediately (conn.run), and after that each unspilled
+// stretch is capped by memBufferAge — the age check rides on Append, which the
+// 30s status heartbeat guarantees keeps arriving. A crash mid-outage can
+// therefore lose up to memBufferAge of samples that the old per-Append store
+// would have kept; that window is the price of the healthy path writing
+// nothing, and callers needing a hard point can Flush.
 //
 // Delivery order is FIFO across both tiers, which the fault detectors depend on:
 // NextBatch serves the disk backlog before any memory group, and a spill appends
@@ -173,12 +178,18 @@ func (s *Store) Close() error {
 }
 
 // Flush spills everything buffered in memory to durable storage. Callers that
-// want a hard durability point (shutdown, suspend) can use it; ordinary
+// want a hard durability point (a session ending, suspend) can use it; ordinary
 // operation relies on Close.
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.spillLocked(time.Now().UTC())
+	dropped, err := s.spillLocked(time.Now().UTC())
+	if dropped > 0 {
+		// Same reason Close logs it: the signature returns only an error, so a
+		// caller cannot see this, and a spill into a backlog already at capacity
+		// sheds whole groups. An unreported eviction is an invisible data gap.
+		log.Printf("WAL over capacity while flushing: dropped %d oldest samples (data gap)", dropped)
+	}
 	return err
 }
 

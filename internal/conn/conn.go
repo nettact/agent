@@ -237,6 +237,14 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 	for {
 		start := time.Now()
 		err := r.session(ctx)
+		// The session is gone, so nothing is draining the outbox's memory tier
+		// any more: spill it now rather than waiting out its age trigger, so the
+		// moment the link drops the crash-loss window closes to zero instead of
+		// staying open for up to memBufferAge. Same goroutine as every other WAL
+		// access; on shutdown Close flushes again, which is an idempotent no-op.
+		if ferr := r.deps.Outbox.Flush(); ferr != nil {
+			log.Printf("flush outbox after session end: %v", ferr)
+		}
 		if ctx.Err() != nil {
 			return nil // shutdown: the session already sent the close frame
 		}
