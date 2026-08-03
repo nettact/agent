@@ -19,6 +19,7 @@ import (
 
 	"github.com/nettact/agent/agentrt"
 	"github.com/nettact/agent/probepolicy"
+	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 )
 
@@ -68,8 +69,9 @@ func Load(lookup Lookup) (agentrt.Config, error) {
 		}
 	}
 
-	// UPLOAD_INTERVAL (duration, default 5s).
-	cfg.UploadInterval = 5 * time.Second
+	// UPLOAD_INTERVAL (duration, default 30s — the protocol constant, so the
+	// server's StaleAfter fallback and the agent's real cadence stay one value).
+	cfg.UploadInterval = pcfg.DefaultUploadInterval
 	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_UPLOAD_INTERVAL", &errs); ok {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {

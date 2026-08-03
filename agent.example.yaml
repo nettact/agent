@@ -30,8 +30,11 @@ server_url: http://host:12450
 # Skip TLS verification — LAN self-signed servers only. Default false.
 #tls_insecure: false
 
-# WAL drain cadence — how often buffered telemetry is uploaded. Default 5s.
-#upload_interval: 5s
+# WAL drain cadence — how often buffered telemetry is uploaded. Default 30s.
+# Lower values make dashboards fresher at the cost of ~linearly more server
+# disk writes (each upload is one server-side transaction); game telemetry
+# drains on its own faster schedule regardless.
+#upload_interval: 30s
 
 # Telemetry wire format: protobuf (default) or json.
 #wire_format: protobuf

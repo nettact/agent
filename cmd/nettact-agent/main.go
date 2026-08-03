@@ -41,7 +41,7 @@ Settings (environment variable — YAML key):
   NETTACT_AGENT_ENROLL_TOKEN        one-time enrollment token (first run only)           — enroll_token
   NETTACT_AGENT_ENROLL_TOKEN_FILE   path to the enrollment token (preferred; exclusive)  — enroll_token_file
   NETTACT_AGENT_TLS_INSECURE        skip TLS verification (default false)                — tls_insecure
-  NETTACT_AGENT_UPLOAD_INTERVAL     WAL drain cadence (default 5s)                       — upload_interval
+  NETTACT_AGENT_UPLOAD_INTERVAL     WAL drain cadence (default 30s)                      — upload_interval
   NETTACT_AGENT_WIRE_FORMAT         protobuf (default) | json                            — wire_format
   NETTACT_AGENT_PERMISSIONS         complete replacement permission list, or 'none'      — permissions (list or "none")
   NETTACT_AGENT_PROBE_ACCESS_MODE   allowlist | denylist                                 — probe_access.mode

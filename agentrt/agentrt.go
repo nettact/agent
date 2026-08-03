@@ -182,7 +182,7 @@ type Config struct {
 	ServerURL      string        // e.g. http://127.0.0.1:52344; required unless both Dialer and Enroller are set
 	DataDir        string        // holds agent.key, agent.json, wal.db
 	Insecure       bool          // skip TLS verification (LAN self-signed)
-	UploadInterval time.Duration // WAL drain cadence; 0 → 5s
+	UploadInterval time.Duration // WAL drain cadence; 0 → pcfg.DefaultUploadInterval (30s)
 	WireFormat     string        // "protobuf" (default when empty) or "json"
 
 	// Policy is the agent's immutable local permission grant (spec §3). The
@@ -238,7 +238,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return errors.New("agentrt: ServerURL is required unless both Dialer and Enroller are set")
 	}
 	if cfg.UploadInterval == 0 {
-		cfg.UploadInterval = 5 * time.Second
+		cfg.UploadInterval = pcfg.DefaultUploadInterval
 	}
 	if cfg.Policy.Granted == nil {
 		return errors.New("agentrt: Config.Policy must be set (permission grant)")
