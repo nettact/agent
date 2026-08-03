@@ -30,10 +30,13 @@ import (
 const PlatformSupported = true
 
 // probeTimeout caps the capability probe. The probe opens and closes a trace
-// session and exits; anything slower is a sensor that is not going to answer,
-// and the agent must not stall startup waiting for it. A var so tests need not
-// wait it out.
-var probeTimeout = 5 * time.Second
+// session and exits — but a Store-edition sensor first asks the Windows
+// licensing service for the app's license, which is sub-second off the local
+// cache yet can take double-digit seconds when the service cold-starts. This is
+// a ceiling, not a wait: an ordinary probe still answers immediately, and only
+// a sensor that is not going to answer costs the full timeout. A var so tests
+// need not wait it out.
+var probeTimeout = 30 * time.Second
 
 // stopGrace is how long a sensor gets to exit after its stdin closes before it
 // is killed. The contract asks for two seconds; this leaves a margin.
