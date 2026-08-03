@@ -10,7 +10,7 @@ import (
 )
 
 func TestNextBatchKeepsCollectorResultWhole(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "wal.db"))
+	s, err := Open(filepath.Join(tempWALDir(t), "wal.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestNextBatchKeepsCollectorResultWhole(t *testing.T) {
 }
 
 func TestFastForwardPreservesInflightAndAdvancesNewBatches(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "wal.db"))
+	s, err := Open(filepath.Join(tempWALDir(t), "wal.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
