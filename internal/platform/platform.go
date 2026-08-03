@@ -8,7 +8,7 @@ package platform
 import (
 	"context"
 	"errors"
-	"net"
+	"math"
 	"time"
 
 	"github.com/nettact/protocol/permission"
@@ -31,6 +31,31 @@ type IfaceInfo struct {
 	// snapshot assembly). True even when the adapter's Wi-Fi status is unreadable,
 	// so wireless hardware never masquerades as a wired interface.
 	IsWireless bool
+	// IPv4Default is this interface's preferred IPv4 default route, or nil when it
+	// has none (or the platform cannot read routes). Read it instead of picking an
+	// address out of Gateways: the two are not interchangeable.
+	IPv4Default *IPv4Default
+}
+
+// IPv4Default is one interface's preferred IPv4 default route: the gateway the
+// host would send off-link traffic to out this NIC, paired with the cost the OS
+// assigns THAT route.
+//
+// The pairing is the point. An interface can carry several default routes — a
+// primary and a low-priority backup, or a gatewayless point-to-point default
+// beside a gatewayed one — so a cheapest-metric taken from one route and a
+// gateway address taken from another describe a path the host never uses. Both
+// fields must come from the same routing table entry.
+type IPv4Default struct {
+	// Gateway is the route's next hop, never the unspecified address: an on-link
+	// default (0.0.0.0 / `default dev tun0`) has no gateway to name or ping.
+	Gateway string
+	// Metric is the route's effective cost, lower winning. Windows ranks by the
+	// route metric plus the interface metric, so that sum is what this carries;
+	// Linux uses the route's RTA_PRIORITY. Nil when the platform reports a default
+	// route but no cost for it — never a synthetic zero, which on Linux is a real
+	// and best-possible metric.
+	Metric *int
 }
 
 // WiFiResult is the collection-level outcome of one WiFi() call: the Wi-Fi
@@ -136,31 +161,48 @@ var ErrRoutesUnreadable = errors.New("platform: routing table unreadable")
 // New returns the platform implementation for the current OS.
 func New() Platform { return newPlatform() }
 
-// ResolveIPv4Gateway returns the first IPv4 gateway on the chosen interface, plus
-// that interface's name. When iface is empty it falls back to the default: the
-// first IPv4 gateway on any up, non-loopback interface. When iface is set but not
-// found (or has no IPv4 gateway) it returns "", so the caller reports the gateway
-// as unreachable rather than silently naming a different NIC's gateway.
+// ResolveIPv4Gateway returns the IPv4 gateway of the chosen interface, plus that
+// interface's name. When iface is empty it resolves default egress: among the up,
+// non-loopback interfaces holding an IPv4 default route, the one the OS prefers —
+// the lowest IPv4Default.Metric, ties and unreported metrics broken by
+// enumeration order. When iface is set but not found (or has no IPv4 default
+// route) it returns "", so the caller reports the gateway as unreachable rather
+// than silently naming a different NIC's gateway.
+//
+// The metric is what makes this the OS's answer rather than a guess. A host with
+// two wired NICs — say 192.168.66.1 at metric 10 and 172.16.66.1 at metric 20 —
+// sends its traffic out the first, but enumeration order is not metric order, so
+// picking "the first interface with a gateway" named the wrong NIC's gateway
+// whenever the OS happened to list the costlier one first.
 //
 // This is the ONE default-egress resolver in the agent. The gateway probe, the
 // interface snapshot, and the incident-scene target resolution all call it, which
 // is what guarantees that the gateway IP the console shows for an incident is the
 // same one the monitor actually pinged.
 func ResolveIPv4Gateway(ifaces []IfaceInfo, iface string) (gateway, interfaceName string) {
-	for _, ifc := range ifaces {
-		if ifc.IsLoopback || !ifc.Up {
+	best := -1
+	bestMetric := 0
+	for i, ifc := range ifaces {
+		if ifc.IsLoopback || !ifc.Up || ifc.IPv4Default == nil {
 			continue
 		}
 		if iface != "" && ifc.ID != iface && ifc.Name != iface {
 			continue
 		}
-		for _, gw := range ifc.Gateways {
-			if ip := net.ParseIP(gw); ip != nil && ip.To4() != nil {
-				return gw, ifc.Name
-			}
+		// An unreported metric sorts after every reported one: a platform that
+		// cannot rank its routes must not outrank one that can.
+		metric := math.MaxInt
+		if ifc.IPv4Default.Metric != nil {
+			metric = *ifc.IPv4Default.Metric
+		}
+		if best < 0 || metric < bestMetric {
+			best, bestMetric = i, metric
 		}
 	}
-	return "", ""
+	if best < 0 {
+		return "", ""
+	}
+	return ifaces[best].IPv4Default.Gateway, ifaces[best].Name
 }
 
 // appendUnique appends v unless list already holds it, preserving order. The OS

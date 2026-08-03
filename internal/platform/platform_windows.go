@@ -5,6 +5,7 @@ package platform
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"runtime"
 	"strconv"
@@ -83,6 +84,50 @@ func isHiddenVirtualWirelessAdapter(desc string) bool {
 	return false
 }
 
+// ipv4Route is one interface's cheapest IPv4 default route as the forwarding
+// table reports it, before the adapter's interface metric is added.
+type ipv4Route struct {
+	gateway string
+	metric  int
+}
+
+// ipv4DefaultRoutes reads the IPv4 forwarding table and returns each interface's
+// cheapest default route, keyed by interface index.
+//
+// The routing table is the only place the pairing exists. GetAdaptersAddresses
+// reports an adapter's gateway addresses and its interface metric, but nothing
+// tying one to the other, and Windows ranks a route by its own metric PLUS the
+// interface metric — so an adapter with the lower interface metric can still lose
+// to one carrying a cheaper route, and a NIC with a manually added backup default
+// has two gateways whose costs differ while the adapter reports one number for
+// both.
+func ipv4DefaultRoutes() (map[uint32]ipv4Route, error) {
+	var table *windows.MibIpForwardTable2
+	if err := windows.GetIpForwardTable2(windows.AF_INET, &table); err != nil {
+		return nil, err
+	}
+	defer windows.FreeMibTable(unsafe.Pointer(table))
+
+	out := map[uint32]ipv4Route{}
+	for _, row := range table.Rows() {
+		if row.DestinationPrefix.PrefixLength != 0 || row.NextHop.Family != windows.AF_INET {
+			continue
+		}
+		ip := net.IP((*windows.RawSockaddrInet4)(unsafe.Pointer(&row.NextHop)).Addr[:])
+		// An on-link default (next hop 0.0.0.0, e.g. a point-to-point WAN link)
+		// still routes, but it names no gateway to report or ping.
+		if ip.IsUnspecified() {
+			continue
+		}
+		metric := int(row.Metric)
+		if prev, ok := out[row.InterfaceIndex]; ok && prev.metric <= metric {
+			continue
+		}
+		out[row.InterfaceIndex] = ipv4Route{gateway: ip.String(), metric: metric}
+	}
+	return out, nil
+}
+
 func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 	// Field-level no-read: tell the OS to omit the denied structures entirely
 	// rather than fetching them and skipping the iteration. A denied address or
@@ -96,6 +141,19 @@ func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 	}
 	if q.Gateways {
 		flags |= gaaFlagIncludeGateways
+	}
+
+	// An unreadable forwarding table is partial, not fatal: the adapter walk below
+	// still fills in every interface's status, addresses and gateway addresses, and
+	// only the default-route ranking is unknown. Saying so (rather than reporting
+	// no default route) keeps "this host has no gateway" distinct from "the agent
+	// could not look" — see ErrRoutesUnreadable.
+	var routes map[uint32]ipv4Route
+	var routesErr error
+	if q.Gateways {
+		if routes, routesErr = ipv4DefaultRoutes(); routesErr != nil {
+			routesErr = fmt.Errorf("%w: %v", ErrRoutesUnreadable, routesErr)
+		}
 	}
 
 	size := uint32(15000)
@@ -146,6 +204,12 @@ func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 					info.Gateways = append(info.Gateways, ip.String())
 				}
 			}
+			if route, ok := routes[aa.IfIndex]; ok {
+				// Windows ranks a route by its own metric plus the metric of the
+				// interface it leaves by, so the sum is the comparable cost.
+				metric := route.metric + int(aa.Ipv4Metric)
+				info.IPv4Default = &IPv4Default{Gateway: route.gateway, Metric: &metric}
+			}
 		}
 		if q.DNS {
 			for da := aa.FirstDnsServerAddress; da != nil; da = da.Next {
@@ -157,7 +221,7 @@ func (winPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 		out = append(out, info)
 	}
 	runtime.KeepAlive(buf)
-	return out, nil
+	return out, routesErr
 }
 
 // iphlpapi ICMP echo + ARP table APIs (loaded lazily; no admin required).

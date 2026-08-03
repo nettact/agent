@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"time"
 
@@ -64,7 +65,14 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 			break
 		}
 		now := time.Now().UTC()
-		gw := c.gatewayFor(t.Params.Interface)
+		gw, known := c.gatewayFor(t.Params.Interface)
+		if !known {
+			// The agent could not read the routes, so whether this host has a gateway
+			// is UNKNOWN. Skipping leaves an honest gap in the series; the branch
+			// below would instead publish 100% loss and a LAN-outage event for a
+			// restriction on the agent itself.
+			continue
+		}
 		if gw == "" {
 			// No gateway found on the selected/default NIC: report LAN-layer down.
 			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN,
@@ -110,8 +118,12 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 // osGateways returns every gateway address the OS currently reports across all
 // interfaces, so CheckGateway can confirm the target is a real gateway.
 func (c *GatewayPingCollector) osGateways() []netip.Addr {
+	// An unreadable routing table still leaves each adapter's gateway addresses
+	// populated on platforms that read them separately, and the guard only needs
+	// to recognize the address. Returning nothing there would have it reject a
+	// gateway the OS does report.
 	ifaces, err := c.p.Interfaces(platform.IfaceQuery{Gateways: true})
-	if err != nil {
+	if err != nil && !errors.Is(err, platform.ErrRoutesUnreadable) {
 		return nil
 	}
 	var out []netip.Addr
@@ -138,18 +150,23 @@ func gatewayLabels(ip, iface string) map[string]string {
 	return labels
 }
 
-// gatewayFor returns the first IPv4 gateway on the chosen interface. When iface
-// is empty it falls back to the default: the first IPv4 gateway on any up,
-// non-loopback interface. When iface is set but not found (or has no IPv4
-// gateway), it returns "" so the caller reports the gateway as unreachable
-// rather than silently probing a different NIC's gateway.
-func (c *GatewayPingCollector) gatewayFor(iface string) string {
+// gatewayFor returns the IPv4 gateway of the chosen interface. When iface is
+// empty it resolves default egress. When iface is set but not found (or has no
+// IPv4 default route) it returns "", so the caller reports the gateway as
+// unreachable rather than silently probing a different NIC's gateway.
+//
+// The bool reports whether the OS answered at all. A failed interface
+// enumeration or an unreadable routing table (ErrRoutesUnreadable — a seccomp
+// policy, a locked-down container) leaves the question UNKNOWN, and unknown is
+// not absent: collapsing the two into an empty gateway made the collector report
+// a restriction on the agent as a dead LAN.
+func (c *GatewayPingCollector) gatewayFor(iface string) (string, bool) {
 	ifaces, err := c.p.Interfaces(platform.IfaceQuery{Gateways: true})
 	if err != nil {
-		return ""
+		return "", false
 	}
 	gateway, _ := platform.ResolveIPv4Gateway(ifaces, iface)
-	return gateway
+	return gateway, true
 }
 
 // SetMinInterval applies the local per-target probe-interval floor (stability limit).

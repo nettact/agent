@@ -132,9 +132,34 @@ const (
 // (`default dev tun0`) has no gateway address to report but is still the
 // interface the host's traffic leaves by, which is where the system resolver
 // list belongs. Collapsing them would drop DNS entirely on such a host.
+//
+// best holds each interface's cheapest IPv4 default route THAT HAS A GATEWAY —
+// its next hop and cost together, from the same table entry. It is what orders
+// two interfaces that both reach the world; without it the winner would be
+// whichever the dump listed first, which is not the route the kernel uses.
+//
+// Gateway and metric have to travel together. An interface can carry a primary
+// default and a low-priority backup to a different next hop, and a gatewayless
+// default (`default dev tun0`) can be the cheapest route on an interface that
+// also has a gatewayed one — take the cost from one entry and the address from
+// another and the result describes a path the kernel never takes.
 type defaultRoutes struct {
 	gateways map[int][]string
 	ifaces   map[int]bool
+	best     map[int]IPv4Default
+}
+
+// noteBest keeps the cheapest gatewayed IPv4 default route per interface. Ties
+// go to the entry the dump listed first, matching the kernel's own tie-break.
+func (r defaultRoutes) noteBest(ifindex int, family uint8, gateway string, metric int) {
+	if family != unix.AF_INET || gateway == "" {
+		return
+	}
+	if prev, ok := r.best[ifindex]; ok && *prev.Metric <= metric {
+		return
+	}
+	cost := metric
+	r.best[ifindex] = IPv4Default{Gateway: gateway, Metric: &cost}
 }
 
 // parseDefaultRoutes extracts the default routes (destination prefix length 0)
@@ -144,7 +169,7 @@ type defaultRoutes struct {
 // container runtimes also carry default routes, and reporting those as "the"
 // gateway of an interface would be actively misleading.
 func parseDefaultRoutes(msgs []syscall.NetlinkMessage) defaultRoutes {
-	out := defaultRoutes{gateways: map[int][]string{}, ifaces: map[int]bool{}}
+	out := defaultRoutes{gateways: map[int][]string{}, ifaces: map[int]bool{}, best: map[int]IPv4Default{}}
 	for _, m := range msgs {
 		if m.Header.Type != uint16(syscall.RTM_NEWROUTE) {
 			continue
@@ -160,6 +185,7 @@ func parseDefaultRoutes(msgs []syscall.NetlinkMessage) defaultRoutes {
 
 		var gw string
 		oif := 0
+		metric := 0 // RTA_PRIORITY is omitted for metric 0, the kernel's best
 		var hops []nexthop
 		for _, a := range netlinkAttrs(m.Data, sizeofRtMsgGo) {
 			switch a.Type {
@@ -170,6 +196,10 @@ func parseDefaultRoutes(msgs []syscall.NetlinkMessage) defaultRoutes {
 			case syscall.RTA_OIF:
 				if len(a.Value) >= 4 {
 					oif = int(binary.NativeEndian.Uint32(a.Value))
+				}
+			case syscall.RTA_PRIORITY:
+				if len(a.Value) >= 4 {
+					metric = int(binary.NativeEndian.Uint32(a.Value))
 				}
 			case syscall.RTA_TABLE:
 				// Table ids above 255 do not fit rtmsg.table and arrive here instead.
@@ -192,6 +222,7 @@ func parseDefaultRoutes(msgs []syscall.NetlinkMessage) defaultRoutes {
 				out.ifaces[nh.ifindex] = true
 				if nh.gateway != "" && gatewayMatchesFamily(family, nh.gateway) {
 					out.gateways[nh.ifindex] = appendUnique(out.gateways[nh.ifindex], nh.gateway)
+					out.noteBest(nh.ifindex, family, nh.gateway, metric) // the legs share the route's cost
 				}
 			}
 			continue
@@ -203,6 +234,7 @@ func parseDefaultRoutes(msgs []syscall.NetlinkMessage) defaultRoutes {
 		// Guard against a family/attribute mismatch producing a nonsense address.
 		if gw != "" && gatewayMatchesFamily(family, gw) {
 			out.gateways[oif] = appendUnique(out.gateways[oif], gw)
+			out.noteBest(oif, family, gw, metric)
 		}
 	}
 	return out

@@ -41,13 +41,23 @@ func gatewayDeps(ifaces []platform.IfaceInfo, err error) Deps {
 	}
 }
 
-// lanIfaces is a two-NIC host: an up Wi-Fi NIC and an up Ethernet NIC, each with
-// its own IPv4 gateway, plus a loopback that must never be chosen.
+// defaultVia is one interface's preferred IPv4 default route, as the OS's route
+// table would report it.
+func defaultVia(gateway string, metric int) *platform.IPv4Default {
+	return &platform.IPv4Default{Gateway: gateway, Metric: &metric}
+}
+
+// lanIfaces is a two-NIC host: an up Wi-Fi NIC owning default egress and an up
+// Ethernet NIC with its own costlier default route, plus a loopback that must
+// never be chosen.
 func lanIfaces() []platform.IfaceInfo {
 	return []platform.IfaceInfo{
-		{ID: "lo", Name: "Loopback", Up: true, IsLoopback: true, Gateways: []string{"127.0.0.1"}},
-		{ID: "wifi0", Name: "Wi-Fi", Up: true, IsWireless: true, Gateways: []string{"192.168.1.1"}},
-		{ID: "eth0", Name: "以太网", Up: true, Gateways: []string{"10.0.0.1"}},
+		{ID: "lo", Name: "Loopback", Up: true, IsLoopback: true, Gateways: []string{"127.0.0.1"},
+			IPv4Default: defaultVia("127.0.0.1", 1)},
+		{ID: "wifi0", Name: "Wi-Fi", Up: true, IsWireless: true, Gateways: []string{"192.168.1.1"},
+			IPv4Default: defaultVia("192.168.1.1", 10)},
+		{ID: "eth0", Name: "以太网", Up: true, Gateways: []string{"10.0.0.1"},
+			IPv4Default: defaultVia("10.0.0.1", 20)},
 	}
 }
 
@@ -110,8 +120,9 @@ func TestGatewayFailuresAreClassifiedDistinctly(t *testing.T) {
 	// An IPv6-only gateway is not an IPv4 default route: the probe would not use
 	// it, so the snapshot must not name it either.
 	v6Only := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: true, Gateways: []string{"fe80::1"}}}
-	// A down NIC's stale gateway must not be reported as the live default route.
-	downNIC := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: false, Gateways: []string{"10.0.0.1"}}}
+	// A down NIC's stale route must not be reported as the live default route.
+	downNIC := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: false,
+		Gateways: []string{"10.0.0.1"}, IPv4Default: defaultVia("10.0.0.1", 10)}}
 
 	for _, tc := range []struct {
 		name   string
@@ -213,9 +224,14 @@ func TestRoutesUnreadableKeepsNetworkGroupCollected(t *testing.T) {
 // target resolves through ResolveIPv4Gateway (up, non-loopback, IPv4).
 func TestDefaultRouteAgreesWithGatewayTarget(t *testing.T) {
 	ifaces := []platform.IfaceInfo{
-		{ID: "lo", Name: "Loopback", Up: true, IsLoopback: true, Gateways: []string{"127.0.0.1"}},
-		{ID: "eth1", Name: "Dock", Up: false, Gateways: []string{"10.9.9.1"}},                // unplugged, stale route
-		{ID: "wifi0", Name: "Wi-Fi", Up: true, Gateways: []string{"fe80::1", "192.168.1.1"}}, // IPv6 first
+		{ID: "lo", Name: "Loopback", Up: true, IsLoopback: true, Gateways: []string{"127.0.0.1"},
+			IPv4Default: defaultVia("127.0.0.1", 1)},
+		// Unplugged, and its stale route is the cheapest on the host: down beats
+		// cheap, so it must still lose.
+		{ID: "eth1", Name: "Dock", Up: false, Gateways: []string{"10.9.9.1"},
+			IPv4Default: defaultVia("10.9.9.1", 5)},
+		{ID: "wifi0", Name: "Wi-Fi", Up: true, Gateways: []string{"fe80::1", "192.168.1.1"}, // IPv6 first
+			IPv4Default: defaultVia("192.168.1.1", 50)},
 	}
 	deps := Deps{
 		Platform:  fakePlatform{ifaces: ifaces},

@@ -115,8 +115,13 @@ func (c *InterfaceCollector) Collect(ctx context.Context) (Result, error) {
 			st.Addrs = ifc.Addrs
 			st.DNS = ifc.DNS
 		}
-		if c.reportGateway {
-			st.Gateway = firstOr(ifc.Gateways)
+		if c.reportGateway && ifc.IPv4Default != nil {
+			// The next hop of this NIC's preferred IPv4 default route — the same fact
+			// the snapshot's DefaultRoute names, from the same routing table entry.
+			// Reporting "the first gateway the OS listed" instead put the IPv6 gateway
+			// of a dual-stack NIC in this field, and the console could no longer match
+			// the row against the IPv4 default route beside it.
+			st.Gateway = ifc.IPv4Default.Gateway
 		}
 
 		if a, ok := adapterByID[ifc.ID]; ok {
@@ -184,11 +189,4 @@ func wifiMetrics(now time.Time, iface string, a platform.WiFiStatus) []telemetry
 	}
 	// Unreadable: no wifi.up sample at all.
 	return out
-}
-
-func firstOr(s []string) string {
-	if len(s) > 0 {
-		return s[0]
-	}
-	return ""
 }

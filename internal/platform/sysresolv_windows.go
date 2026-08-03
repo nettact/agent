@@ -2,6 +2,8 @@
 
 package platform
 
+import "errors"
+
 // SystemResolvers returns the resolver addresses the host uses when a probe does
 // not pin one of its own, most-preferred first. Windows configures DNS per
 // adapter, so the list is assembled from the adapter table rather than one file.
@@ -12,8 +14,11 @@ package platform
 // yields no servers rather than an error — an unnameable resolver is reported as
 // unknown, never guessed.
 func SystemResolvers() []string {
+	// An unreadable routing table costs this nothing but the default-route
+	// ordering hint below: every adapter's DNS list is still populated, so a
+	// resolver stays nameable. Only a failed enumeration yields no servers.
 	ifaces, err := (winPlatform{}).Interfaces(IfaceQuery{DNS: true, Gateways: true})
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrRoutesUnreadable) {
 		return nil
 	}
 	return pickSystemResolvers(ifaces)

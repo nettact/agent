@@ -32,8 +32,10 @@ func TestInterfaceCollectorAuthoritativeWiFiSnapshot(t *testing.T) {
 	p := ifaceTestPlatform{
 		ifaces: []platform.IfaceInfo{
 			{ID: "lo", Name: "lo", IsLoopback: true, Up: true},
-			{ID: "eth", Name: "eth0", Up: true, Gateways: []string{"192.168.1.1"}},
-			{ID: "wifi-id", Name: "wlan0", Up: true, IsWireless: true, Addrs: []string{"192.168.1.2/24"}, Gateways: []string{"10.0.0.1"}},
+			{ID: "eth", Name: "eth0", Up: true, Gateways: []string{"192.168.1.1"},
+				IPv4Default: defaultVia("192.168.1.1", 10)},
+			{ID: "wifi-id", Name: "wlan0", Up: true, IsWireless: true, Addrs: []string{"192.168.1.2/24"},
+				Gateways: []string{"10.0.0.1"}, IPv4Default: defaultVia("10.0.0.1", 50)},
 		},
 		wifi: platform.WiFiResult{State: "ok", Adapters: []platform.WiFiStatus{{
 			ID: "wifi-id", Name: "wlan0", State: "connected", SSID: "home", Band: "5", Channel: 36,
@@ -77,6 +79,40 @@ func TestInterfaceCollectorAuthoritativeWiFiSnapshot(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing Wi-Fi metrics: %+v", want)
+	}
+}
+
+// Each row's gateway is the next hop of its own IPv4 default route, so the row
+// the snapshot's DefaultRoute names is the one that matches it. Reporting "the
+// first gateway address the OS listed" instead put a dual-stack NIC's IPv6
+// gateway in the field, leaving the disconnected Wi-Fi adapter — which keeps a
+// stale route to the IPv4 gateway its wired sibling owns — as the only row
+// matching the route. The console joined the path onto Wi-Fi and called it
+// failed on a host with no Wi-Fi in use.
+func TestInterfaceCollectorRowGatewayMatchesTheDefaultRoute(t *testing.T) {
+	p := ifaceTestPlatform{
+		ifaces: []platform.IfaceInfo{
+			{ID: "eth", Name: "eth0", Up: true,
+				Gateways:    []string{"fe80::747d:b8ff:fe57:998f", "192.168.66.1"},
+				IPv4Default: defaultVia("192.168.66.1", 10)},
+			// Unplugged, but Windows keeps its default route in the table.
+			{ID: "w", Name: "wlan0", IsWireless: true, Gateways: []string{"192.168.66.1"},
+				IPv4Default: defaultVia("192.168.66.1", 50)},
+		},
+		wifi: platform.WiFiResult{State: "ok", Adapters: []platform.WiFiStatus{{ID: "w", Name: "wlan0", State: "disconnected"}}},
+	}
+	res, err := NewInterfaceCollector(p, true, true, true, true).Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	route := res.InterfaceSnapshot.DefaultRoute
+	if route == nil || route.Gateway != "192.168.66.1" || route.Interface != "eth0" {
+		t.Fatalf("default route=%+v, want eth0 via 192.168.66.1", route)
+	}
+	for _, row := range res.InterfaceSnapshot.Interfaces {
+		if row.Name == "eth0" && row.Gateway != route.Gateway {
+			t.Fatalf("wired row gateway=%q, want the default route's %q", row.Gateway, route.Gateway)
+		}
 	}
 }
 

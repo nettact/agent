@@ -135,6 +135,48 @@ func TestParseDefaultRoutes(t *testing.T) {
 	}
 }
 
+// The metric orders two interfaces that both carry a default route, so it has to
+// survive the parse — RTA_PRIORITY when present, 0 (the kernel's best, and the
+// value it omits the attribute for) when not — and it must stay attached to the
+// gateway of the very route it came from. Metrics harvested across an
+// interface's routes describe a path the kernel never takes.
+func TestParseDefaultRoutesBest(t *testing.T) {
+	primary := net.ParseIP("192.168.1.1").To4()
+	backup := net.ParseIP("192.168.1.254").To4()
+	other := net.ParseIP("172.16.1.1").To4()
+	v6 := net.ParseIP("fe80::1").To16()
+
+	got := parseDefaultRoutes([]syscall.NetlinkMessage{
+		// A costly backup default listed BEFORE the cheap primary on the same NIC:
+		// the winner must be the primary's gateway at the primary's cost, not one
+		// route's address with the other's metric.
+		routeMsg(unix.AF_INET, 0, syscall.RT_TABLE_MAIN, syscall.RTN_UNICAST,
+			attr(syscall.RTA_GATEWAY, backup), attr(syscall.RTA_OIF, u32(2)), attr(syscall.RTA_PRIORITY, u32(100))),
+		routeMsg(unix.AF_INET, 0, syscall.RT_TABLE_MAIN, syscall.RTN_UNICAST,
+			attr(syscall.RTA_GATEWAY, primary), attr(syscall.RTA_OIF, u32(2)), attr(syscall.RTA_PRIORITY, u32(50))),
+		// A gatewayless default is the cheapest route on ifindex 3, but it has no
+		// address to lend to the gatewayed one beside it.
+		routeMsg(unix.AF_INET, 0, syscall.RT_TABLE_MAIN, syscall.RTN_UNICAST,
+			attr(syscall.RTA_OIF, u32(3)), attr(syscall.RTA_PRIORITY, u32(1))),
+		// No RTA_PRIORITY at all — metric 0.
+		routeMsg(unix.AF_INET, 0, syscall.RT_TABLE_MAIN, syscall.RTN_UNICAST,
+			attr(syscall.RTA_GATEWAY, other), attr(syscall.RTA_OIF, u32(3))),
+		// IPv6 only: it must not become ifindex 4's IPv4 default.
+		routeMsg(unix.AF_INET6, 0, syscall.RT_TABLE_MAIN, syscall.RTN_UNICAST,
+			attr(syscall.RTA_GATEWAY, v6), attr(syscall.RTA_OIF, u32(4)), attr(syscall.RTA_PRIORITY, u32(1))),
+	})
+
+	if b := got.best[2]; b.Gateway != "192.168.1.1" || b.Metric == nil || *b.Metric != 50 {
+		t.Fatalf("ifindex 2 best = %+v, want 192.168.1.1 at metric 50", b)
+	}
+	if b := got.best[3]; b.Gateway != "172.16.1.1" || b.Metric == nil || *b.Metric != 0 {
+		t.Fatalf("ifindex 3 best = %+v, want 172.16.1.1 at metric 0", b)
+	}
+	if _, ok := got.best[4]; ok {
+		t.Fatalf("an IPv6-only default gave the interface an IPv4 route: %+v", got.best)
+	}
+}
+
 // TestParseDefaultRoutesMultipath: an ECMP default carries its gateways inside
 // RTA_MULTIPATH nexthop records rather than as top-level RTA_GATEWAY/RTA_OIF. A
 // parser that reads only the top level reports such a host as having no gateway.

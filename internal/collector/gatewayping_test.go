@@ -2,6 +2,8 @@ package collector
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,14 +19,15 @@ import (
 // interface set and records ping calls. recv, when set, decides per-echo whether
 // the reply is received (echo index is 0-based); nil means every echo answers.
 type gwTestPlatform struct {
-	ifaces []platform.IfaceInfo
-	pinged string
-	pings  int
-	recv   func(seq int) bool
+	ifaces   []platform.IfaceInfo
+	ifaceErr error
+	pinged   string
+	pings    int
+	recv     func(seq int) bool
 }
 
 func (p *gwTestPlatform) Interfaces(platform.IfaceQuery) ([]platform.IfaceInfo, error) {
-	return p.ifaces, nil
+	return p.ifaces, p.ifaceErr
 }
 func (p *gwTestPlatform) Ping(_ context.Context, target string, _ platform.PingOptions) (platform.PingResult, error) {
 	seq := p.pings
@@ -39,11 +42,20 @@ func (p *gwTestPlatform) WiFi(includeSSID bool) platform.WiFiResult {
 }
 func (p *gwTestPlatform) Supports() permission.Set { return nil }
 
+// defaultVia is one interface's preferred IPv4 default route, as the OS's route
+// table would report it.
+func defaultVia(gateway string, metric int) *platform.IPv4Default {
+	return &platform.IPv4Default{Gateway: gateway, Metric: &metric}
+}
+
 func gwTestIfaces() []platform.IfaceInfo {
 	return []platform.IfaceInfo{
-		{ID: "lo", Name: "lo", IsLoopback: true, Up: true, Gateways: []string{"127.0.0.1"}},
-		{ID: "eth-id", Name: "eth0", Up: true, Gateways: []string{"192.168.1.1"}},
-		{ID: "wifi-id", Name: "wlan0", Up: true, IsWireless: true, Gateways: []string{"10.0.0.1"}},
+		{ID: "lo", Name: "lo", IsLoopback: true, Up: true, Gateways: []string{"127.0.0.1"},
+			IPv4Default: defaultVia("127.0.0.1", 1)},
+		{ID: "eth-id", Name: "eth0", Up: true, Gateways: []string{"192.168.1.1"},
+			IPv4Default: defaultVia("192.168.1.1", 10)},
+		{ID: "wifi-id", Name: "wlan0", Up: true, IsWireless: true, Gateways: []string{"10.0.0.1"},
+			IPv4Default: defaultVia("10.0.0.1", 50)},
 	}
 }
 
@@ -81,6 +93,54 @@ func TestGatewayCollectorNamedInterface(t *testing.T) {
 		if m.Layer != telemetry.LayerLAN {
 			t.Fatalf("metric layer=%q want LAN", m.Layer)
 		}
+	}
+}
+
+// An unreadable routing table means the agent could not look, not that the LAN
+// is dead. Reporting it as 100% loss plus a gateway-unreachable event blamed the
+// network for a restriction on the agent — and that fabricated outage replays
+// from the WAL long after the restriction is gone.
+func TestGatewayCollectorSkipsUnreadableRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"routes unreadable", fmt.Errorf("%w: seccomp", platform.ErrRoutesUnreadable)},
+		{"enumeration failed", errors.New("interface enumeration failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &gwTestPlatform{ifaces: gwTestIfaces(), ifaceErr: tc.err}
+			c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+			c.SetTargets([]pcfg.ProbeTarget{{MonitorID: "gw1", Kind: "gateway", Target: "gateway"}})
+			res, err := c.Collect(context.Background())
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if len(res.Metrics) != 0 || len(res.Events) != 0 {
+				t.Fatalf("unreadable routes fabricated telemetry: metrics=%+v events=%+v", res.Metrics, res.Events)
+			}
+			if p.pings != 0 {
+				t.Fatalf("pinged %d times with no known gateway", p.pings)
+			}
+		})
+	}
+}
+
+// A readable table that genuinely holds no default route IS a LAN-layer fault,
+// and must still be reported as one.
+func TestGatewayCollectorReportsGenuinelyMissingGateway(t *testing.T) {
+	p := &gwTestPlatform{ifaces: []platform.IfaceInfo{{ID: "eth-id", Name: "eth0", Up: true}}}
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c.SetTargets([]pcfg.ProbeTarget{{MonitorID: "gw1", Kind: "gateway", Target: "gateway"}})
+	res, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if got := lossPct(res); got != 100 {
+		t.Fatalf("loss=%v want 100 (no gateway on a readable table)", got)
+	}
+	if len(res.Events) != 1 || res.Events[0].Type != telemetry.EventGatewayUnreachable {
+		t.Fatalf("events=%+v want one gateway.unreachable", res.Events)
 	}
 }
 

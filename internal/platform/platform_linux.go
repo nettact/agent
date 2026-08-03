@@ -94,6 +94,9 @@ func (linuxPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 			if gws := routes.gateways[idx]; len(gws) > 0 {
 				out[i].Gateways = gws
 			}
+			if best, ok := routes.best[idx]; ok {
+				out[i].IPv4Default = &best
+			}
 		}
 		// Carrying a default route is the condition for DNS, not having a gateway
 		// ADDRESS: on a tunnel or point-to-point default there is no gateway to
