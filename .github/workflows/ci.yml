@@ -110,6 +110,13 @@ jobs:
       - name: Shell + arch-table checks
         run: sh openwrt/test-scripts.sh
 
+      # gettext is not on the runner image. msgfmt is worth installing rather
+      # than dropping: it is what checks that each translation's printf
+      # placeholders match its source string, and a mismatch there is a runtime
+      # error in the LuCI page that nothing else here would catch.
+      - name: Install gettext
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gettext
+
       - name: Syntax-check scripts and JSON
         run: |
           set -euo pipefail
@@ -128,7 +135,10 @@ jobs:
           do
             jq -e . "$f" >/dev/null || { echo "bad JSON: $f"; fail=1; }
           done
-          msgfmt --check-format -o /dev/null openwrt/luci-app-nettact/po/zh_Hans/nettact.po
+          for f in openwrt/luci-app-nettact/po/*/*.po; do
+            [ -f "$f" ] || continue
+            msgfmt --check-format -o /dev/null "$f" || { echo "bad po: $f"; fail=1; }
+          done
           exit $fail
 
       - name: Build packages
