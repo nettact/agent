@@ -4,11 +4,14 @@
 *.out
 /bin/
 
-# Agent local state / SQLite WAL
+# Agent local state
 agent-data/
-*.db
-*.db-wal
-*.db-shm
+
+# Build output
+/dist/
+/dist-bins/
+/.tmp/
+/openwrt/out/
 
 # Editor / OS
 .DS_Store

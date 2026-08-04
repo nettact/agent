@@ -78,7 +78,7 @@ type Options struct {
 
 	// Dialer establishes the session link. Nil selects the default WebSocket
 	// dialer built from ServerURL/Insecure/Format. The desktop injects the
-	// embedded Lite server's in-process pipe dialer here, so no loopback socket
+	// embedded server's in-process pipe dialer here, so no loopback socket
 	// is used and ServerURL/Format are then irrelevant.
 	Dialer wire.Dialer
 
@@ -516,8 +516,8 @@ func (r *runner) clearInflight(aw *asyncWork, f wire.Frame) {
 // drain uploads pending WAL batches over the socket, one ack-confirmed packet
 // at a time (semantics carried over from the old uploader loop: bounded per
 // tick, same-sequence retry on failure, server dedups on agent_id+sequence).
-// All WAL access happens here, on the session goroutine — the store rides a
-// single SQLite connection.
+// All WAL access happens here, on the session goroutine, so the store never
+// sees concurrent claims.
 func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, aw *asyncWork) error {
 	for i := 0; i < maxBatchesPerDrain; i++ {
 		batch, ok, err := r.deps.Outbox.NextBatch(batchItems)

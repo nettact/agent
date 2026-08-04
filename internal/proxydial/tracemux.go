@@ -1,3 +1,5 @@
+//go:build !lite
+
 package proxydial
 
 import (
@@ -81,16 +83,6 @@ type pendingProbe struct {
 	// stack assigns invisibly (the same reason pingtunnel matches on payload).
 	payload []byte
 	dest    netip.Addr
-}
-
-// TraceProbeReply is the outcome of one in-tunnel TTL'd echo. Timeout means no
-// correlated reply arrived in time — never a broken path by itself. Reached is
-// set only when the destination itself answered the echo.
-type TraceProbeReply struct {
-	Responder netip.Addr
-	Reached   bool
-	Timeout   bool
-	RTT       time.Duration
 }
 
 const (

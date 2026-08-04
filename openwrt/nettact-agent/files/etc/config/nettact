@@ -1,0 +1,47 @@
+# NetTact Agent — OpenWrt configuration.
+#
+# The package ships no agent binary: a full agent is ~11 MB, which most routers
+# cannot spare on flash. It is downloaded on demand instead, either into RAM on
+# every boot or once onto the overlay. See 'mode' below.
+#
+# Edit here or in LuCI (Services -> NetTact), then: /etc/init.d/nettact restart
+
+config nettact 'main'
+	# Master switch. The service starts nothing until this is 1 AND server_url
+	# is set, so installing the package cannot make a router phone home.
+	option enabled '0'
+
+	# Where the agent binary lives.
+	#   ram   - downloaded to /tmp on every boot. Uses no flash and survives
+	#           sysupgrade, at the cost of ~11 MB of RAM and a download each
+	#           boot. Right for 8/16 MB devices.
+	#   flash - downloaded once to /usr/lib/nettact. Boots offline, needs
+	#           ~11 MB free on the overlay.
+	# The agent's IDENTITY is unaffected: agent.key and agent.json always live
+	# in /etc/nettact/data, so the router never re-enrolls either way.
+	option mode 'ram'
+
+	# The NetTact server this agent reports to, e.g. https://nettact.example.com
+	option server_url ''
+
+	# One-time enrollment token. It is used only until enrollment succeeds;
+	# after that /etc/nettact/data/agent.json holds the real credential and this
+	# is ignored. Safe to clear once the router shows as enrolled.
+	option enroll_token ''
+
+	# Accept a server TLS certificate that does not verify. Only for a private
+	# CA or an IP-address server you control.
+	option tls_insecure '0'
+
+	# How often buffered telemetry is uploaded.
+	option upload_interval '30s'
+
+	# Where binaries are fetched from. Point this at a local mirror to avoid
+	# the internet entirely; it must serve the same layout as the default:
+	#   <base>/versions.json
+	#   <base>/<tag>/nettact-agent-lite-linux-<arch>
+	#   <base>/<tag>/SHA256SUMS
+	option download_base 'https://d.nettact.org/agent'
+
+	# 'latest', or a pinned release tag such as v1.2.3.
+	option version 'latest'

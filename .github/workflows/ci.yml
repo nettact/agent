@@ -1,0 +1,208 @@
+# Pull-request checks.
+#
+# Until this existed, vet/build/test only ran inside the release job, so a break
+# was found at tag time. The release gate still runs them — this is the same
+# work, earlier.
+#
+# Requires CI_SUBMODULE_SSH_KEY (read access to nettact/protocol), like the
+# release workflow: the agent does not compile without protocol in the
+# workspace.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: agent
+
+      - name: Checkout protocol
+        uses: actions/checkout@v4
+        with:
+          repository: nettact/protocol
+          path: protocol
+          ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: |
+            agent/go.sum
+            protocol/go.sum
+
+      - name: Assemble workspace (trimmed go.work + versioned replace)
+        run: |
+          set -euo pipefail
+          go work init ./protocol ./agent
+          go work edit -replace github.com/nettact/protocol@v0.0.0-00010101000000-000000000000=./protocol
+
+      - name: vet · build · test (default)
+        run: |
+          set -euo pipefail
+          ( cd agent && go vet ./... && go build ./... && go test ./... )
+
+      # The lite tag is a genuinely different program — no WireGuard egress, a
+      # memory-only outbox — and nothing else here would notice if it stopped
+      # compiling or its tests started failing.
+      - name: vet · build · test (lite)
+        run: |
+          set -euo pipefail
+          ( cd agent && go vet -tags lite ./... && go build -tags lite ./... && go test -tags lite ./... )
+
+      # The router architectures are the ones a dependency can quietly drop
+      # support for; a pure-Go tree builds for all of them, and the day one does
+      # not, this is where it should surface rather than in a release.
+      - name: Cross-compile router targets
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          cd agent
+          fail=0
+          for spec in \
+            "lite linux mipsle softfloat" \
+            "lite linux mips softfloat" \
+            "lite linux arm 7" \
+            "lite linux riscv64 -" \
+            "lite linux 386 -" \
+            "full linux mipsle softfloat" \
+            "full windows amd64 -"
+          do
+            set -- $spec
+            variant="$1"; export GOOS="$2"; export GOARCH="$3"
+            unset GOMIPS GOARM GO386
+            case "$GOARCH" in
+              mips|mipsle) export GOMIPS="$4" ;;
+              arm) export GOARM="$4" ;;
+              386) export GO386=softfloat ;;
+            esac
+            tags=""; [ "$variant" = lite ] && tags="-tags lite"
+            printf '%-6s %s/%s%s ... ' "$variant" "$GOOS" "$GOARCH" "${4#-}"
+            if go build $tags -trimpath -o /dev/null ./cmd/nettact-agent; then
+              echo ok
+            else
+              echo FAILED; fail=1
+            fi
+          done
+          exit $fail
+
+  openwrt:
+    name: OpenWrt packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No SDK and no cross toolchain: neither package holds a binary, so the
+      # check is that they assemble and that what comes out has the layout opkg
+      # and LuCI expect.
+      - name: Shell + arch-table checks
+        run: sh openwrt/test-scripts.sh
+
+      - name: Syntax-check scripts and JSON
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in openwrt/build-ipk.sh openwrt/test-scripts.sh \
+                   openwrt/*/control/{postinst,prerm,postrm} \
+                   openwrt/nettact-agent/files/etc/init.d/nettact \
+                   openwrt/nettact-agent/files/usr/lib/nettact/*.sh \
+                   openwrt/luci-app-nettact/files/usr/libexec/rpcd/nettact
+          do
+            [ -f "$f" ] || continue
+            sh -n "$f" || { echo "shell syntax error: $f"; fail=1; }
+          done
+          for f in openwrt/luci-app-nettact/files/usr/share/luci/menu.d/*.json \
+                   openwrt/luci-app-nettact/files/usr/share/rpcd/acl.d/*.json
+          do
+            jq -e . "$f" >/dev/null || { echo "bad JSON: $f"; fail=1; }
+          done
+          msgfmt --check-format -o /dev/null openwrt/luci-app-nettact/po/zh_Hans/nettact.po
+          exit $fail
+
+      - name: Build packages
+        run: sh openwrt/build-ipk.sh v0.0.0-ci .tmp/ipk
+
+      - name: Validate package layout
+        run: |
+          set -euo pipefail
+          fail=0
+
+          # Unpack each ipk the way opkg would, then check plain files. Piping
+          # tar into `grep -q` looks tidier but is wrong under pipefail: grep
+          # exits at the first match, tar takes SIGPIPE, and the pipeline
+          # reports failure for a package that was perfectly fine.
+          for p in nettact-agent luci-app-nettact; do
+            d=".tmp/x/$p"
+            mkdir -p "$d/control" "$d/data"
+            tar xzf ".tmp/ipk/$p.ipk" -C "$d"
+            for m in debian-binary control.tar.gz data.tar.gz; do
+              [ -f "$d/$m" ] || { echo "$p: missing member $m"; fail=1; }
+            done
+            tar xzf "$d/control.tar.gz" -C "$d/control"
+            tar xzf "$d/data.tar.gz" -C "$d/data"
+          done
+
+          need() {
+            [ -e ".tmp/x/$1/data/$2" ] || { echo "$1: missing $2"; fail=1; }
+          }
+          field() {
+            grep -qx "$2" ".tmp/x/$1/control/control" \
+              || { echo "$1: control lacks '$2'"; fail=1; }
+          }
+
+          for p in nettact-agent luci-app-nettact; do
+            [ "$(cat ".tmp/x/$p/debian-binary")" = "2.0" ] \
+              || { echo "$p: debian-binary is not 2.0"; fail=1; }
+            field "$p" 'Architecture: all'
+            field "$p" 'Version: 0.0.0-ci'
+          done
+
+          for f in etc/config/nettact etc/init.d/nettact \
+                   usr/lib/nettact/fetch.sh usr/lib/nettact/launch.sh \
+                   usr/lib/nettact/common.sh lib/upgrade/keep.d/nettact; do
+            need nettact-agent "$f"
+          done
+          # The package must ship no agent executable: that is the whole reason
+          # one architecture-independent ipk can serve every router.
+          if find .tmp/x/nettact-agent/data -name 'nettact-agent' -type f | grep .; then
+            echo "nettact-agent: ships an agent binary; it is meant to download one"; fail=1
+          fi
+          # A script opkg unpacks without the executable bit never runs.
+          for f in etc/init.d/nettact usr/lib/nettact/fetch.sh usr/lib/nettact/launch.sh; do
+            [ -x ".tmp/x/nettact-agent/data/$f" ] \
+              || { echo "nettact-agent: $f is not executable"; fail=1; }
+          done
+          [ -x .tmp/x/nettact-agent/control/postinst ] \
+            || { echo "nettact-agent: postinst is not executable"; fail=1; }
+
+          for f in www/luci-static/resources/view/nettact/status.js \
+                   www/luci-static/resources/view/nettact/settings.js \
+                   usr/share/luci/menu.d/luci-app-nettact.json \
+                   usr/share/rpcd/acl.d/luci-app-nettact.json \
+                   usr/libexec/rpcd/nettact \
+                   usr/lib/lua/luci/i18n/nettact.zh-cn.lmo; do
+            need luci-app-nettact "$f"
+          done
+          [ -x .tmp/x/luci-app-nettact/data/usr/libexec/rpcd/nettact ] \
+            || { echo "luci-app-nettact: rpcd backend is not executable"; fail=1; }
+
+          # Every ubus method the views call must be granted by the ACL, or the
+          # page loads and every button fails with a permission error.
+          for m in status versions fetch fetch_status service; do
+            grep -q "\"$m\"" .tmp/x/luci-app-nettact/data/usr/share/rpcd/acl.d/luci-app-nettact.json \
+              || { echo "acl.d: ubus method $m is not granted"; fail=1; }
+          done
+
+          exit $fail

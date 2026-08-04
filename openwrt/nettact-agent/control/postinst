@@ -1,0 +1,20 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+# An upgrade replaced the init script and the launch/fetch helpers underneath a
+# service that is still running the old ones, so the new copies do not take
+# effect until it restarts. Restarting only when the service is enabled keeps a
+# FRESH install untouched: it is not enabled yet, so this does nothing and the
+# router still will not talk to a server nobody has named.
+if [ -x /etc/rc.d/S99nettact ]; then
+	/etc/init.d/nettact restart 2>/dev/null
+	exit 0
+fi
+
+# The service stays disabled until it is configured: installing a package must
+# never make a router start reporting to a server nobody has named yet.
+if [ ! -s /etc/nettact/data/agent.json ]; then
+	echo "NetTact agent installed. Set server_url and enroll_token under"
+	echo "Services -> NetTact in LuCI (or in /etc/config/nettact), then enable it."
+fi
+exit 0

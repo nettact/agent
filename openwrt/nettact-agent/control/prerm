@@ -1,0 +1,31 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+# opkg runs prerm for BOTH an upgrade and a removal, and distinguishes them the
+# Debian way — through the first argument, not the environment. An upgrade calls
+# the outgoing package's script as `prerm upgrade <new-version>`; a removal
+# calls it as `prerm remove`.
+#
+# Treating an upgrade as a removal is what makes `opkg upgrade nettact-agent`
+# quietly hostile: it would stop the service, drop it out of the boot sequence,
+# and delete the ~11 MB binary the router had already downloaded. Nothing puts
+# any of that back, so a routine package update would leave monitoring off until
+# somebody noticed and turned it on again by hand.
+#
+# Anything that is not an upgrade falls through to the cleanup, so an unfamiliar
+# argument errs toward tidying up rather than leaving files behind.
+if [ "$1" = upgrade ]; then
+	# The package carries only scripts, and replacing those under a running
+	# agent is safe — launch.sh has already exec'd into the binary by then.
+	# postinst restarts the service so the new scripts take effect.
+	exit 0
+fi
+
+/etc/init.d/nettact stop 2>/dev/null
+/etc/init.d/nettact disable 2>/dev/null
+
+# The downloaded binary is not owned by the package (it was fetched, not
+# installed), so opkg will not remove it.
+rm -f /usr/lib/nettact/nettact-agent
+rm -rf /tmp/nettact
+exit 0

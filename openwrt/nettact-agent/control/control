@@ -1,0 +1,18 @@
+Package: nettact-agent
+Version: @VERSION@
+Depends: libc, ca-bundle
+Source: https://github.com/nettact/agent
+Section: net
+Priority: optional
+Maintainer: NetTact <support@nettact.org>
+Architecture: all
+Description: NetTact monitoring agent for OpenWrt.
+ Runs network probes on the router and pushes the results to a NetTact server.
+ .
+ The package contains no executable: the agent binary is ~11 MB and is
+ downloaded on first start instead, either into RAM on every boot or once onto
+ the overlay (see the 'mode' option in /etc/config/nettact). One package
+ therefore serves every CPU architecture, and an 8 MB router can run the agent
+ without spending any flash on it.
+ .
+ Configure it under Services -> NetTact in LuCI, or in /etc/config/nettact.

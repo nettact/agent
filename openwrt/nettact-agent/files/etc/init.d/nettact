@@ -1,0 +1,71 @@
+#!/bin/sh /etc/rc.common
+# NetTact agent, supervised by procd.
+
+USE_PROCD=1
+# After the network (20) and sysntpd (98): launch.sh still waits for a route and
+# a plausible clock, but starting behind them means it usually waits for nothing.
+START=99
+STOP=10
+
+. /usr/lib/nettact/common.sh
+
+start_service() {
+	local enabled server_url enroll_token tls_insecure upload_interval
+
+	config_load nettact
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" != 1 ]; then
+		return 0
+	fi
+
+	config_get server_url main server_url
+	if [ -z "$server_url" ]; then
+		nettact_err "server_url is not set; not starting (configure it in LuCI or /etc/config/nettact)"
+		return 0
+	fi
+	config_get enroll_token main enroll_token
+	config_get_bool tls_insecure main tls_insecure 0
+	config_get upload_interval main upload_interval 30s
+
+	# Identity lives on flash in every mode: agent.key and agent.json are a few
+	# hundred bytes, and losing them would mean re-enrolling with a one-time
+	# token the user no longer has.
+	mkdir -p "$NETTACT_DATA_DIR"
+	chmod 0700 "$NETTACT_DATA_DIR"
+
+	procd_open_instance nettact
+	procd_set_param command /bin/sh /usr/lib/nettact/launch.sh
+
+	# Config travels as environment rather than a rendered YAML file: every
+	# option the agent takes already has a NETTACT_AGENT_* variable, so there is
+	# no generated file to go stale, and the enrollment token never lands on
+	# flash in a second place. (A hand-written /etc/nettact/agent.yaml still
+	# wins if an advanced user drops one — the agent prefers a file over env.)
+	procd_set_param env \
+		NETTACT_AGENT_SERVER_URL="$server_url" \
+		NETTACT_AGENT_DATA_DIR="$NETTACT_DATA_DIR" \
+		NETTACT_AGENT_TLS_INSECURE="$tls_insecure" \
+		NETTACT_AGENT_UPLOAD_INTERVAL="$upload_interval"
+	if [ -n "$enroll_token" ]; then
+		procd_append_param env NETTACT_AGENT_ENROLL_TOKEN="$enroll_token"
+	fi
+
+	# Retry forever, 10s apart: an agent that cannot reach its server yet is the
+	# normal state during boot, not a reason to give up. The 3600s threshold is
+	# procd's "if it keeps dying this fast for this long" window.
+	procd_set_param respawn 3600 10 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/nettact.pid
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "nettact"
+}
+
+reload_service() {
+	# The agent reads its configuration once at startup, so a config change means
+	# a restart rather than a signal.
+	restart
+}

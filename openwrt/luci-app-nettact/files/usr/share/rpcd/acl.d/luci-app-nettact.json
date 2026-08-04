@@ -1,0 +1,17 @@
+{
+	"luci-app-nettact": {
+		"description": "Grant access to the NetTact agent",
+		"read": {
+			"ubus": {
+				"luci.nettact": [ "status", "versions", "fetch_status" ]
+			},
+			"uci": [ "nettact" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.nettact": [ "fetch", "service" ]
+			},
+			"uci": [ "nettact" ]
+		}
+	}
+}

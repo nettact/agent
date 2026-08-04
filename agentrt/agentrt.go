@@ -180,7 +180,7 @@ func DefaultLimits() Limits {
 // Config drives one Run. Zero values select production defaults where noted.
 type Config struct {
 	ServerURL      string        // e.g. http://127.0.0.1:52344; required unless both Dialer and Enroller are set
-	DataDir        string        // holds agent.key, agent.json, wal.db
+	DataDir        string        // holds agent.key, agent.json, the wal/ directory
 	Insecure       bool          // skip TLS verification (LAN self-signed)
 	UploadInterval time.Duration // WAL drain cadence; 0 → pcfg.DefaultUploadInterval (30s)
 	WireFormat     string        // "protobuf" (default when empty) or "json"
@@ -199,7 +199,7 @@ type Config struct {
 	Limits Limits
 
 	// Dialer establishes the server session. Nil selects a WebSocket to ServerURL
-	// (the standalone path). The desktop injects the embedded Lite server's
+	// (the standalone path). The desktop injects the embedded server's
 	// in-process pipe dialer so telemetry never touches a loopback socket.
 	Dialer wire.Dialer
 
@@ -389,7 +389,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// gone first.
 	runCtx, cancel := context.WithCancel(ctx)
 
-	outbox, err := wal.Open(filepath.Join(cfg.DataDir, "wal.db"))
+	outbox, err := wal.Open(filepath.Join(cfg.DataDir, "wal"))
 	if err != nil {
 		cancel()
 		return fmt.Errorf("open wal: %w", err)

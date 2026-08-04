@@ -1,0 +1,211 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh_Hans\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "NetTact Agent"
+msgstr "NetTact 探针"
+
+msgid ""
+"The agent runs network probes on this router and pushes the results to a "
+"NetTact server. The binary itself is not part of the package; it is "
+"downloaded on first start."
+msgstr ""
+"探针在本路由器上执行网络探测，并将结果推送到 NetTact 服务器。安装包中不含可执行"
+"文件，首次启动时才会下载。"
+
+msgid "Connection"
+msgstr "连接"
+
+msgid "Enabled"
+msgstr "启用"
+
+msgid "The agent stays stopped until this is on and a server address is set."
+msgstr "只有在启用并填写服务器地址后，探针才会启动。"
+
+msgid "Server URL"
+msgstr "服务器地址"
+
+msgid "For example https://nettact.example.com"
+msgstr "例如 https://nettact.example.com"
+
+msgid "Must start with http:// or https://"
+msgstr "必须以 http:// 或 https:// 开头"
+
+msgid "Enrollment token"
+msgstr "注册令牌"
+
+msgid ""
+"One-time token from the server. It is only used until this router is "
+"enrolled; after that it can be cleared."
+msgstr "服务器签发的一次性令牌。注册成功后即不再使用，可以清空。"
+
+msgid "Skip TLS verification"
+msgstr "跳过 TLS 验证"
+
+msgid ""
+"Accept a server certificate that does not verify. Only for a private CA or an "
+"IP-address server you control."
+msgstr "接受无法验证的服务器证书。仅适用于自建 CA 或你自己控制的 IP 地址服务器。"
+
+msgid "Upload interval"
+msgstr "上报间隔"
+
+msgid "How often buffered telemetry is sent, e.g. 30s or 2m."
+msgstr "缓存的遥测数据多久上报一次，例如 30s 或 2m。"
+
+msgid "Binary"
+msgstr "程序文件"
+
+msgid "Where to keep the agent"
+msgstr "探针存放位置"
+
+msgid ""
+"The agent is about 11 MB. In RAM mode it is downloaded to /tmp on every boot "
+"and uses no flash at all — the right choice for an 8 or 16 MB router. In "
+"flash mode it is downloaded once and survives a reboot offline. Either way "
+"the router keeps its identity and never has to enroll twice."
+msgstr ""
+"探针约 11 MB。内存模式下每次开机都会下载到 /tmp，完全不占用闪存，适合 8MB 或 "
+"16MB 的路由器；闪存模式只下载一次，断网重启也能直接运行。两种模式都会保留身份"
+"信息，不需要重复注册。"
+
+msgid "RAM — re-download each boot, no flash used"
+msgstr "内存 — 每次开机重新下载，不占闪存"
+
+msgid "Flash — download once, needs ~12 MB free"
+msgstr "闪存 — 只下载一次，需要约 12 MB 可用空间"
+
+msgid "Download source"
+msgstr "下载源"
+
+msgid ""
+"Change this to use a local mirror. It must serve versions.json and per-"
+"release directories the same way the default does."
+msgstr ""
+"可改为本地镜像。镜像需要按与默认源相同的方式提供 versions.json 和各版本目录。"
+
+msgid "Version"
+msgstr "版本"
+
+msgid "Pin a release, or track the newest one."
+msgstr "锁定某个版本，或始终跟随最新版本。"
+
+msgid "Latest (%s)"
+msgstr "最新版（%s）"
+
+msgid "%s (pre-release)"
+msgstr "%s（预发布）"
+
+msgid ""
+"The version list could not be fetched (%s). Enter a release tag such as "
+"v1.2.3, or \"latest\"."
+msgstr "无法获取版本列表（%s）。请手动填写版本号，例如 v1.2.3，或填 latest。"
+
+msgid "Status"
+msgstr "状态"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Service"
+msgstr "服务"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "Start on boot"
+msgstr "开机自启"
+
+msgid "Disabled"
+msgstr "已禁用"
+
+msgid "Enrolled"
+msgstr "已注册"
+
+msgid "Yes"
+msgstr "是"
+
+msgid "Not yet"
+msgstr "尚未注册"
+
+msgid "Agent binary"
+msgstr "探针程序"
+
+msgid "present"
+msgstr "已就绪"
+
+msgid "not downloaded yet"
+msgstr "尚未下载"
+
+msgid "Storage mode"
+msgstr "存放模式"
+
+msgid "Flash"
+msgstr "闪存"
+
+msgid "RAM (re-downloaded each boot)"
+msgstr "内存（每次开机重新下载）"
+
+msgid "Architecture"
+msgstr "架构"
+
+msgid "unrecognised"
+msgstr "无法识别"
+
+msgid "Restart"
+msgstr "重启"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Enable on boot"
+msgstr "开机自启"
+
+msgid "Disable on boot"
+msgstr "取消自启"
+
+msgid "Download / update binary"
+msgstr "下载 / 更新程序"
+
+msgid "Downloading…"
+msgstr "正在下载…"
+
+msgid ""
+"Downloading the agent in the background. This can take a few minutes on a "
+"slow link."
+msgstr "正在后台下载探针。网络较慢时可能需要几分钟。"
+
+msgid "The download failed:"
+msgstr "下载失败："
+
+msgid "The agent binary was installed. Restart the service to run it."
+msgstr "探针程序已安装。重启服务即可运行。"
+
+msgid "Could not start the download."
+msgstr "无法启动下载。"
+
+msgid "Recent log"
+msgstr "最近日志"
+
+msgid "No recent log entries."
+msgstr "暂无日志。"
+
+msgid ""
+"The agent binary is downloaded rather than shipped, so a router with little "
+"flash can still run it."
+msgstr "探针程序按需下载而非随包安装，因此闪存很小的路由器也能运行。"
+
+msgid "Please wait…"
+msgstr "请稍候…"
+
+msgid "Applying…"
+msgstr "正在应用…"
+
+msgid "Action failed (exit code %d)."
+msgstr "操作失败（退出码 %d）。"

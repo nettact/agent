@@ -110,6 +110,16 @@ type ListenPacketFunc func() (net.PacketConn, error)
 // correlated reply. A missing reply is a Timeout result, not an error.
 type TraceProbeFunc func(ctx context.Context, dest netip.Addr, ttl int, timeout time.Duration) (TraceProbeReply, error)
 
+// TraceProbeReply is the outcome of one in-tunnel TTL'd echo. Timeout means no
+// correlated reply arrived in time — never a broken path by itself. Reached is
+// set only when the destination itself answered the echo.
+type TraceProbeReply struct {
+	Responder netip.Addr
+	Reached   bool
+	Timeout   bool
+	RTT       time.Duration
+}
+
 // DialContext routes a TCP connection to address through this proxy.
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return d.dial(ctx, network, address)

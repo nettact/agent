@@ -1,0 +1,177 @@
+#!/bin/sh
+# ubus object luci.nettact — the backend behind the LuCI pages.
+#
+# Access is gated by /usr/share/rpcd/acl.d/luci-app-nettact.json: reads need the
+# read scope, anything that changes the router needs write.
+. /usr/share/libubox/jshn.sh
+. /usr/lib/nettact/common.sh
+
+FETCH_DIR=/tmp/nettact
+FETCH_LOG="$FETCH_DIR/fetch.log"
+FETCH_PID="$FETCH_DIR/fetch.pid"
+FETCH_RC="$FETCH_DIR/fetch.rc"
+
+# service_running asks procd rather than looking for a process name, so a
+# manually started binary is not mistaken for the supervised service.
+service_running() {
+	ubus call service list '{"name":"nettact"}' 2>/dev/null \
+		| grep -q '"running"[[:space:]]*:[[:space:]]*true' && echo 1 || echo 0
+}
+
+service_enabled() {
+	[ -x /etc/rc.d/S99nettact ] && echo 1 || echo 0
+}
+
+binary_version() {
+	local bin
+	bin="$(nettact_bin)"
+	[ -x "$bin" ] || return 0
+	# --version prints one line and exits; the timeout is insurance against a
+	# corrupt download that hangs instead.
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 5 "$bin" --version 2>/dev/null | head -n 1
+	else
+		"$bin" --version 2>/dev/null | head -n 1
+	fi
+}
+
+status() {
+	local bin
+	bin="$(nettact_bin)"
+	json_init
+	json_add_boolean running "$(service_running)"
+	json_add_boolean enabled "$(service_enabled)"
+	# agent.json is the credential written when enrollment succeeds, so its
+	# presence is the honest answer to "is this router registered".
+	json_add_boolean enrolled "$([ -s "$NETTACT_DATA_DIR/agent.json" ] && echo 1 || echo 0)"
+	json_add_boolean binary_present "$([ -x "$bin" ] && echo 1 || echo 0)"
+	json_add_string binary_path "$bin"
+	json_add_string binary_version "$(binary_version)"
+	json_add_string mode "$(nettact_mode)"
+	json_add_string arch "$(/usr/lib/nettact/fetch.sh arch 2>/dev/null)"
+
+	# Collect first, then loop OUTSIDE a pipeline. Every stage of a pipeline is
+	# its own subshell in ash, so a `logread | while read` loop would call
+	# json_add_string in a child process and the parent would close and emit an
+	# empty array — a permanently blank log panel, with no error anywhere.
+	logs="$(logread -e nettact 2>/dev/null | tail -n 30)"
+	json_add_array log
+	if [ -n "$logs" ]; then
+		set -f                  # a log line containing * must not be globbed
+		oldifs="$IFS"; IFS='
+'
+		for line in $logs; do
+			json_add_string "" "$line"
+		done
+		IFS="$oldifs"; set +f
+	fi
+	json_close_array
+	json_dump
+}
+
+versions() {
+	local out
+	out="$(/usr/lib/nettact/fetch.sh versions 2>&1)"
+	if [ $? -ne 0 ]; then
+		json_init
+		json_add_string error "$out"
+		json_dump
+		return
+	fi
+	# The payload is already the JSON document LuCI wants; pass it through so
+	# the mirror configured in UCI is the one that answers, not the browser.
+	echo "$out"
+}
+
+# fetch runs in the background: a 12 MB download over a slow WAN link takes far
+# longer than ubus will wait, so the call returns immediately and the page polls
+# fetch_status.
+fetch() {
+	local version="$1"
+	mkdir -p "$FETCH_DIR"
+	if [ -f "$FETCH_PID" ] && kill -0 "$(cat "$FETCH_PID" 2>/dev/null)" 2>/dev/null; then
+		json_init
+		json_add_boolean started 0
+		json_add_string error "a download is already running"
+		json_dump
+		return
+	fi
+	rm -f "$FETCH_RC"
+	(
+		/usr/lib/nettact/fetch.sh install "$version" >"$FETCH_LOG" 2>&1
+		echo $? >"$FETCH_RC"
+	) &
+	echo $! >"$FETCH_PID"
+	json_init
+	json_add_boolean started 1
+	json_dump
+}
+
+fetch_status() {
+	local state="idle" rc=""
+	if [ -f "$FETCH_PID" ] && kill -0 "$(cat "$FETCH_PID" 2>/dev/null)" 2>/dev/null; then
+		state="running"
+	elif [ -f "$FETCH_RC" ]; then
+		rc="$(cat "$FETCH_RC" 2>/dev/null)"
+		[ "$rc" = 0 ] && state="done" || state="error"
+	fi
+	json_init
+	json_add_string state "$state"
+	[ -n "$rc" ] && json_add_int code "$rc"
+	json_add_string log "$(tail -n 20 "$FETCH_LOG" 2>/dev/null)"
+	json_dump
+}
+
+# service only ever runs the init script, and only with an action from this
+# list: the parameter reaches a shell, so an allowlist is the boundary.
+service_action() {
+	local action="$1"
+	case "$action" in
+		start|stop|restart|enable|disable) ;;
+		*)
+			json_init
+			json_add_boolean ok 0
+			json_add_string error "unsupported action"
+			json_dump
+			return
+			;;
+	esac
+	/etc/init.d/nettact "$action" >/dev/null 2>&1
+	local rc=$?
+	json_init
+	json_add_boolean ok "$([ $rc -eq 0 ] && echo 1 || echo 0)"
+	json_add_int code "$rc"
+	json_dump
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object status; json_close_object
+		json_add_object versions; json_close_object
+		json_add_object fetch; json_add_string version ""; json_close_object
+		json_add_object fetch_status; json_close_object
+		json_add_object service; json_add_string action ""; json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			status) status ;;
+			versions) versions ;;
+			fetch)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var version version
+				fetch "$version"
+				;;
+			fetch_status) fetch_status ;;
+			service)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var action action
+				service_action "$action"
+				;;
+			*) echo '{}' ;;
+		esac
+		;;
+esac

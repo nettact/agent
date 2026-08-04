@@ -1,3 +1,5 @@
+//go:build !lite
+
 package proxydial_test
 
 // End-to-end tests over a REAL WireGuard tunnel, both ends in this process.

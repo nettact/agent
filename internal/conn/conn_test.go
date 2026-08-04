@@ -120,15 +120,15 @@ func newTestDeps(t *testing.T) (Deps, *wal.Store, *fakeConfigurable, *fakeSchedu
 	if err != nil {
 		t.Fatalf("make temp dir: %v", err)
 	}
-	outbox, err := wal.Open(filepath.Join(dataDir, "wal.db"))
+	outbox, err := wal.Open(filepath.Join(dataDir, "wal"))
 	if err != nil {
 		_ = os.RemoveAll(dataDir)
 		t.Fatalf("open wal: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = outbox.Close()
-		// modernc SQLite can release/delete its Windows WAL sidecars a fraction
-		// after Close returns. Retry the test-only directory cleanup so a transient
+		// Windows can hold a just-closed file open a fraction longer than Close
+		// suggests. Retry the test-only directory cleanup so a transient
 		// ERROR_DIR_NOT_EMPTY does not turn a passing protocol test flaky.
 		deadline := time.Now().Add(time.Second)
 		for {
@@ -308,10 +308,18 @@ func TestHelloThenDrainAck(t *testing.T) {
 	}
 }
 
-// TestDrainFastForwardsResetWAL reproduces WIFI-010 end to end: the local WAL
-// starts at sequence 1 while the server ACK reports a much higher retained
-// watermark. The in-flight packet remains sequence 1, then the next newly
-// claimed packet must jump directly to watermark+1.
+// TestDrainFastForwardsResetWAL reproduces WIFI-010 end to end: the server's ACK
+// reports a retained watermark far above where the local WAL is issuing, and the
+// next newly claimed packet must come out above it — otherwise the server dedups
+// every packet on (agent_id, sequence) and the telemetry reads as sent while
+// never being stored.
+//
+// What is asserted here is the wiring — that the ack's watermark reaches the
+// WAL's allocator at all — rather than the exact numbers, because the two builds
+// allocate differently: the default store starts at 1 and jumps to watermark+1,
+// while the lite store seeds from the wall clock and is already past it, making
+// the fast-forward a no-op. Both satisfy the property that matters. The
+// allocator's own arithmetic is pinned in the wal package's tests.
 func TestDrainFastForwardsResetWAL(t *testing.T) {
 	for name, format := range map[string]string{
 		"protobuf": wire.SubprotocolProtobuf,
@@ -368,8 +376,12 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 
 			select {
 			case got := <-seqs:
-				if got[0] != 1 || got[1] != watermark+1 {
-					t.Fatalf("packet sequences=%v want [1 %d]", got, watermark+1)
+				if got[1] <= watermark {
+					t.Fatalf("packet sequences=%v: the second is at or below the server watermark %d, so it would be deduped away",
+						got, watermark)
+				}
+				if got[1] <= got[0] {
+					t.Fatalf("packet sequences=%v went backwards", got)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("server never received fast-forwarded packet")

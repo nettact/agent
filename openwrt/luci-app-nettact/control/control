@@ -1,0 +1,13 @@
+Package: luci-app-nettact
+Version: @VERSION@
+Depends: luci-base, nettact-agent
+Source: https://github.com/nettact/agent
+Section: luci
+Category: LuCI
+Priority: optional
+Maintainer: NetTact <support@nettact.org>
+Architecture: all
+Description: LuCI interface for the NetTact monitoring agent.
+ Configure the server address and enrollment token, choose whether the agent
+ binary lives in RAM or on flash, pick or pin a version, and watch the service's
+ status and recent log output.

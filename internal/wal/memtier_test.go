@@ -1,3 +1,5 @@
+//go:build !lite
+
 package wal
 
 import (
@@ -14,12 +16,12 @@ import (
 // no packet is ever lost, duplicated, or reordered across the boundary between
 // the two.
 
-// tempWALDir returns a directory for a WAL database, removed on a best-effort
-// basis when the test ends.
+// tempWALDir returns a directory to hold a WAL, removed on a best-effort basis
+// when the test ends.
 //
-// t.TempDir is the wrong owner for a SQLite file on Windows: its cleanup fails
-// the test if RemoveAll errors, and Windows releases the database file slightly
-// after Close returns — so a passing test intermittently reports a failure on the
+// t.TempDir is the wrong owner for it on Windows: its cleanup fails the test if
+// RemoveAll errors, and Windows can release a just-closed file slightly after
+// Close returns — so a passing test intermittently reports a failure on the
 // unlink rather than on anything it asserted. (server-core has the same helper,
 // for the same reason.) Retry briefly and never fail: a leftover directory under
 // the OS temp root is the operating system's to reap.
@@ -42,7 +44,7 @@ func tempWALDir(t *testing.T) string {
 
 func openTemp(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(tempWALDir(t), "wal.db"))
+	s, err := Open(filepath.Join(tempWALDir(t), "wal"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -55,12 +57,24 @@ func metric(v float64) telemetry.Metric {
 	return telemetry.Metric{TS: time.Now().UTC(), Kind: telemetry.ICMPRTTms, Target: "10.0.0.1", Value: v}
 }
 
-// storedRows is how many sample rows have actually reached SQLite.
+// storedRows is how many sample rows are physically present in the store's
+// segment files. It counts bytes on disk rather than the in-memory index, which
+// is what makes "a draining agent writes nothing" an honest assertion.
 func storedRows(t *testing.T, s *Store) int {
 	t.Helper()
-	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sample`).Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
+	segs, err := listSegments(s.dir)
+	if err != nil {
+		t.Fatalf("list segments: %v", err)
+	}
+	n := 0
+	for _, seg := range segs {
+		groups, err := scanSegment(segPath(s.dir, seg), seg)
+		if err != nil {
+			t.Fatalf("scan segment %d: %v", seg, err)
+		}
+		for _, g := range groups {
+			n += g.n
+		}
 	}
 	return n
 }
@@ -204,7 +218,7 @@ func TestSpillPreservesTheClaimedPacket(t *testing.T) {
 // TestCloseFlushesSoRestartLosesNothing: an ordinary shutdown is not a crash.
 func TestCloseFlushesSoRestartLosesNothing(t *testing.T) {
 	dir := tempWALDir(t)
-	path := filepath.Join(dir, "wal.db")
+	path := filepath.Join(dir, "wal")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +250,7 @@ func TestCloseFlushesSoRestartLosesNothing(t *testing.T) {
 // previous process could have handed out.
 func TestSequencesNeverRepeatAcrossRestarts(t *testing.T) {
 	dir := tempWALDir(t)
-	path := filepath.Join(dir, "wal.db")
+	path := filepath.Join(dir, "wal")
 	seen := map[uint64]bool{}
 
 	for restart := 0; restart < 3; restart++ {
@@ -343,10 +357,15 @@ func TestFastForwardRecoversWhenTheWatermarkIsInsideAReservedBlock(t *testing.T)
 // two copies once the disk recovers.
 func TestSpillFailureDoesNotRejectTheAppend(t *testing.T) {
 	s := openTemp(t)
-	// Break the durable tier underneath the buffer.
-	if err := s.db.Close(); err != nil {
+	// Break the durable tier underneath the buffer: a path that is a regular
+	// file, so every attempt to create a segment inside it fails.
+	blocked := filepath.Join(tempWALDir(t), "not-a-dir")
+	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	s.mu.Lock()
+	s.dir = blocked
+	s.mu.Unlock()
 
 	// Force the age trigger so this append must try to spill.
 	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
@@ -379,11 +398,13 @@ func TestExpiredBacklogIsNotServedAfterTheWindow(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	// Age the spilled rows past the retention window.
-	if _, err := s.db.Exec(`UPDATE sample SET created_at = ?`,
-		time.Now().UTC().Add(-s.retention-time.Hour)); err != nil {
-		t.Fatal(err)
+	// Age the spilled groups past the retention window.
+	old := time.Now().UTC().Add(-s.retention - time.Hour)
+	s.mu.Lock()
+	for i := range s.disk {
+		s.disk[i].at = old
 	}
+	s.mu.Unlock()
 
 	if _, ok, err := s.NextBatch(500); err != nil || ok {
 		t.Fatalf("expired backlog was served: ok=%v err=%v", ok, err)

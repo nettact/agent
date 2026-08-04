@@ -1,3 +1,5 @@
+//go:build !lite
+
 package wal
 
 import (
@@ -10,7 +12,7 @@ import (
 )
 
 func TestNextBatchKeepsCollectorResultWhole(t *testing.T) {
-	s, err := Open(filepath.Join(tempWALDir(t), "wal.db"))
+	s, err := Open(filepath.Join(tempWALDir(t), "wal"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -49,7 +51,7 @@ func TestNextBatchKeepsCollectorResultWhole(t *testing.T) {
 }
 
 func TestFastForwardPreservesInflightAndAdvancesNewBatches(t *testing.T) {
-	s, err := Open(filepath.Join(tempWALDir(t), "wal.db"))
+	s, err := Open(filepath.Join(tempWALDir(t), "wal"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

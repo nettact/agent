@@ -4,7 +4,7 @@
 //
 // The handshake is split into BuildRequest (assemble + sign, transport-free) and
 // Post (the HTTP exchange). Standalone agents compose the two; the desktop keeps
-// BuildRequest and hands the request to the embedded Lite server directly,
+// BuildRequest and hands the request to the embedded server directly,
 // skipping HTTP entirely.
 package enroll
 

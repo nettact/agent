@@ -1,0 +1,20 @@
+{
+	"admin/services/nettact": {
+		"title": "NetTact",
+		"order": 60,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-nettact" ], "uci": { "nettact": true } }
+	},
+
+	"admin/services/nettact/status": {
+		"title": "Status",
+		"order": 1,
+		"action": { "type": "view", "path": "nettact/status" }
+	},
+
+	"admin/services/nettact/settings": {
+		"title": "Settings",
+		"order": 2,
+		"action": { "type": "view", "path": "nettact/settings" }
+	}
+}
