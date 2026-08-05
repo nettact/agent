@@ -64,6 +64,27 @@ EOF
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
 
+# host_timezone — the host's IANA zone name, or empty if it cannot be determined.
+# The auto-update cron (NETTACT_AGENT_UPDATE_CRON) and Watchtower's TZ live in the
+# container, which inherits none of the host's timezone; without persisting the
+# zone here, "03:00 nightly" would fire at 03:00 UTC rather than host-local time.
+host_timezone() {
+  local tz=""
+  if command -v timedatectl >/dev/null 2>&1; then
+    tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+  fi
+  if [ -z "$tz" ] && [ -r /etc/timezone ]; then
+    tz="$(head -n1 /etc/timezone 2>/dev/null || true)"
+  fi
+  if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+    tz="$(readlink -f /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p' || true)"
+  fi
+  case "$tz" in
+    ''|Local|*[!A-Za-z0-9/_+-]*) tz="" ;;
+  esac
+  printf '%s' "$tz"
+}
+
 # JSON quoted strings are valid YAML scalars and safely preserve URLs/paths.
 yaml_quote() {
   printf '%s' "$1" | awk 'BEGIN { ORS=""; print "\"" } {
@@ -183,6 +204,7 @@ if $DOCKER_MODE; then
   compose() {
     ( cd "$INSTALL_DIR" \
       && env -u NETTACT_AGENT_IMAGE -u NETTACT_AGENT_VERSION -u NETTACT_AGENT_SERVER_URL \
+           -u NETTACT_AGENT_UPDATE_CRON -u NETTACT_TZ \
         docker compose "$@" )
   }
 
@@ -264,12 +286,16 @@ YAML
 
   # --auto-update: watches the Agent image and restarts the container when a new
   # one is published. It holds the Docker socket, which is root-equivalent on this
-  # host — remove this service to opt back out.
+  # host — remove this service to opt back out. Runs on a cron schedule (see
+  # NETTACT_AGENT_UPDATE_CRON in .env, host-local time) rather than a fixed
+  # interval, so the check lands in the early morning.
   updater:
     image: containrrr/watchtower:latest
     container_name: nettact-agent-updater
     restart: unless-stopped
-    command: --cleanup --interval 86400 nettact-agent
+    command: --cleanup --schedule "${NETTACT_AGENT_UPDATE_CRON:-0 0 3 * * *}" nettact-agent
+    environment:
+      TZ: ${NETTACT_TZ:-UTC}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 YAML
@@ -372,6 +398,19 @@ YAML
     printf 'NETTACT_AGENT_IMAGE=%s\n' "$IMG_REPO"
     printf 'NETTACT_AGENT_VERSION=%s\n' "${VERSION:-latest}"
     printf 'NETTACT_AGENT_SERVER_URL=%s\n' "$SERVER_URL"
+    if $AUTO_UPDATE; then
+      # 6-field cron for the auto-update check, in the host-local timezone (TZ in
+      # the compose file). Defaults to 03:00; the compose file falls back to the
+      # same value, so this line is documentation until an operator edits it.
+      printf 'NETTACT_AGENT_UPDATE_CRON=0 0 3 * * *\n'
+      # Watchtower interprets the cron above in TZ. Persist the host's zone so
+      # "03:00 nightly" means host-local 03:00, not 03:00 UTC.
+      HOST_TZ="$(host_timezone)"
+      if [ -n "$HOST_TZ" ]; then
+        printf 'NETTACT_TZ=%s\n' "$HOST_TZ"
+        log "timezone: $HOST_TZ (change NETTACT_TZ in .env)"
+      fi
+    fi
   } > "$INSTALL_DIR/.env"
   chmod 600 "$INSTALL_DIR/.env"
 
