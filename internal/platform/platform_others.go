@@ -1,4 +1,4 @@
-//go:build !windows && !linux
+//go:build !windows && !linux && !darwin
 
 package platform
 
@@ -10,14 +10,11 @@ import (
 )
 
 // genericPlatform is the stdlib-only fallback for the platforms with no native
-// implementation yet (macOS and anything else the agent cross-compiles for). It
-// reports only what it can actually do — interface status/addresses and Wi-Fi —
-// so ICMP, gateway probing and neighbor discovery never enter `supported` and the
-// console shows them as a platform gap rather than a silent failure.
-//
-// Windows has platform_windows.go and Linux has platform_linux.go; macOS route
-// and neighbor tables need a different API again (sysctl over PF_ROUTE), which is
-// still open work.
+// implementation (whatever else the agent cross-compiles for; Windows, Linux
+// and macOS each have their own). It reports only what it can actually do —
+// interface status/addresses and Wi-Fi — so ICMP, gateway probing and neighbor
+// discovery never enter `supported` and the console shows them as a platform
+// gap rather than a silent failure.
 type genericPlatform struct{}
 
 func newPlatform() Platform { return genericPlatform{} }

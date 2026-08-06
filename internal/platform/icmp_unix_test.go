@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package platform
 
@@ -73,7 +73,7 @@ func TestDstUnreachNameCoversCommonCodes(t *testing.T) {
 // it runs with rather than asserting a fixed set, so it is meaningful both in CI
 // (unprivileged) and in a root shell.
 func TestSupportsReflectsRuntimeCapability(t *testing.T) {
-	s := linuxPlatform{}.Supports()
+	s := newPlatform().Supports()
 
 	// Interface reads never depend on privilege.
 	if !s.Has(permission.NetIfaceStatusRead) || !s.Has(permission.NetIfaceAddressRead) {
@@ -102,7 +102,7 @@ func TestPingAgainstLoopback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	res, err := linuxPlatform{}.Ping(ctx, "127.0.0.1", PingOptions{Timeout: 2 * time.Second})
+	res, err := newPlatform().Ping(ctx, "127.0.0.1", PingOptions{Timeout: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("ping loopback: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestPingAgainstLoopback(t *testing.T) {
 // TestPingRejectsIPv6 pins parity with the Windows implementation: IPv4 only, and
 // an IPv6 target is a clear error rather than a silent non-result.
 func TestPingRejectsIPv6(t *testing.T) {
-	if _, err := (linuxPlatform{}).Ping(context.Background(), "::1", PingOptions{}); err == nil {
+	if _, err := newPlatform().Ping(context.Background(), "::1", PingOptions{}); err == nil {
 		t.Fatal("an IPv6 target must be rejected")
 	}
 }

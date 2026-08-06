@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"syscall"
@@ -13,7 +14,7 @@ import (
 // linuxPlatform is the native Linux HAL implementation. Interface enumeration and
 // Wi-Fi come from the shared unix walk and nl80211; default gateways and the
 // neighbor table come from netlink (netlink_linux.go); ICMP echo comes from a raw
-// or unprivileged ping socket (icmp_linux.go).
+// or unprivileged ping socket (icmp_unix.go).
 //
 // Everything privilege-dependent is probed once at startup and reported through
 // Supports(), so `effective` reflects what this process can really do rather than
@@ -66,7 +67,7 @@ func (linuxPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 	}
 
 	// One netlink dump serves both fields: DNS is attached to the interfaces that
-	// carry a default route (see resolv_linux.go for why).
+	// carry a default route (see resolv_unix.go for why).
 	//
 	// A failed dump is REPORTED, not swallowed. Leaving an empty route table
 	// behind and returning success makes "this host has no gateway" and "the agent
@@ -106,6 +107,10 @@ func (linuxPlatform) Interfaces(q IfaceQuery) ([]IfaceInfo, error) {
 		}
 	}
 	return out, nil
+}
+
+func (linuxPlatform) Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error) {
+	return icmpPing(ctx, target, opts)
 }
 
 func (linuxPlatform) Neighbors() ([]Neighbor, error) {

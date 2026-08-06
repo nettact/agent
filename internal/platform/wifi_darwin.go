@@ -58,7 +58,7 @@ type cwClient interface {
 // newCWClient is a package var so tests can substitute a fake without CoreWLAN.
 var newCWClient = func() (cwClient, error) { return openCoreWLAN() }
 
-func (genericPlatform) WiFi(includeSSID bool) WiFiResult {
+func (darwinPlatform) WiFi(includeSSID bool) WiFiResult {
 	cl, err := newCWClient()
 	if err != nil {
 		// dlopen / class-resolution / shared-client failure — the subsystem is

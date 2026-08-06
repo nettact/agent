@@ -4,8 +4,9 @@
 // limit; each request resolves its destination exactly once through the same
 // netguard target-access policy the live probes use, clamps its own inputs, and
 // obeys the request's budget as its only validity window. ICMP and TCP
-// are executed by dedicated TTL-aware platform paths (real on Windows/IPv4,
-// precise-unsupported stubs elsewhere); at the agent level there is never an
+// are executed by dedicated TTL-aware platform paths (real on Windows, Linux
+// and macOS, IPv4 only; precise-unsupported stubs elsewhere); at the agent
+// level there is never an
 // automatic fallback between the two modes — mode fallback (TCP to ICMP) is
 // done by the server before dispatch, based on the agent's reported effective
 // permissions (see server-core incidentops.deriveTrace) — and there is no
@@ -37,14 +38,16 @@ type probeOutcome struct {
 type prober func(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.Duration) (probeOutcome, error)
 
 // capabilities reports which diagnostic modes this build+runtime can actually
-// execute. ICMP is a platform fact (Windows IPv4 iphlpapi TTL echo, no admin
-// needed). TCP additionally needs to observe intermediate TTL-exceeded
-// responders on a raw ICMP socket, which on Windows only an elevated process
+// execute. On Windows, ICMP is a platform fact (IPv4 iphlpapi TTL echo, no
+// admin needed) while TCP additionally needs to observe intermediate
+// TTL-exceeded responders on a raw ICMP socket, which only an elevated process
 // (or a service running as SYSTEM) can actually receive — a non-elevated
 // process can open the same raw socket but only ever sees echo replies from
 // the final destination, never intermediate Time-Exceeded/Unreachable
-// messages. So TCP is a runtime capability gated on process elevation,
-// determined at startup by checking the process token.
+// messages. So TCP there is a runtime capability gated on process elevation,
+// determined at startup by checking the process token. On Linux and macOS both
+// modes hang off one startup check: can this process open a raw ICMP socket
+// (root / CAP_NET_RAW) — see probe_unix.go.
 type capabilities struct {
 	ICMP bool
 	TCP  bool

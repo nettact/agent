@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package platform
 
@@ -17,17 +17,18 @@ import (
 	"github.com/nettact/protocol/telemetry"
 )
 
-// Linux offers two ways to send an ICMP echo, and which one a process gets is a
-// runtime fact, not a build fact:
+// Linux and macOS both offer two ways to send an ICMP echo, and which one a
+// process gets is a runtime fact, not a build fact:
 //
-//   - a RAW ICMP socket (CAP_NET_RAW, which root has) sees every ICMP packet on
+//   - a RAW ICMP socket (root; CAP_NET_RAW on Linux) sees every ICMP packet on
 //     the host, including the Time-Exceeded and Destination-Unreachable errors
 //     that classify a failed probe and drive traceroute;
-//   - an unprivileged "ping socket" (SOCK_DGRAM/IPPROTO_ICMP) needs no
-//     capability but is only enabled when net.ipv4.ping_group_range covers the
-//     process's gid, and the kernel delivers ICMP errors for it to the socket
-//     error queue rather than as readable messages — so echoes work, but a
-//     failure can only be reported as "no answer".
+//   - an unprivileged datagram ICMP socket (SOCK_DGRAM/IPPROTO_ICMP) needs no
+//     privilege — on Linux only when net.ipv4.ping_group_range covers the
+//     process's gid, on macOS unconditionally — and the errors a raw socket
+//     would read may not arrive as readable messages (Linux routes them to the
+//     socket error queue), so echoes work, but a failure can degrade to
+//     "no answer".
 //
 // The agent probes for both once at startup and reports the outcome through
 // Supports(), so a host that can only do one, or neither, says so honestly
@@ -61,11 +62,12 @@ func detectICMPCapability() icmpMode {
 // errNoICMP is returned when neither socket type is available. It is a probe
 // error, not a silent failure: the permission is not in `supported` either, so
 // the server should never have scheduled an ICMP monitor for this agent.
-var errNoICMP = errors.New("icmp echo unavailable: no raw ICMP socket (CAP_NET_RAW) and no unprivileged ping socket (net.ipv4.ping_group_range)")
+var errNoICMP = errors.New("icmp echo unavailable: no raw ICMP socket (root/CAP_NET_RAW) and no unprivileged datagram ICMP socket")
 
-// Ping sends one ICMP echo and classifies the outcome. IPv4 only, matching the
-// Windows implementation.
-func (linuxPlatform) Ping(ctx context.Context, target string, opts PingOptions) (PingResult, error) {
+// icmpPing sends one ICMP echo and classifies the outcome. IPv4 only, matching
+// the Windows implementation. A free function rather than a method so each
+// platform type (linuxPlatform, darwinPlatform) can wrap it.
+func icmpPing(ctx context.Context, target string, opts PingOptions) (PingResult, error) {
 	res := PingResult{Target: target}
 
 	ip := net.ParseIP(target)
@@ -142,7 +144,13 @@ func (linuxPlatform) Ping(ctx context.Context, target string, opts PingOptions) 
 			res.Reason = telemetry.ProbeReasonTimeout
 			return res, nil
 		}
-		rm, perr := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), rb[:n])
+		buf := rb[:n]
+		// darwin's datagram ICMP socket delivers the full IP packet; the ICMP
+		// message starts after the IPv4 header (see icmp_dgram_darwin.go).
+		if mode == icmpDatagram && datagramReplyHasIPHeader {
+			buf = trimIPv4Header(buf)
+		}
+		rm, perr := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), buf)
 		if perr != nil {
 			continue
 		}

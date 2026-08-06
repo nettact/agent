@@ -50,11 +50,14 @@ type IPv4Default struct {
 	// Gateway is the route's next hop, never the unspecified address: an on-link
 	// default (0.0.0.0 / `default dev tun0`) has no gateway to name or ping.
 	Gateway string
-	// Metric is the route's effective cost, lower winning. Windows ranks by the
-	// route metric plus the interface metric, so that sum is what this carries;
-	// Linux uses the route's RTA_PRIORITY. Nil when the platform reports a default
-	// route but no cost for it — never a synthetic zero, which on Linux is a real
-	// and best-possible metric.
+	// Metric is the platform's own ranking of this route, lower winning. Windows
+	// ranks by the route metric plus the interface metric, so that sum is what
+	// this carries; Linux uses the route's RTA_PRIORITY; macOS has no numeric
+	// route cost, so this carries the kernel's two-level preference instead — 0
+	// for the unscoped (primary) default route, 1 for an RTF_IFSCOPE (scoped)
+	// one. Nil when the platform reports a default route but expressed no
+	// preference for it — never a value invented where the OS stated none, which
+	// on Linux would collide with 0 being a real and best-possible metric.
 	Metric *int
 }
 

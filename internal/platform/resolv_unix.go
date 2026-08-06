@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package platform
 
@@ -12,12 +12,14 @@ import (
 	"github.com/nettact/agent/internal/hostfs"
 )
 
-// Linux resolves names through a single system-wide resolver list
-// (/etc/resolv.conf), not a per-adapter one the way Windows does. The interface
-// collector's DNS field is therefore filled from that one list and attached to
-// the interfaces that carry a default route — the ones actually reaching those
-// servers. Reporting the same list on every interface (including loopback and
-// down ones) would invent per-interface configuration that does not exist.
+// Linux and macOS both resolve names through a single system-wide resolver list
+// (/etc/resolv.conf; on macOS configd maintains that file as a mirror of the
+// primary resolver configuration), not a per-adapter one the way Windows does.
+// The interface collector's DNS field is therefore filled from that one list and
+// attached to the interfaces that carry a default route — the ones actually
+// reaching those servers. Reporting the same list on every interface (including
+// loopback and down ones) would invent per-interface configuration that does not
+// exist.
 
 // parseResolvConf extracts the nameserver addresses from a resolv.conf stream,
 // in file order and without duplicates. Comments (# or ;) and any other

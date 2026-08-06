@@ -862,10 +862,10 @@ func probeMachine(ctx context.Context, cfg Config, p platform.Platform) machineC
 	// Both traceroute modes are runtime capabilities owned by the traceroute
 	// engine, which is the only component that knows what observing intermediate
 	// Time-Exceeded responders costs on each OS: Administrator on Windows for TCP,
-	// a raw ICMP socket (CAP_NET_RAW/root) on Linux for either mode. Asking it
-	// keeps one answer per mode instead of a platform layer and an engine
-	// disagreeing. Effective stays supported∩granted, so desktop FullAccess
-	// remains capability-gated.
+	// a raw ICMP socket (root / CAP_NET_RAW) on Linux and macOS for either mode.
+	// Asking it keeps one answer per mode instead of a platform layer and an
+	// engine disagreeing. Effective stays supported∩granted, so desktop
+	// FullAccess remains capability-gated.
 	icmpTraceCap, tcpTraceCap := traceroute.Supported()
 	if icmpTraceCap {
 		caps.base.Add(permission.DiagnosticTracerouteICMP)
@@ -1027,9 +1027,10 @@ func subprotocolFor(format string) (string, error) {
 // platformIndependentSupported returns the permissions that work on every OS via
 // the Go stdlib (DNS/HTTP/TCP/NAT probes) or the always-compiled gopsutil host
 // metric and process/connection snapshot collectors; the platform adds ICMP,
-// gateway, wifi, and neighbor support where implemented.
+// gateway, wifi, and neighbor support where implemented. "Always compiled" is
+// not quite "always works": the one OS-shaped exception is carved out below.
 func platformIndependentSupported() permission.Set {
-	return permission.NewSet(
+	s := permission.NewSet(
 		// Active probes backed by the Go stdlib.
 		permission.ProbeDNS,
 		permission.ProbeHTTP,
@@ -1052,13 +1053,20 @@ func platformIndependentSupported() permission.Set {
 		permission.HostProcessBasicRead,
 		permission.HostProcessOwnerRead,
 		permission.HostProcessResourceRead,
-		permission.HostProcessIORead,
 		// Connection snapshot scopes — gopsutil/net, compiled everywhere.
 		permission.HostConnectionSummaryRead,
 		permission.HostConnectionLocalRead,
 		permission.HostConnectionRemoteRead,
 		permission.HostConnectionOwnerRead,
 	)
+	// Per-process I/O counters compile everywhere but gopsutil cannot read them
+	// on macOS without cgo (IOCountersWithContext returns ErrNotImplementedError
+	// there), so the read always fails — advertising the permission would let it
+	// be granted and shown as effective while never producing a byte of data.
+	if runtime.GOOS != "darwin" {
+		s.Add(permission.HostProcessIORead)
+	}
+	return s
 }
 
 // gameProbeGranted reports whether the local policy authorizes looking for the

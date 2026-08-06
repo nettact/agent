@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package traceroute
 
@@ -14,20 +14,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Linux TTL probes. Both modes need to OBSERVE the ICMP Time-Exceeded replies
-// intermediate routers send back, and on Linux only a raw ICMP socket
-// (CAP_NET_RAW, which root has) delivers those as readable packets — an
-// unprivileged ping socket can send echoes but its ICMP errors go to the socket
-// error queue instead. So a single raw-socket check gates both modes, the same
-// shape as the Windows elevation check gating TCP there.
+// Linux and macOS TTL probes. Both modes need to OBSERVE the ICMP Time-Exceeded
+// replies intermediate routers send back, and on both OSes only a raw ICMP
+// socket (root; CAP_NET_RAW on Linux) is known to deliver those as readable
+// packets — Linux's unprivileged ping socket routes its ICMP errors to the
+// socket error queue instead, and whether macOS's unprivileged datagram ICMP
+// socket delivers them readably is unverified on real hardware, so it is
+// deliberately not relied on here. A single raw-socket check therefore gates
+// both modes, the same shape as the Windows elevation check gating TCP there.
 //
 // Sending the probe itself needs no privilege in either mode: the TTL is an
 // ordinary IP_TTL socket option.
 
 // detectCapabilities reports whether this process can run traceroute at all,
-// which on Linux is exactly "can it open a raw ICMP socket".
+// which here is exactly "can it open a raw ICMP socket".
 func detectCapabilities() capabilities {
-	s, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_ICMP)
+	s, err := sysSocket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
 	if err != nil {
 		return capabilities{}
 	}
@@ -131,7 +133,7 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 	}
 	ip4 := dest.As4()
 
-	raw, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_ICMP)
+	raw, err := sysSocket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
 	if err != nil {
 		return probeOutcome{}, errUnsupported // raw-socket capability lost since startup
 	}
@@ -142,7 +144,7 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 		return probeOutcome{}, errUnsupported
 	}
 
-	tcp, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	tcp, err := sysSocket(unix.AF_INET, unix.SOCK_STREAM, unix.IPPROTO_TCP)
 	if err != nil {
 		return probeOutcome{}, err
 	}
