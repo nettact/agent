@@ -446,7 +446,7 @@ YAML
   if ! wait_enrolled docker exec nettact-agent test -f /agent-data/agent.json; then
     docker logs --tail 30 nettact-agent >&2 || true
     compose down --remove-orphans >/dev/null 2>&1 || true
-    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). The container was removed; fix the problem, generate a fresh token in the console, and re-run this command."
+    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). The container was removed; fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and re-run this command."
   fi
   # Enrollment succeeded, but the restart policy would also mask an Agent that
   # crashes right after it: the credential survives restarts, so agent.json
@@ -459,7 +459,7 @@ YAML
      [ "$(docker inspect -f '{{.State.StartedAt}}' nettact-agent 2>/dev/null)" != "$STARTED_AT" ]; then
     docker logs --tail 30 nettact-agent >&2 || true
     compose down --remove-orphans >/dev/null 2>&1 || true
-    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). The container was removed; fix the problem, generate a fresh token in the console, and re-run this command."
+    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). The container was removed; fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and re-run this command."
   fi
   if $AUTO_UPDATE; then
     # Added only now, for the same reason it was torn down first: an updater
@@ -610,7 +610,7 @@ EOF
   if ! wait_enrolled test -f "$DATA_DIR/agent.json"; then
     journalctl -u nettact-agent.service -n 30 --no-pager >&2 || true
     systemctl disable --now nettact-agent.service >/dev/null 2>&1 || true
-    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). Nothing was left running; fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and re-run this command."
   fi
   # Enrollment succeeded, but Restart=always would also mask an Agent that
   # crashes right after it: the credential survives restarts, so agent.json
@@ -623,7 +623,7 @@ EOF
      [ "$(systemctl show -p ActiveEnterTimestampMonotonic nettact-agent.service 2>/dev/null)" != "$STARTED" ]; then
     journalctl -u nettact-agent.service -n 30 --no-pager >&2 || true
     systemctl disable --now nettact-agent.service >/dev/null 2>&1 || true
-    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). Nothing was left running; fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and re-run this command."
   fi
   log "SUCCESS: Agent enrolled and running (logs: journalctl -u nettact-agent -f)"
 else
@@ -657,7 +657,7 @@ EOF
     tail -n 30 /var/log/nettact-agent.log >&2 2>/dev/null || true
     launchctl bootout system/org.nettact.agent >/dev/null 2>&1 || true
     rm -f "$PLIST"
-    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+    die "INSTALL FAILED: the Agent could not enroll with $SERVER_URL (see its log above). Nothing was left running; fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and re-run this command."
   fi
   # Enrollment succeeded, but KeepAlive would also mask an Agent that crashes
   # right after it: the credential survives restarts, so agent.json alone
@@ -669,7 +669,7 @@ EOF
     tail -n 30 /var/log/nettact-agent.log >&2 2>/dev/null || true
     launchctl bootout system/org.nettact.agent >/dev/null 2>&1 || true
     rm -f "$PLIST"
-    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). Nothing was left running; fix the problem, generate a fresh token in the console, and re-run this command."
+    die "INSTALL FAILED: the Agent enrolled but did not stay running (see its log above). Nothing was left running; fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and re-run this command."
   fi
   log "SUCCESS: Agent enrolled and running (logs: tail -f /var/log/nettact-agent.log)"
 fi

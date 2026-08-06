@@ -733,7 +733,9 @@ func Run(ctx context.Context, cfg Config) error {
 	// On revocation the credential is dead; delete it here so re-running enrolls
 	// fresh (keeps credential-file knowledge inside the agent module and fixes the
 	// standalone wart of a revoked agent redialing 4004 forever). The ed25519 key
-	// is kept, so re-enrollment reuses the same identity.
+	// is kept: with a console-issued reinstall token (AGENT-006) the next enrollment
+	// rejoins under the SAME agent_id and keeps its history; without one it
+	// registers a brand-new agent.
 	if errors.Is(err, ErrRevoked) {
 		if derr := identity.DeleteCredential(cfg.DataDir); derr != nil {
 			// The stale credential is still on disk (permissions, antivirus lock,

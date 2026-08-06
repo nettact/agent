@@ -201,7 +201,7 @@ try {
         foreach ($line in $output) {
             Write-Host "    $line"
         }
-        Write-Host "Nothing was left running. Fix the problem, generate a fresh token in the console, and run the install command again."
+        Write-Host "Nothing was left running. Fix the problem, then generate a token in the console (for a reinstall of this machine, open the Agent in the console and choose Reinstall) and run the install command again."
         throw "Installation failed: the Agent could not enroll. See its output above."
     }
 } finally {
