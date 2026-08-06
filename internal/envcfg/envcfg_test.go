@@ -20,7 +20,7 @@ func mapLookup(values map[string]string) Lookup {
 
 func TestLoadPermissionModesAndDefaults(t *testing.T) {
 	base := map[string]string{"NETTACT_AGENT_SERVER_URL": "https://server.example"}
-	cfg, err := Load(mapLookup(base))
+	cfg, err := Load(mapLookup(base), File{})
 	if err != nil {
 		t.Fatalf("Load(defaults): %v", err)
 	}
@@ -35,7 +35,7 @@ func TestLoadPermissionModesAndDefaults(t *testing.T) {
 		"NETTACT_AGENT_SERVER_URL":  "https://server.example",
 		"NETTACT_AGENT_PERMISSIONS": "none",
 	}
-	cfg, err = Load(mapLookup(none))
+	cfg, err = Load(mapLookup(none), File{})
 	if err != nil {
 		t.Fatalf("Load(none): %v", err)
 	}
@@ -47,7 +47,7 @@ func TestLoadPermissionModesAndDefaults(t *testing.T) {
 		"NETTACT_AGENT_SERVER_URL":  "https://server.example",
 		"NETTACT_AGENT_PERMISSIONS": "host.process.basic.read,host.process.owner.read",
 	}
-	cfg, err = Load(mapLookup(explicit))
+	cfg, err = Load(mapLookup(explicit), File{})
 	if err != nil {
 		t.Fatalf("Load(explicit): %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoadRejectsInvalidPermissionSets(t *testing.T) {
 			_, err := Load(mapLookup(map[string]string{
 				"NETTACT_AGENT_SERVER_URL":  "https://server.example",
 				"NETTACT_AGENT_PERMISSIONS": tt.value,
-			}))
+			}), File{})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Load(%q) error = %v, want substring %q", tt.value, err, tt.want)
 			}
@@ -88,7 +88,7 @@ func TestLoadRejectsOversizedTokenFile(t *testing.T) {
 	_, err := Load(mapLookup(map[string]string{
 		"NETTACT_AGENT_SERVER_URL":        "https://server.example",
 		"NETTACT_AGENT_ENROLL_TOKEN_FILE": path,
-	}))
+	}), File{})
 	if err == nil || !strings.Contains(err.Error(), "is too large") {
 		t.Fatalf("oversized token error = %v, want safe size rejection", err)
 	}

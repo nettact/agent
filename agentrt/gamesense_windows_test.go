@@ -477,7 +477,23 @@ func TestStrictModeWithNoProfilesCapturesNothing(t *testing.T) {
 // A sensor that is installed but cannot collect must not be reported as capable,
 // and must not leave the operator guessing why: the event carries the reason
 // that the permission report structurally cannot.
+// forgetBlockedSensor clears the process-wide "already reported" record so a
+// test that asserts the blocked-sensor event is emitted actually gets one.
+//
+// The record exists so a supervisor re-running Run in the same process does not
+// re-report an unchanged sensor. Tests run in one process too, and the sensor
+// path and reason are identical across them, so without this the SECOND test to
+// assert the event — or the same test under -count=2 — waits for something the
+// agent deliberately suppressed and times out.
+func forgetBlockedSensor(t *testing.T) {
+	t.Helper()
+	blockedSensor.Lock()
+	blockedSensor.reported = nil
+	blockedSensor.Unlock()
+}
+
 func TestBlockedSensorIsUnsupportedAndExplained(t *testing.T) {
+	forgetBlockedSensor(t)
 	t.Setenv(mockSensorEnv, "blocked")
 	t.Setenv(gamesense.PathEnv, testExecutable(t))
 
@@ -520,6 +536,7 @@ func TestBlockedSensorIsUnsupportedAndExplained(t *testing.T) {
 // already had. The event says it happened at this moment; the report says it is
 // the state now, and the console can only act on the second.
 func TestStaleSensorReportsTheProtocolMismatch(t *testing.T) {
+	forgetBlockedSensor(t)
 	t.Setenv(mockSensorEnv, "stale")
 	t.Setenv(gamesense.PathEnv, testExecutable(t))
 
@@ -879,8 +896,8 @@ func runAgentUnder(t *testing.T, f *fake, policy permission.Policy, linger time.
 	}
 	t.Setenv(mockSensorGPUFlagEnv, flag)
 
-	dataDir := t.TempDir()
-	if err := identity.SaveCredential(dataDir, identity.Credential{
+	dataDir := agentDataDir(t)
+	if err := identity.SaveCredential(dataDir, "default", identity.Credential{
 		AgentID: "agent-test", SiteID: "site-test", AgentToken: "test-token",
 	}); err != nil {
 		t.Fatalf("save credential: %v", err)
@@ -891,7 +908,8 @@ func runAgentUnder(t *testing.T, f *fake, policy permission.Policy, linger time.
 	go func() {
 		defer close(stopped)
 		_ = Run(ctx, Config{
-			ServerURL: f.srv.URL, DataDir: dataDir, WireFormat: "json",
+			Servers: []ServerConfig{{Name: "default", URL: f.srv.URL}},
+			DataDir: dataDir, WireFormat: "json",
 			UploadInterval: 200 * time.Millisecond,
 			Policy:         policy,
 		})

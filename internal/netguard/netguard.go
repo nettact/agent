@@ -17,15 +17,80 @@ import (
 	"github.com/nettact/agent/probepolicy"
 )
 
-// Guard evaluates and enforces one immutable probe-access policy.
+// Guard evaluates and enforces one or more immutable probe-access policies.
+//
+// More than one because an agent may report to several servers and each may be
+// given a tighter target-access policy than the machine's (AGENT-007 phase 2).
+// The layers are a conjunction, not a merge: a destination must satisfy EVERY
+// layer, so the agent-wide policy is a floor the machine owner sets and a server
+// entry can only ever narrow it. There is deliberately no way to express the
+// other direction — a per-server policy that widened the floor would let a
+// configured server reach somewhere the owner of the machine said it may not.
 type Guard struct {
-	policy probepolicy.Policy
+	layers []probepolicy.Policy
 	bypass bool
 }
 
 // New builds a Guard. bypass=true (desktop FullAccess) allows everything.
 func New(policy probepolicy.Policy, bypass bool) *Guard {
-	return &Guard{policy: policy, bypass: bypass}
+	return &Guard{layers: []probepolicy.Policy{policy}, bypass: bypass}
+}
+
+// Narrow returns a Guard enforcing everything the receiver does AND p. The
+// receiver is unchanged, so one machine-wide guard can spawn a tightened view
+// per server without any of them affecting each other.
+//
+// Narrowing a bypass guard yields a guard over p alone. Bypass is "the floor
+// allows everything", so a conjunction with it is just p — and keeping the
+// bypass flag instead would silently discard the narrowing, which is the one
+// outcome that must not be possible.
+func (g *Guard) Narrow(p probepolicy.Policy) *Guard {
+	if g.bypass {
+		return &Guard{layers: []probepolicy.Policy{p}}
+	}
+	layers := make([]probepolicy.Policy, 0, len(g.layers)+1)
+	layers = append(layers, g.layers...)
+	layers = append(layers, p)
+	return &Guard{layers: layers}
+}
+
+// checkAddr runs the address check against every layer and returns the first
+// refusal, so the reported selector is the one that actually blocked the dial.
+//
+// auth carries, per layer, whether that layer already authorized the hostname
+// being dialed (nil for a literal IP, where no name was involved). A layer that
+// did gets the deny-only check, exactly as a single-policy guard always has; the
+// rest get the full check.
+//
+// Per layer, and not one flag for the whole guard, because the layers can
+// authorize the same target by different means: a machine floor may allow
+// `host:api.example.com` while a server's narrowing allows `cidr:10.0.0.0/8`.
+// Both are satisfied, but a single flag has to pick one interpretation for
+// everyone — and "not every layer authorized the name" forces the full check
+// onto the floor too, where the resolved address has no allow of its own and the
+// probe is refused. That is a legitimate configuration silently failing.
+func (g *Guard) checkAddr(auth []bool, a netip.Addr) probepolicy.Decision {
+	for i := range g.layers {
+		if auth != nil && auth[i] {
+			if denied, m := g.layers[i].DeniedAddr(a); denied {
+				return probepolicy.Decision{Allowed: false, Matched: m}
+			}
+			continue
+		}
+		if dec := g.layers[i].CheckAddr(a); !dec.Allowed {
+			return dec
+		}
+	}
+	return probepolicy.Decision{Allowed: true}
+}
+
+// hostAuth is the per-layer name authorization for one hostname.
+func (g *Guard) hostAuth(host string) []bool {
+	out := make([]bool, len(g.layers))
+	for i := range g.layers {
+		out[i] = g.layers[i].CheckHost(host).NameAuthorized
+	}
+	return out
 }
 
 // BlockedError reports a destination refused by policy. FromResolve marks a block
@@ -53,7 +118,7 @@ func (g *Guard) CheckAddr(a netip.Addr) probepolicy.Decision {
 	if g.bypass {
 		return probepolicy.Decision{Allowed: true}
 	}
-	return g.policy.CheckAddr(a)
+	return g.checkAddr(nil, a)
 }
 
 // CheckAddrString parses a literal IP and checks it. A non-IP string is treated
@@ -84,16 +149,20 @@ func (g *Guard) CheckGateway(a netip.Addr, osGateways []netip.Addr) probepolicy.
 	if !present {
 		return probepolicy.Decision{Allowed: false}
 	}
-	// Only an explicit ip:/cidr: deny overrides the gateway exception.
-	for _, s := range g.policy.Deny {
-		switch s.Kind {
-		case probepolicy.KindIP:
-			if s.Addr.Unmap() == a {
-				return probepolicy.Decision{Allowed: false, Matched: s.String()}
-			}
-		case probepolicy.KindCIDR:
-			if s.Prefix.Contains(a) {
-				return probepolicy.Decision{Allowed: false, Matched: s.String()}
+	// Only an explicit ip:/cidr: deny overrides the gateway exception — in any
+	// layer, since a server-level narrowing that names the gateway means it just
+	// as much as the machine-wide policy does.
+	for i := range g.layers {
+		for _, s := range g.layers[i].Deny {
+			switch s.Kind {
+			case probepolicy.KindIP:
+				if s.Addr.Unmap() == a {
+					return probepolicy.Decision{Allowed: false, Matched: s.String()}
+				}
+			case probepolicy.KindCIDR:
+				if s.Prefix.Contains(a) {
+					return probepolicy.Decision{Allowed: false, Matched: s.String()}
+				}
 			}
 		}
 	}
@@ -101,10 +170,17 @@ func (g *Guard) CheckGateway(a netip.Addr, osGateways []netip.Addr) probepolicy.
 }
 
 // ResolveVetted resolves host once and returns the addresses that survive the
-// policy: deny-only when the name is already authorized (a host:/name allow
-// matched, or denylist mode), full CheckAddr otherwise. An empty result is a
-// *BlockedError with FromResolve set.
+// policy: per layer, deny-only where that layer already authorized the name (a
+// host:/name allow matched, or denylist mode) and the full CheckAddr where it
+// did not. An empty result is a *BlockedError with FromResolve set.
+//
+// nameAuthorized is the caller's aggregate answer from CheckHost. It is accepted
+// but not used to decide: the authorization is re-derived per layer from host,
+// which is the only form that stays correct when the layers authorize by
+// different means (see checkAddr). A single-policy guard — every standalone
+// agent — behaves exactly as before either way.
 func (g *Guard) ResolveVetted(ctx context.Context, host string, nameAuthorized bool) ([]netip.Addr, error) {
+	_ = nameAuthorized
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return nil, err
@@ -116,23 +192,15 @@ func (g *Guard) ResolveVetted(ctx context.Context, host string, nameAuthorized b
 		}
 		return out, nil
 	}
+	auth := g.hostAuth(host)
 	var out []netip.Addr
 	var lastMatched string
 	for _, a := range addrs {
 		a = a.Unmap()
-		if nameAuthorized {
-			if denied, m := g.policy.DeniedAddr(a); denied {
-				lastMatched = m
-				continue
-			}
+		if dec := g.checkAddr(auth, a); dec.Allowed {
 			out = append(out, a)
 		} else {
-			dec := g.policy.CheckAddr(a)
-			if dec.Allowed {
-				out = append(out, a)
-			} else {
-				lastMatched = dec.Matched
-			}
+			lastMatched = dec.Matched
 		}
 	}
 	if len(out) == 0 {
@@ -160,7 +228,7 @@ func (g *Guard) DialContext(ctx context.Context, network, address string) (net.C
 		}
 		// A literal IP is authorized by the full check; the backstop re-runs the
 		// same full check on the settled address.
-		d := &net.Dialer{Control: g.control(false)}
+		d := &net.Dialer{Control: g.control(nil)}
 		return d.DialContext(ctx, network, address)
 	}
 
@@ -173,11 +241,11 @@ func (g *Guard) DialContext(ctx context.Context, network, address string) (net.C
 		return nil, err
 	}
 	// The backstop must apply the same semantics that vetted the addresses:
-	// deny-only when the name was authorized (a host:/name allow, or denylist
-	// mode), full CheckAddr otherwise — otherwise a name-authorized address that
-	// legitimately lacks an independent ip:/scope: allow is rejected at syscall
-	// time in allowlist mode.
-	d := &net.Dialer{Control: g.control(hd.NameAuthorized)}
+	// per layer, deny-only where that layer authorized the name (a host:/name
+	// allow, or denylist mode) and full CheckAddr where it did not — otherwise a
+	// name-authorized address that legitimately lacks an independent ip:/scope:
+	// allow is rejected at syscall time in allowlist mode.
+	d := &net.Dialer{Control: g.control(g.hostAuth(host))}
 	var lastErr error
 	for _, a := range vetted {
 		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
@@ -194,16 +262,20 @@ func (g *Guard) DialContext(ctx context.Context, network, address string) (net.C
 
 // DialVettedAddrs dials already-vetted addresses in order and returns the first
 // successful connection, applying the SAME syscall backstop the resolution used:
-// deny-only when the hostname was authorized (a host:/name allow, or denylist
-// mode), full CheckAddr otherwise. It exists for probes that resolve a hostname
-// separately — e.g. to time DNS apart from the connect — yet must keep everything
-// DialContext gives a hostname dial: the per-address fallback AND the
-// name-authorization contract (so a host:-only allowlist entry is not rejected
-// when the resolved IP lacks an independent ip:/cidr: allow). addrs must already
-// be policy-vetted (from ResolveVetted); only the literal IPs are dialed, never
-// the raw name.
-func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []netip.Addr, port string, nameAuthorized bool) (net.Conn, error) {
-	d := &net.Dialer{Control: g.control(nameAuthorized)}
+// per layer, deny-only where that layer authorized the hostname (a host:/name
+// allow, or denylist mode) and full CheckAddr where it did not. It exists for
+// probes that resolve a hostname separately — e.g. to time DNS apart from the
+// connect — yet must keep everything DialContext gives a hostname dial: the
+// per-address fallback AND the name-authorization contract (so a host:-only
+// allowlist entry is not rejected when the resolved IP lacks an independent
+// ip:/cidr: allow). addrs must already be policy-vetted (from ResolveVetted);
+// only the literal IPs are dialed, never the raw name.
+//
+// host is the name those addresses were resolved from, and it is what the
+// backstop re-derives the per-layer authorization from — a bool could not, since
+// different layers may authorize the same target by different means.
+func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []netip.Addr, port, host string) (net.Conn, error) {
+	d := &net.Dialer{Control: g.control(g.hostAuth(host))}
 	var lastErr error
 	for _, a := range addrs {
 		conn, err := d.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
@@ -219,18 +291,36 @@ func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []net
 }
 
 // checkHost applies the hostname pre-resolution check (bypass authorizes all).
+//
+// Across layers: a conclusive deny in ANY layer denies, and the name counts as
+// authorized only when EVERY layer authorizes it. The conjunction has to run
+// that way round — a name allowed by one layer's host: selector but not by
+// another's still has to have its resolved addresses checked in full against
+// that other layer, or the narrower policy would be satisfied by a name it never
+// mentioned.
 func (g *Guard) checkHost(host string) probepolicy.HostDecision {
 	if g.bypass {
 		return probepolicy.HostDecision{NameAuthorized: true}
 	}
-	return g.policy.CheckHost(host)
+	out := probepolicy.HostDecision{NameAuthorized: true}
+	for i := range g.layers {
+		d := g.layers[i].CheckHost(host)
+		if d.Denied {
+			return d
+		}
+		if !d.NameAuthorized {
+			out.NameAuthorized = false
+		}
+	}
+	return out
 }
 
 // control returns a Dialer.Control backstop that re-checks the concrete address
 // the dialer settled on, so even a path that slipped past cannot dial a denied
-// address. It mirrors the semantics that vetted the address: deny-only when the
-// name was authorized, full CheckAddr otherwise.
-func (g *Guard) control(nameAuthorized bool) func(network, address string, c syscall.RawConn) error {
+// address. It mirrors the semantics that vetted the address: per layer,
+// deny-only where that layer authorized the name, full CheckAddr where it did
+// not. auth is nil for a literal-IP dial, where no name was involved.
+func (g *Guard) control(auth []bool) func(network, address string, c syscall.RawConn) error {
 	return func(network, address string, c syscall.RawConn) error {
 		if g.bypass {
 			return nil
@@ -243,14 +333,7 @@ func (g *Guard) control(nameAuthorized bool) func(network, address string, c sys
 		if err != nil {
 			return nil
 		}
-		a = a.Unmap()
-		if nameAuthorized {
-			if denied, m := g.policy.DeniedAddr(a); denied {
-				return &BlockedError{Target: host, Matched: m}
-			}
-			return nil
-		}
-		if dec := g.policy.CheckAddr(a); !dec.Allowed {
+		if dec := g.checkAddr(auth, a.Unmap()); !dec.Allowed {
 			return &BlockedError{Target: host, Matched: dec.Matched}
 		}
 		return nil

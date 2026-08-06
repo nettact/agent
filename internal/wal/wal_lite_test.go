@@ -15,11 +15,18 @@ import (
 // rules as the default build, minus durability, plus a bounded buffer that sheds
 // its oldest whole groups rather than growing without limit.
 
+// srvA and srvB are configured server names, mirroring the default build's
+// helpers so the two suites read the same.
+const (
+	srvA = "alpha"
+	srvB = "beta"
+)
+
 func openLite(t *testing.T) *Store {
 	t.Helper()
 	// The path is ignored, but a real-looking one is passed to keep the call
 	// identical to the production one in agentrt.
-	s, err := Open(t.TempDir() + "/wal")
+	s, err := Open(t.TempDir()+"/wal", []string{srvA})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -36,13 +43,13 @@ func metric(v float64) telemetry.Metric {
 // carrying a telemetry backlog.
 func TestLiteStoreCreatesNoFile(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir + "/wal")
+	s, err := Open(dir+"/wal", []string{srvA})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer s.Close()
 	for i := 0; i < 50; i++ {
-		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}); err != nil {
+		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}, srvA); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
@@ -56,13 +63,13 @@ func TestLiteStoreCreatesNoFile(t *testing.T) {
 func TestLiteFIFOAndWholeGroups(t *testing.T) {
 	s := openLite(t)
 	for i := 0; i < 3; i++ {
-		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i)), metric(float64(i) + 0.5)}}); err != nil {
+		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i)), metric(float64(i) + 0.5)}}, srvA); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
 	// maxItems 3 cannot fit a second 2-row group, so exactly one group is claimed
 	// — a group is never split to fill the packet.
-	b, ok, err := s.NextBatch(3)
+	b, ok, err := s.NextBatch(srvA, 3)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch = (%v, %v)", ok, err)
 	}
@@ -72,10 +79,10 @@ func TestLiteFIFOAndWholeGroups(t *testing.T) {
 	if b.Metrics[0].Value != 0 {
 		t.Fatalf("first metric = %v, want the oldest (0)", b.Metrics[0].Value)
 	}
-	if err := s.Ack(b.Sequence); err != nil {
+	if err := s.Ack(srvA, b.Sequence); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	next, ok, err := s.NextBatch(3)
+	next, ok, err := s.NextBatch(srvA, 3)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch after ack = (%v, %v)", ok, err)
 	}
@@ -95,10 +102,10 @@ func TestLiteOversizedGroupStillProgresses(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		big.Metrics = append(big.Metrics, metric(float64(i)))
 	}
-	if _, err := s.Append(big); err != nil {
+	if _, err := s.Append(big, srvA); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	b, ok, err := s.NextBatch(3)
+	b, ok, err := s.NextBatch(srvA, 3)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch = (%v, %v)", ok, err)
 	}
@@ -111,18 +118,18 @@ func TestLiteOversizedGroupStillProgresses(t *testing.T) {
 // session re-sends it and the server dedups rather than the agent losing it.
 func TestLiteUnackedBatchIsReserved(t *testing.T) {
 	s := openLite(t)
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	first, _, err := s.NextBatch(100)
+	first, _, err := s.NextBatch(srvA, 100)
 	if err != nil {
 		t.Fatalf("NextBatch: %v", err)
 	}
 	// New telemetry arriving mid-flight must not overtake the claimed packet.
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}, srvA); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	again, ok, err := s.NextBatch(100)
+	again, ok, err := s.NextBatch(srvA, 100)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch = (%v, %v)", ok, err)
 	}
@@ -133,11 +140,11 @@ func TestLiteUnackedBatchIsReserved(t *testing.T) {
 		t.Fatalf("re-served batch = %v, want the original single metric", again.Metrics)
 	}
 	// A stale ack for a sequence that is not in flight is ignored, not an error.
-	if err := s.Ack(first.Sequence + 999); err != nil {
+	if err := s.Ack(srvA, first.Sequence+999); err != nil {
 		t.Fatalf("stale Ack: %v", err)
 	}
-	if s.Pending() != 2 {
-		t.Fatalf("Pending = %d, want 2 (in-flight + buffered)", s.Pending())
+	if s.Pending(srvA) != 2 {
+		t.Fatalf("Pending = %d, want 2 (in-flight + buffered)", s.Pending(srvA))
 	}
 }
 
@@ -148,7 +155,7 @@ func TestLiteEvictsOldestWholeGroups(t *testing.T) {
 	totalDropped := 0
 	// Two rows per group; enough groups to run well past the cap.
 	for i := 0; i < memOnlyMaxRows; i++ {
-		d, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i)), metric(float64(i))}})
+		d, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i)), metric(float64(i))}}, srvA)
 		if err != nil {
 			t.Fatalf("Append: %v", err)
 		}
@@ -157,16 +164,16 @@ func TestLiteEvictsOldestWholeGroups(t *testing.T) {
 	if totalDropped == 0 {
 		t.Fatal("nothing was dropped despite appending far past the cap")
 	}
-	if got := s.Pending(); got > memOnlyMaxRows {
+	if got := s.Pending(srvA); got > memOnlyMaxRows {
 		t.Fatalf("Pending = %d, want it held at or below the %d-row cap", got, memOnlyMaxRows)
 	}
 	// Eviction is whole-group, so the buffer never holds half a Records: an odd
 	// pending count would mean one was split.
-	if s.Pending()%2 != 0 {
-		t.Fatalf("Pending = %d is odd, so a 2-row group was split", s.Pending())
+	if s.Pending(srvA)%2 != 0 {
+		t.Fatalf("Pending = %d is odd, so a 2-row group was split", s.Pending(srvA))
 	}
 	// The survivors are the NEWEST ones.
-	b, ok, err := s.NextBatch(2)
+	b, ok, err := s.NextBatch(srvA, 2)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch = (%v, %v)", ok, err)
 	}
@@ -222,13 +229,13 @@ func TestLiteInitialSeq(t *testing.T) {
 
 func TestLiteFlushAndPendingAreCheap(t *testing.T) {
 	s := openLite(t)
-	if s.Pending() != 0 {
-		t.Fatalf("Pending on a fresh store = %d, want 0", s.Pending())
+	if s.Pending(srvA) != 0 {
+		t.Fatalf("Pending on a fresh store = %d, want 0", s.Pending(srvA))
 	}
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush on an empty store: %v", err)
 	}
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1), metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1), metric(2)}}, srvA); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	// Flush cannot make anything durable here, but it must not drop the buffer
@@ -236,7 +243,7 @@ func TestLiteFlushAndPendingAreCheap(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	if s.Pending() != 2 {
-		t.Fatalf("Pending after Flush = %d, want the 2 still-queued samples", s.Pending())
+	if s.Pending(srvA) != 2 {
+		t.Fatalf("Pending after Flush = %d, want the 2 still-queued samples", s.Pending(srvA))
 	}
 }

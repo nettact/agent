@@ -107,7 +107,6 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	// what the proxy is asked to connect to, so the defense survives the proxy.
 	literal := false
 	var vetted []netip.Addr
-	nameAuthorized := false
 	var dnsMs float64
 	haveDNS := false
 	if _, perr := netip.ParseAddr(t.Target); perr == nil {
@@ -152,7 +151,6 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		dnsMs = msSince(r0)
 		haveDNS = true
 		vetted = v
-		nameAuthorized = hd.NameAuthorized
 	}
 
 	// Phase 2 — pure TCP connect. Timed alone, so connect_ms excludes DNS and TLS.
@@ -177,7 +175,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	case literal:
 		conn, dialErr = c.guard.DialContext(cctx, "tcp", addr)
 	default:
-		conn, dialErr = c.guard.DialVettedAddrs(cctx, "tcp", vetted, port, nameAuthorized)
+		conn, dialErr = c.guard.DialVettedAddrs(cctx, "tcp", vetted, port, t.Target)
 	}
 	connectMs := msSince(c0)
 	connectOK := dialErr == nil

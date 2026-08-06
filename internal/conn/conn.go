@@ -71,6 +71,12 @@ const (
 // Options configure the connection itself: where to dial, how to authenticate,
 // and the static identity the server sees.
 type Options struct {
+	// ServerName is this session's key in the agent's per-server state: which WAL
+	// cursor it drains and which credential it holds. It is the configured entry
+	// name, not the URL or the agent id, because those are respectively editable
+	// and assigned by the very enrollment the name has to survive.
+	ServerName string
+
 	ServerURL string // e.g. http://localhost:8080; scheme maps http→ws, https→wss
 	Token     string // bearer token presented on the upgrade request
 	Insecure  bool   // skip TLS verification (LAN self-signed dev)
@@ -243,7 +249,7 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// staying open for up to memBufferAge. Same goroutine as every other WAL
 		// access; on shutdown Close flushes again, which is an idempotent no-op.
 		if ferr := r.deps.Outbox.Flush(); ferr != nil {
-			log.Printf("flush outbox after session end: %v", ferr)
+			r.logf("flush outbox after session end: %v", ferr)
 		}
 		if ctx.Err() != nil {
 			return nil // shutdown: the session already sent the close frame
@@ -266,7 +272,7 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		delay := bo.next()
 		// One line per attempt; backoff caps this at ~2 lines/min steady-state,
 		// so an unreachable server doesn't flood the log.
-		log.Printf("session ended: %v; reconnecting in %s", err, delay.Round(time.Millisecond))
+		r.logf("session ended: %v; reconnecting in %s", err, delay.Round(time.Millisecond))
 		select {
 		case <-ctx.Done():
 			return nil
@@ -289,6 +295,14 @@ type runner struct {
 	// edit leaves this untouched (see applyPush).
 	appliedGameVersion int
 	lastSnapshotAt     time.Time
+}
+
+// logf writes a session log line tagged with the server it belongs to. Every
+// configured server has a runner of its own writing to the same log, and lines
+// like "session ended, reconnecting" or "applied config v7" mean nothing without
+// knowing which one said them.
+func (r *runner) logf(format string, args ...any) {
+	log.Printf("[%s] "+format, append([]any{r.opts.ServerName}, args...)...)
 }
 
 // session runs one connection lifecycle: dial, Hello, then the frame loop
@@ -520,11 +534,11 @@ func (r *runner) clearInflight(aw *asyncWork, f wire.Frame) {
 // sees concurrent claims.
 func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, aw *asyncWork) error {
 	for i := 0; i < maxBatchesPerDrain; i++ {
-		batch, ok, err := r.deps.Outbox.NextBatch(batchItems)
+		batch, ok, err := r.deps.Outbox.NextBatch(r.opts.ServerName, batchItems)
 		if err != nil {
 			// A WAL read error is local and usually transient (busy timeout);
 			// keep the session alive and retry next tick, as the old loop did.
-			log.Printf("wal next batch: %v", err)
+			r.logf("wal next batch: %v", err)
 			return nil
 		}
 		if !ok {
@@ -566,15 +580,15 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 		// persistence failure we do NOT delete the batch and yield the drain: the
 		// same sequence is retried on the next tick, not in a tight loop.
 		if err := r.deps.Outbox.FastForward(ack.HighestSequence); err != nil {
-			log.Printf("wal fast-forward to watermark=%d: %v", ack.HighestSequence, err)
+			r.logf("wal fast-forward to watermark=%d: %v", ack.HighestSequence, err)
 			return nil
 		}
-		if err := r.deps.Outbox.Ack(batch.Sequence); err != nil {
-			log.Printf("wal ack seq=%d: %v", batch.Sequence, err)
+		if err := r.deps.Outbox.Ack(r.opts.ServerName, batch.Sequence); err != nil {
+			r.logf("wal ack seq=%d: %v", batch.Sequence, err)
 		}
-		log.Printf("sent seq=%d metrics=%d events=%d inv=%d (watermark=%d, pending=%d)",
+		r.logf("sent seq=%d metrics=%d events=%d inv=%d (watermark=%d, pending=%d)",
 			batch.Sequence, len(pkt.Metrics), len(pkt.Events), len(pkt.InventoryDelta),
-			ack.HighestSequence, r.deps.Outbox.Pending())
+			ack.HighestSequence, r.deps.Outbox.Pending(r.opts.ServerName))
 	}
 	return nil
 }
@@ -648,7 +662,7 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{HostSnapshot: &snap}); err != nil {
 			return fmt.Errorf("write snapshot req=%s: %w", req.RequestID, err)
 		}
-		log.Printf("sent host snapshot req=%s scopes=%d procs=%d conns=%d",
+		r.logf("sent host snapshot req=%s scopes=%d procs=%d conns=%d",
 			req.RequestID, len(snap.Scopes), len(snap.Processes), len(snap.Connections))
 
 	case f.IncidentSnapshotRequest != nil:
@@ -674,12 +688,12 @@ func (r *runner) applyGameConfig(game *pcfg.GameConfig) {
 	// Equal versions re-apply: the applier compares the resulting sensor
 	// configuration and only acts on a real change, so a repeat costs nothing.
 	if game.Version < r.appliedGameVersion {
-		log.Printf("ignoring stale game config v%d (v%d already applied)", game.Version, r.appliedGameVersion)
+		r.logf("ignoring stale game config v%d (v%d already applied)", game.Version, r.appliedGameVersion)
 		return
 	}
 	r.deps.Game.ApplyGameConfig(*game)
 	r.appliedGameVersion = game.Version
-	log.Printf("applied game config v%d: %d profiles (record unmatched=%v)",
+	r.logf("applied game config v%d: %d profiles (record unmatched=%v)",
 		game.Version, len(game.Profiles), game.RecordUnmatched)
 }
 
@@ -692,7 +706,7 @@ func (r *runner) applyProbeConfig(sessionCtx context.Context, c wire.Conn, ds *p
 	// can arrive after N+1 was already applied. Applying it would silently
 	// regress targets/intervals; equal versions re-apply harmlessly.
 	if ds.ConfigVersion < r.appliedConfigVersion {
-		log.Printf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
+		r.logf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
 		return nil
 	}
 	// Reconcile the egress proxies FIRST. Two reasons for the ordering: monitor
@@ -737,7 +751,7 @@ func (r *runner) applyProbeConfig(sessionCtx context.Context, c wire.Conn, ds *p
 			return fmt.Errorf("write monitor status: %w", werr)
 		}
 	}
-	log.Printf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
+	r.logf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
 	return nil
 }
 
@@ -749,11 +763,11 @@ func (r *runner) applyProbeConfig(sessionCtx context.Context, c wire.Conn, ds *p
 // budget, so the worker always produces exactly one result Frame.
 func (r *runner) dispatchIncidentSnapshot(sessionCtx context.Context, aw *asyncWork, req pcfg.IncidentSnapshotRequest) {
 	if r.deps.CollectIncidentSnapshot == nil {
-		log.Printf("ignoring incident snapshot req=%s: collector not wired", req.RequestID)
+		r.logf("ignoring incident snapshot req=%s: collector not wired", req.RequestID)
 		return
 	}
 	if _, dup := aw.inflightSnap[req.RequestID]; dup {
-		log.Printf("ignoring duplicate in-flight incident snapshot req=%s", req.RequestID)
+		r.logf("ignoring duplicate in-flight incident snapshot req=%s", req.RequestID)
 		return
 	}
 	aw.inflightSnap[req.RequestID] = struct{}{}
@@ -777,11 +791,11 @@ func (r *runner) dispatchIncidentSnapshot(sessionCtx context.Context, aw *asyncW
 // only handles dedupe, cancellation scope, and single-writer delivery.
 func (r *runner) dispatchTrace(sessionCtx context.Context, aw *asyncWork, req pcfg.TraceRequest) {
 	if r.deps.RunTrace == nil {
-		log.Printf("ignoring trace req=%s: engine not wired", req.ReportID)
+		r.logf("ignoring trace req=%s: engine not wired", req.ReportID)
 		return
 	}
 	if _, dup := aw.inflightTrace[req.ReportID]; dup {
-		log.Printf("ignoring duplicate in-flight trace report=%s", req.ReportID)
+		r.logf("ignoring duplicate in-flight trace report=%s", req.ReportID)
 		return
 	}
 	aw.inflightTrace[req.ReportID] = struct{}{}

@@ -21,6 +21,11 @@ import (
 	"github.com/nettact/protocol/wire"
 )
 
+// testServer is the configured server name every test session runs under. The
+// WAL keys its cursor by it and Options.ServerName selects that cursor, so the
+// two must agree — a constant is how that stays true.
+const testServer = "default"
+
 // startServer runs an httptest server that checks bearer auth, upgrades to a
 // WebSocket, and hands each accepted connection to script. Scripts use
 // t.Errorf (never Fatalf — they run off the test goroutine) and signal the
@@ -120,7 +125,7 @@ func newTestDeps(t *testing.T) (Deps, *wal.Store, *fakeConfigurable, *fakeSchedu
 	if err != nil {
 		t.Fatalf("make temp dir: %v", err)
 	}
-	outbox, err := wal.Open(filepath.Join(dataDir, "wal"))
+	outbox, err := wal.Open(filepath.Join(dataDir, "wal"), []string{testServer})
 	if err != nil {
 		_ = os.RemoveAll(dataDir)
 		t.Fatalf("open wal: %v", err)
@@ -163,11 +168,12 @@ func newTestDeps(t *testing.T) (Deps, *wal.Store, *fakeConfigurable, *fakeSchedu
 // run fast, short ack timeout so failures surface quickly.
 func testOptions(serverURL, format string) Options {
 	return Options{
-		ServerURL: serverURL,
-		Token:     "test-token",
-		Format:    format,
-		AgentID:   "agent-1",
-		SiteID:    "site-1",
+		ServerName: testServer,
+		ServerURL:  serverURL,
+		Token:      "test-token",
+		Format:     format,
+		AgentID:    "agent-1",
+		SiteID:     "site-1",
 		Hello: wire.Hello{
 			SchemaVersion: protocol.SchemaVersion,
 			Hostname:      "test-host",
@@ -252,7 +258,7 @@ func TestHelloThenDrainAck(t *testing.T) {
 			deps, outbox, _, _ := newTestDeps(t)
 			if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 				{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 1, Unit: telemetry.UnitSec},
-			}}); err != nil {
+			}}, testServer); err != nil {
 				t.Fatalf("wal append: %v", err)
 			}
 
@@ -303,7 +309,7 @@ func TestHelloThenDrainAck(t *testing.T) {
 				t.Errorf("packet = %+v, want agent-1/site-1 with 1 metric", got.pkt)
 			}
 			// The ack must delete the batch — the WAL drains to empty.
-			waitFor(t, "WAL cleared after ack", func() bool { return outbox.Pending() == 0 })
+			waitFor(t, "WAL cleared after ack", func() bool { return outbox.Pending(testServer) == 0 })
 		})
 	}
 }
@@ -329,7 +335,7 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 			deps, outbox, _, _ := newTestDeps(t)
 			if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{{
 				TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 1,
-			}}}); err != nil {
+			}}}, testServer); err != nil {
 				t.Fatalf("append first: %v", err)
 			}
 
@@ -370,7 +376,7 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 			}
 			if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{{
 				TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2,
-			}}}); err != nil {
+			}}}, testServer); err != nil {
 				t.Fatalf("append second: %v", err)
 			}
 
@@ -386,7 +392,7 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("server never received fast-forwarded packet")
 			}
-			waitFor(t, "WAL cleared after fast-forwarded ack", func() bool { return outbox.Pending() == 0 })
+			waitFor(t, "WAL cleared after fast-forwarded ack", func() bool { return outbox.Pending(testServer) == 0 })
 			cancel()
 		})
 	}
@@ -436,7 +442,7 @@ func TestDesiredStateApplied(t *testing.T) {
 	// A packet sent after the push must carry the applied version.
 	if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 		{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2, Unit: telemetry.UnitSec},
-	}}); err != nil {
+	}}, testServer); err != nil {
 		t.Fatalf("wal append: %v", err)
 	}
 	select {

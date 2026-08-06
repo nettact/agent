@@ -53,6 +53,17 @@ Settings (environment variable — YAML key):
   NETTACT_AGENT_SNAPSHOT_TIMEOUT       default 10s  [1s,60s]                             — snapshot_timeout
   NETTACT_AGENT_MAX_TRACE_CONCURRENCY  default 4    [1,64]                               — max_trace_concurrency
 
+Reporting to more than one server (config file only — a list has no environment form):
+  servers:                            list of {name, url, enroll_token|enroll_token_file,
+                                      tls_insecure, permissions, probe_access}
+  Mutually exclusive with server_url / enroll_token / enroll_token_file / tls_insecure.
+  'name' is required and unique; it keys the saved credential and the queued backlog,
+  so renaming an entry re-enrolls it. The single-server form above is equivalent to one
+  entry named "default". The FIRST entry owns game/frame capture.
+  A per-entry 'permissions' replaces the top-level grant for that server; a per-entry
+  'probe_access' can only narrow the top-level one, never widen it.
+  See agent.example.yaml for an annotated example.
+
 Configuration changes require an agent restart.
 `
 
@@ -91,8 +102,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid configuration: %v", err)
 	}
+	var fileCfg envcfg.File
 	if path != "" {
-		fileCfg, err := envcfg.LoadFile(path)
+		fileCfg, err = envcfg.LoadFile(path)
 		if err != nil {
 			log.Fatalf("invalid configuration: %v", err)
 		}
@@ -100,7 +112,7 @@ func main() {
 		log.Printf("using config file %s", path)
 	}
 
-	cfg, err := envcfg.Load(lookup)
+	cfg, err := envcfg.Load(lookup, fileCfg)
 	if err != nil {
 		log.Fatalf("invalid configuration:\n%v", err)
 	}

@@ -527,7 +527,7 @@ func TestWireGuardLoopbackEngineProducesAnAttestedInTunnelTrace(t *testing.T) {
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
 	// supported is EMPTY on purpose: this host cannot raw-socket its way to a
 	// host-stack traceroute, and the in-tunnel path must not care.
-	e := traceroute.New(labGuard(), permission.Set{}, granted, permission.Set{}, 2, traceegress.Resolver(m))
+	e := traceroute.New(labGuard(), permission.Set{}, granted, permission.Set{}, traceroute.NewLimiter(2), traceegress.Resolver(m))
 
 	res := e.Run(context.Background(), labTraceRequest(spec, spec.ConfigSerial), time.Now())
 	if res.Status != telemetry.TraceStatusSucceeded {
@@ -572,7 +572,7 @@ func TestWireGuardLoopbackEngineFailsClosedOnRotatedGeneration(t *testing.T) {
 	before := lab.echoesSeen()
 
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
-	e := traceroute.New(labGuard(), granted, granted, granted, 2, traceegress.Resolver(m))
+	e := traceroute.New(labGuard(), granted, granted, granted, traceroute.NewLimiter(2), traceegress.Resolver(m))
 
 	res := e.Run(context.Background(), labTraceRequest(spec, spec.ConfigSerial), time.Now())
 	if res.Status != telemetry.TraceStatusFailed || res.Reason != "egress_generation_mismatch" {
@@ -602,7 +602,7 @@ func TestWireGuardLoopbackEngineNamesAGenerationRotatedMidSweep(t *testing.T) {
 	waitTunnelUp(t, d)
 
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
-	e := traceroute.New(labGuard(), granted, granted, granted, 2, traceegress.Resolver(m))
+	e := traceroute.New(labGuard(), granted, granted, granted, traceroute.NewLimiter(2), traceegress.Resolver(m))
 
 	// The first hop is silent, so the sweep parks on it for its per-attempt
 	// budget. Rotating once that probe has demonstrably reached the far side puts

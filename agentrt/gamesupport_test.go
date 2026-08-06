@@ -1,6 +1,7 @@
 package agentrt
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -171,3 +172,109 @@ func TestGameSupportExplainsWhatItLeavesUnsupported(t *testing.T) {
 // join renders a set for comparison and for a failure message. Strings is in
 // canonical order, so two equal sets always render identically.
 func join(s permission.Set) string { return strings.Join(s.Strings(), " ") }
+
+// Frame capture belongs to exactly one server, so what gameSupport settled for
+// the machine reaches only that server's view — and every other server is told
+// why, not just that it cannot have it.
+//
+// Without the reason a console would render a machine that plainly can capture
+// frames as one that cannot, and send the operator after a sensor that is
+// installed and working. The other direction is the half that carries the
+// contract: a server that granted no game permission asked nothing, and gets no
+// entry at all rather than one explaining a capability it never wanted.
+func TestViewsForGivesGameCaptureToTheOwnerAlone(t *testing.T) {
+	gameIDs := []permission.ID{
+		permission.GameProcessDetect, permission.GamePerformanceRead, permission.GameGPURead,
+	}
+	// A machine whose sensor probe verified all three: the interesting case,
+	// because every difference below is then the ownership rule and nothing else.
+	caps := machineCaps{
+		base:          platformIndependentSupported(),
+		gameSupported: permission.NewSet(gameIDs...),
+		gameReasons:   map[string]string{},
+	}
+	withGame := permission.Policy{
+		Granted: permission.Closure(permission.NewSet(permission.GameGPURead)),
+		Source:  permission.SourceEnvironment,
+	}
+	noGame := permission.Policy{
+		Granted: permission.NewSet(permission.ProbeDNS),
+		Source:  permission.SourceServerConfig,
+	}
+
+	cfg := Config{
+		Servers: []ServerConfig{
+			{Name: "home", URL: "https://home.example"},
+			{Name: "work", URL: "https://work.example"},
+		},
+		Policy: withGame,
+	}
+
+	for _, tt := range []struct {
+		name string
+		sc   ServerConfig
+		owns bool
+		// wantGame is whether the three game permissions are supported (and, since
+		// all three are granted here, effective).
+		wantGame bool
+		// wantReason is the UnsupportedReasons entry expected for each GRANTED game
+		// permission; "" means the map must carry none at all.
+		wantReason string
+	}{{
+		// Servers[0] owns the sensor, so it gets what the probe verified.
+		name:     "owner",
+		sc:       cfg.Servers[0],
+		owns:     true,
+		wantGame: true,
+	}, {
+		// The same grant at a server that does not own capture. Genuinely
+		// unsupported — and said so with the cause, because "unsupported" alone is
+		// indistinguishable from a missing sensor.
+		name:       "non-owner that granted capture",
+		sc:         cfg.Servers[1],
+		wantReason: gs.ReasonOwnedByAnotherServer,
+	}, {
+		// A non-owner that never asked. Nothing was withheld from it, so there is
+		// nothing to explain.
+		name: "non-owner that granted no game permission",
+		sc:   ServerConfig{Name: "work", URL: "https://work.example", Policy: &noGame},
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			v, report := viewsFor(cfg, tt.sc, tt.owns, caps)
+
+			for _, id := range gameIDs {
+				if got := v.supported.Has(id); got != tt.wantGame {
+					t.Errorf("supported.Has(%s) = %v, want %v (supported = [%s])", id, got, tt.wantGame, join(v.supported))
+				}
+				if got := v.effective.Has(id); got != tt.wantGame {
+					t.Errorf("effective.Has(%s) = %v, want %v (effective = [%s])", id, got, tt.wantGame, join(v.effective))
+				}
+			}
+			// The report is what the server is actually told, so it has to agree
+			// with the views rather than merely be derived from them.
+			for _, id := range gameIDs {
+				if slices.Contains(report.Supported, string(id)) != tt.wantGame {
+					t.Errorf("report.Supported = %v, want %s present=%v", report.Supported, id, tt.wantGame)
+				}
+			}
+
+			if tt.wantReason == "" {
+				if len(report.UnsupportedReasons) != 0 {
+					t.Fatalf("UnsupportedReasons = %v, want no entry at all", report.UnsupportedReasons)
+				}
+				return
+			}
+			for _, id := range gameIDs {
+				if got := report.UnsupportedReasons[string(id)]; got != tt.wantReason {
+					t.Errorf("reason for %s = %q, want %q", id, got, tt.wantReason)
+				}
+			}
+			// And nothing beyond the three: the map explains what was asked about
+			// and withheld, not whatever else happens to be unsupported.
+			if len(report.UnsupportedReasons) != len(gameIDs) {
+				t.Errorf("UnsupportedReasons = %v, want exactly the %d game permissions",
+					report.UnsupportedReasons, len(gameIDs))
+			}
+		})
+	}
+}

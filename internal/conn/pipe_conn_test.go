@@ -43,7 +43,7 @@ func TestRunOverPipe(t *testing.T) {
 	// Seed one batch so the session has something to drain + await an ack for.
 	if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 		{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Layer: telemetry.LayerLocal, Value: 1, Unit: telemetry.UnitSec},
-	}}); err != nil {
+	}}, testServer); err != nil {
 		t.Fatalf("seed wal: %v", err)
 	}
 

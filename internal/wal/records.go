@@ -3,6 +3,34 @@
 // batches carry a sequence so a crash mid-upload re-sends the SAME sequence and
 // the server dedups on (agent_id, sequence).
 //
+// # One log, N consumers
+//
+// An agent may be enrolled at several servers at once, each with its own
+// session, its own credential and its own view of what this machine should
+// probe. They share this one outbox rather than getting a queue each, because
+// duplicating the log would multiply the disk a disconnected agent needs by the
+// number of servers configured — and the servers are independent, so they are
+// disconnected at independent times.
+//
+// Sharing the storage does NOT mean sharing the records. Every group is appended
+// with exactly one owner and is only ever served to that server. A probe result
+// names a MonitorID and a ConfigSerial minted by the server that pushed the
+// target; handing it to a second server would have it store a series under an
+// identity that means something else there. Host-level data is likewise appended
+// once per server that is permitted to receive it (the agent runs a collector
+// pipeline per server, so the per-server permission grant decides what exists to
+// append at all) rather than broadcast from one group — which is what keeps the
+// ownership rule total and this file free of audience arithmetic.
+//
+// Each server therefore has a cursor: how far it has acknowledged, and the one
+// batch it currently owes an ack for. A group's bytes become collectable when
+// its owner acks it; a server that is offline for a week pins only its own
+// backlog, and the row cap sheds the oldest unclaimed groups — which are that
+// laggard's — rather than growing disk without bound. Sequences come from one
+// allocator shared by every server: they only have to be unique per (agent,
+// server) pair, servers take MAX for their watermark and never require
+// contiguity, so one counter with gaps is cheaper than one counter per server.
+//
 // There are two implementations of Store, selected by build tag, sharing the
 // types in this file and the ordering rules the uploader depends on:
 //
@@ -14,9 +42,9 @@
 //     binary may be running from a tmpfs a reboot clears anyway, a durable
 //     backlog costs write cycles for very little.
 //
-// Both honour the same contract for everything above them: FIFO delivery, whole
-// Records groups claimed indivisibly, and an in-flight packet re-served under
-// its original sequence until acked.
+// Both honour the same contract for everything above them: FIFO delivery per
+// server, whole Records groups claimed indivisibly, and an in-flight packet
+// re-served under its original sequence until acked.
 package wal
 
 import (
@@ -57,35 +85,73 @@ type Batch struct {
 	GameHostSeconds []gamesense.HostSecond
 }
 
-// memGroup is one Append held in memory: an indivisible Records plus the wall
-// clock it arrived at (its created_at if it is ever spilled) and its row count.
+// memGroup is one Append held in memory: an indivisible Records, the server it
+// belongs to, the wall clock it arrived at (its created_at if it is ever
+// spilled) and its row count.
+//
+// gid is the store-wide group id: a monotonic counter that survives a restart
+// via state.json. It is what a claim addresses, so a claimed group keeps its
+// identity when the buffer spills underneath it — the memory and durable tiers
+// hold different representations of the same numbered sequence of groups, not
+// two separate queues.
 type memGroup struct {
-	at  time.Time
-	rec Records
-	n   int
+	gid   uint64
+	owner string
+	at    time.Time
+	rec   Records
+	n     int
 }
 
-// memBatch is the one memory-served packet handed to the uploader and awaiting
-// its ack. It keeps the groups rather than a flattened Batch so a spill can
-// write them back out with their own created_at and grouping intact.
-type memBatch struct {
-	seq    uint64
-	groups []memGroup
+// claim is one server's in-flight packet: the sequence it went out under and the
+// gid range it covers. A range rather than a group count because the log is
+// interleaved — the claimed groups are this server's, contiguous in ITS
+// subsequence but with other servers' groups sitting between them — and because
+// a range stays valid across a spill, which a positional index would not.
+//
+// n is how many groups the range covered when the claim was taken. It is
+// bookkeeping for exactly one job: after a crash, a range that resolves to a
+// different number of groups says the spill that was supposed to make them
+// durable never landed, and the claim must not be served short under a sequence
+// the server may already associate with different content.
+type claim struct {
+	seq  uint64
+	from uint64
+	to   uint64
+	n    int
 }
 
-// batch flattens the claimed groups into the packet to send, preserving arrival
-// order across groups and payload order within each.
-func (m *memBatch) batch() Batch {
-	b := Batch{Sequence: m.seq}
-	for _, g := range m.groups {
-		b.Metrics = append(b.Metrics, g.rec.Metrics...)
-		b.Events = append(b.Events, g.rec.Events...)
-		b.Inventory = append(b.Inventory, g.rec.Inventory...)
-		b.Snapshots = append(b.Snapshots, g.rec.Snapshots...)
-		b.GameRuns = append(b.GameRuns, g.rec.GameRuns...)
-		b.GameBuckets = append(b.GameBuckets, g.rec.GameBuckets...)
-		b.GameGaps = append(b.GameGaps, g.rec.GameGaps...)
-		b.GameHostSeconds = append(b.GameHostSeconds, g.rec.GameHostSeconds...)
+// covers reports whether a group belongs to this claim.
+func (c *claim) covers(gid uint64) bool {
+	return c != nil && gid >= c.from && gid <= c.to
+}
+
+// cursor is one server's position in the shared log: every group of its own with
+// gid <= acked is delivered and done, and claim is the packet it currently owes
+// an ack for.
+//
+// acked is the persisted truth about what is dead; the in-memory group lists are
+// a cache of it that Ack prunes eagerly. Keeping the watermark rather than a
+// consumed-prefix pointer is what makes N consumers work: server A acking its
+// groups leaves holes in the middle of the log that B has not reached yet, and a
+// single prefix could not describe that.
+type cursor struct {
+	acked uint64
+	claim *claim
+}
+
+// flatten concatenates the claimed groups into the packet to send, preserving
+// arrival order across groups and payload order within each.
+func flatten(seq uint64, recs []Records) Batch {
+	b := Batch{Sequence: seq}
+	for _, r := range recs {
+		b.Metrics = append(b.Metrics, r.Metrics...)
+		b.Events = append(b.Events, r.Events...)
+		b.Inventory = append(b.Inventory, r.Inventory...)
+		b.Snapshots = append(b.Snapshots, r.Snapshots...)
+		b.GameRuns = append(b.GameRuns, r.GameRuns...)
+		b.GameBuckets = append(b.GameBuckets, r.GameBuckets...)
+		b.GameGaps = append(b.GameGaps, r.GameGaps...)
+		b.GameHostSeconds = append(b.GameHostSeconds, r.GameHostSeconds...)
 	}
 	return b
 }

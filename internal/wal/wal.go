@@ -3,6 +3,7 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -12,52 +13,38 @@ import (
 )
 
 const (
-	// memBufferRows caps the in-memory tier. It is only reached when uploads are
-	// not keeping up; the buffer then spills to one segment file, which is what
-	// makes a disconnected agent cheap to store rather than expensive.
+	// memBufferRows is the depth that forces a spill. Sized so a healthy agent —
+	// one whose session is up and draining every 30s — never reaches it, while an
+	// agent that has just lost its server spills within a few minutes rather than
+	// holding an unbounded backlog only in memory.
 	memBufferRows = 20000
 
-	// memBufferAge is how long a record may sit in memory before it is spilled
-	// regardless of depth. It bounds what a crash can lose while the server is
-	// unreachable. A healthy agent uploads every DefaultUploadInterval (30s) and
-	// so drains well inside this, never spilling at all.
+	// memBufferAge is the other spill trigger: a slow trickle of samples would
+	// otherwise sit in memory indefinitely, so a crash on an idle-ish agent would
+	// lose more than a busy one. Checked on Append, so it is a floor on how stale
+	// the buffer can be at the moment anything is added.
 	memBufferAge = 90 * time.Second
 
 	// seqBlock is how many packet sequences one durable reservation covers. The
-	// allocator has to survive restarts (a reused sequence is silently deduped by
-	// the server, i.e. lost telemetry), but writing it per packet would put back
-	// the per-upload write this tier exists to remove. Reserving in blocks costs
-	// one small write per seqBlock packets; the unused tail of a block is skipped
-	// after a restart, which is harmless because the server dedups on the exact
-	// (agent_id, sequence) pair and takes MAX for its watermark — it never
-	// requires sequences to be contiguous.
+	// allocator persists its ceiling, not each handout, so a crash burns at most
+	// this many sequences — which costs nothing, since the server takes MAX for
+	// its watermark and never requires contiguity — in exchange for one small
+	// write per thousand packets instead of one per packet.
 	seqBlock = 1000
 
-	// memBufferHardCap is how far past memBufferRows the buffer may grow while
-	// spills are failing before it starts shedding the oldest groups.
+	// memBufferHardCap is where a buffer that cannot spill starts shedding. See
+	// Append for why a failed spill is not an error.
 	memBufferHardCap = 2 * memBufferRows
 )
 
-// Store is the agent's outbox: an in-memory queue in front of a segment-file
-// spill.
+// Store is the agent's outbox: a memory buffer in front of a durable tier of
+// segment files, shared by every server session this agent runs (see the package
+// doc for the ownership model).
 //
-// Telemetry is appended to memory and, when the session is up, handed straight
-// to the uploader and dropped on ack — so a healthy agent writes NOTHING to
-// disk beyond one small state file per seqBlock packets. Disk is what the buffer
-// falls back on: when the buffer fills, ages past memBufferAge, or the process
-// shuts down, the whole buffer is written as one new segment.
-//
-// The cost is bounded and deliberate: a crash loses whatever is still in
-// memory. While connected that is at most one upload interval's worth. While
-// disconnected it is BOUNDED, not zero: the session's end flushes the buffer
-// immediately (conn.run), and after that each unspilled stretch is capped by
-// memBufferAge — the age check rides on Append, which the 30s status heartbeat
-// guarantees keeps arriving. Callers needing a hard point can Flush.
-//
-// Delivery order is FIFO across both tiers, which the fault detectors depend on:
-// NextBatch serves the disk backlog before any memory group, and a spill appends
-// a segment after the ones already there, so a target's rounds can never reach
-// the server out of order.
+// The whole store is behind one mutex. Sessions are independent goroutines that
+// claim and ack concurrently, but their cursors are disjoint — two servers never
+// contend for the same group — so the lock is only ever held for the length of
+// one index walk.
 //
 // See segment.go for the on-disk format and its durability guarantees.
 type Store struct {
@@ -66,39 +53,67 @@ type Store struct {
 	maxRows   int
 	retention time.Duration
 
-	mem      []memGroup // buffered, not yet claimed
-	memRows  int
-	inflight *memBatch // claimed from memory, awaiting ack; nil when none
+	mem     []memGroup // buffered, gid-ascending; includes groups under a claim
+	memRows int
 
-	// disk indexes the live spilled groups in FIFO order. It is the authority on
-	// what is still owed; the files may additionally hold groups this index has
-	// dropped (see the cap eviction in spillLocked).
+	// disk indexes the live spilled groups in gid order. Every disk gid is below
+	// every mem gid, because a spill writes the whole buffer and empties it, so
+	// "disk then mem" is already delivery order.
 	disk    []diskGroup
-	claim   *diskClaim // the head groups already issued as a packet; nil when none
-	head    diskPos    // durable consumed prefix
-	nextSeg uint64     // counter the next spill will use
+	nextSeg uint64 // counter the next spill will use
+
+	// cursors is one entry per configured server, created at Open. A group whose
+	// owner has no cursor is dead — that is how a server dropped from the config
+	// stops pinning bytes forever.
+	cursors map[string]*cursor
+
+	nextGid uint64 // group id the next Append will take
 
 	seqNext, seqCeil uint64 // reserved sequence block [seqNext, seqCeil)
 	durableSeq       uint64 // persisted allocator position, mirrored in memory
 }
 
-// Open creates/opens the WAL in directory dir.
-func Open(dir string) (*Store, error) {
+// Open creates/opens the WAL in directory dir, serving the named servers.
+//
+// The names are the store's whole notion of who its consumers are: a cursor
+// persisted for a name not listed here is discarded along with everything it
+// owed, which is what stops a server the user removed from the config from
+// pinning its backlog until the retention window expires. Renaming a server
+// entry therefore discards its backlog, the same as removing it.
+func Open(dir string, servers []string) (*Store, error) {
+	if len(servers) == 0 {
+		return nil, errors.New("wal: Open needs at least one server name")
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	removeStaleTemps(dir)
 
-	s := &Store{dir: dir, maxRows: 50000, retention: 72 * time.Hour, durableSeq: 1, nextSeg: 1}
+	s := &Store{
+		dir:        dir,
+		maxRows:    50000,
+		retention:  72 * time.Hour,
+		durableSeq: 1,
+		nextSeg:    1,
+		nextGid:    1,
+		cursors:    make(map[string]*cursor, len(servers)),
+	}
+	for _, name := range servers {
+		s.cursors[name] = &cursor{}
+	}
 
 	st, found, err := readState(dir)
+	if err == nil && found && st.V != stateFormat {
+		err = fmt.Errorf("state format %d, want %d", st.V, stateFormat)
+	}
 	if err != nil {
 		// state.json is published by rename, so a torn write is impossible; this
-		// is hand-editing or real corruption. Starting over loses the backlog,
-		// which beats replaying it: without the allocator position, every group
-		// would be re-sent under sequences the server cannot recognise as
-		// duplicates. FastForward lifts the allocator on the first ack — this is
-		// precisely the recreated-WAL case it exists for.
+		// is hand-editing, real corruption, or a store written by a build whose
+		// format this one cannot read. Starting over loses the backlog, which
+		// beats replaying it: without the allocator position, every group would be
+		// re-sent under sequences the server cannot recognise as duplicates.
+		// FastForward lifts the allocator on the first ack — this is precisely the
+		// recreated-WAL case it exists for.
 		log.Printf("wal: unreadable %s (%v); discarding the durable backlog and starting fresh", stateName, err)
 		if err := s.discardSegments(); err != nil {
 			return nil, err
@@ -109,7 +124,23 @@ func Open(dir string) (*Store, error) {
 		if st.NextSeq > 0 {
 			s.durableSeq = st.NextSeq
 		}
-		s.head = diskPos{seg: st.HeadSeg, grp: st.HeadGrp}
+		if st.NextGid > s.nextGid {
+			s.nextGid = st.NextGid
+		}
+		for name, cs := range st.Cursors {
+			c, ok := s.cursors[name]
+			if !ok {
+				log.Printf("wal: server %q is no longer configured; discarding what it had not acknowledged", name)
+				continue
+			}
+			c.acked = cs.Acked
+			if cs.ClaimN > 0 {
+				c.claim = &claim{seq: cs.ClaimSeq, from: cs.ClaimFrom, to: cs.ClaimTo, n: cs.ClaimN}
+			}
+			if cs.Acked >= s.nextGid {
+				s.nextGid = cs.Acked + 1
+			}
+		}
 	}
 
 	segs, err := listSegments(dir)
@@ -117,49 +148,71 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	for _, n := range segs {
-		if n < s.head.seg {
-			os.Remove(segPath(dir, n)) // fully consumed before the last shutdown
-			continue
-		}
 		groups, err := scanSegment(segPath(dir, n), n)
 		if err != nil {
 			return nil, err
 		}
-		if n == s.head.seg && s.head.grp > 0 {
-			if s.head.grp >= len(groups) {
-				// The whole segment was consumed; its deletion just did not happen
-				// before the process went away.
-				os.Remove(segPath(dir, n))
-				groups = nil
-			} else {
-				groups = groups[s.head.grp:]
+		live := 0
+		for _, g := range groups {
+			if g.gid >= s.nextGid {
+				s.nextGid = g.gid + 1
+			}
+			if s.liveLocked(g.gid, g.owner) {
+				s.disk = append(s.disk, g)
+				live++
 			}
 		}
-		s.disk = append(s.disk, groups...)
+		if live == 0 {
+			// Everything in it was acknowledged (or belonged to a server that is
+			// gone) before the last shutdown; its deletion just did not happen.
+			os.Remove(segPath(dir, n))
+		}
 		if n >= s.nextSeg {
 			s.nextSeg = n + 1
 		}
 	}
-	if s.head.seg >= s.nextSeg {
-		s.nextSeg = s.head.seg + 1
-	}
 
-	if st.ClaimN > 0 {
-		if st.ClaimN <= len(s.disk) {
-			s.claim = &diskClaim{seq: st.ClaimSeq, n: st.ClaimN}
-		} else {
-			// The state naming this claim was written, but the segment carrying
-			// its groups never got renamed into place. Serving a short packet
-			// under a sequence the server may already associate with different
-			// content would be worse than dropping it: the sequence is simply
-			// burned, which the server tolerates (it takes MAX, never requires
-			// contiguity).
-			log.Printf("wal: claim %d covers %d groups but only %d survived; dropping the claim",
-				st.ClaimSeq, st.ClaimN, len(s.disk))
+	// A claim that does not resolve to the number of groups it was taken over
+	// means the state naming it was written but the segment carrying them never
+	// got renamed into place. Serving a short packet under a sequence the server
+	// may already associate with different content would be worse than dropping
+	// it: the sequence is simply burned, which the server tolerates (it takes
+	// MAX, never requires contiguity).
+	for name, c := range s.cursors {
+		if c.claim == nil {
+			continue
+		}
+		if got := countClaimed(name, c.claim, s.disk, nil); got != c.claim.n {
+			log.Printf("wal: claim %d for %q covers %d groups but %d survived; dropping the claim",
+				c.claim.seq, name, c.claim.n, got)
+			c.claim = nil
 		}
 	}
-	s.refreshHeadLocked()
 	return s, nil
+}
+
+// liveLocked reports whether a stored group is still owed to anyone. Caller
+// holds mu (or is Open, before the store is shared).
+func (s *Store) liveLocked(gid uint64, owner string) bool {
+	c, ok := s.cursors[owner]
+	return ok && gid > c.acked
+}
+
+// countClaimed returns how many of a server's claimed groups are present in the
+// given tiers.
+func countClaimed(owner string, cl *claim, disk []diskGroup, mem []memGroup) int {
+	n := 0
+	for _, g := range disk {
+		if g.owner == owner && cl.covers(g.gid) {
+			n++
+		}
+	}
+	for _, g := range mem {
+		if g.owner == owner && cl.covers(g.gid) {
+			n++
+		}
+	}
+	return n
 }
 
 // discardSegments deletes every segment, used when the bookkeeping that
@@ -172,13 +225,16 @@ func (s *Store) discardSegments() error {
 	for _, n := range segs {
 		os.Remove(segPath(s.dir, n))
 	}
-	s.disk, s.claim, s.head, s.nextSeg = nil, nil, diskPos{seg: 1}, 1
+	s.disk, s.nextSeg = nil, 1
+	for _, c := range s.cursors {
+		c.acked, c.claim = 0, nil
+	}
 	return nil
 }
 
 // Close flushes the memory tier to disk. Flushing here is what makes an ordinary
-// shutdown lossless: the caller already stops every producer and joins them
-// before closing, so nothing is still being appended.
+// shutdown lossless: the caller already stops every producer and every session
+// and joins them before closing, so nothing is still being appended or claimed.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -195,7 +251,8 @@ func (s *Store) Close() error {
 
 // Flush spills everything buffered in memory to durable storage. Callers that
 // want a hard durability point (a session ending, suspend) can use it; ordinary
-// operation relies on Close.
+// operation relies on Close. It is safe to call from any session goroutine: a
+// spill covers the whole buffer regardless of which server prompted it.
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -209,21 +266,24 @@ func (s *Store) Flush() error {
 	return err
 }
 
-// Append queues one batch of records for upload. It returns the number of
-// samples dropped for over-capacity (>0 means a data gap the caller should
-// surface).
+// Append queues one batch of records for delivery to one server. It returns the
+// number of samples dropped for over-capacity (>0 means a data gap the caller
+// should surface).
 //
 // The records go to memory. They reach disk only if the buffer fills, ages past
-// memBufferAge, or the store is closed — so while the session is up and draining
-// this costs no disk write at all. See Store for the durability trade.
+// memBufferAge, or the store is closed — so while the sessions are up and
+// draining this costs no disk write at all. See Store for the durability trade.
 //
 // An error means the records were NOT accepted and the caller still owns them.
-// A failed spill is deliberately not one: the records are in the buffer and the
-// next trigger retries writing them, so reporting a rejection would be both
-// untrue and harmful — agentrt's game drain re-queues on error, which would put
-// a second copy of the same records in the buffer and upload both once the disk
-// recovers. Spill failures are logged here instead.
-func (s *Store) Append(r Records) (dropped int, err error) {
+// An unknown server name is one: appending for a server with no cursor would
+// store bytes nothing will ever deliver or collect, so it is reported as the
+// wiring bug it is rather than silently swallowed. A failed spill is NOT an
+// error: the records are in the buffer and the next trigger retries writing
+// them, so reporting a rejection would be both untrue and harmful — agentrt's
+// game drain re-queues on error, which would put a second copy of the same
+// records in the buffer and upload both once the disk recovers. Spill failures
+// are logged here instead.
+func (s *Store) Append(r Records, server string) (dropped int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -231,8 +291,12 @@ func (s *Store) Append(r Records) (dropped int, err error) {
 	if n == 0 {
 		return 0, nil
 	}
+	if _, ok := s.cursors[server]; !ok {
+		return 0, fmt.Errorf("wal: append for unknown server %q", server)
+	}
 	now := time.Now().UTC()
-	s.mem = append(s.mem, memGroup{at: now, rec: r, n: n})
+	s.mem = append(s.mem, memGroup{gid: s.nextGid, owner: server, at: now, rec: r, n: n})
+	s.nextGid++
 	s.memRows += n
 
 	if s.memRows < memBufferRows && now.Sub(s.oldestLocked()) < memBufferAge {
@@ -257,26 +321,35 @@ func (s *Store) Append(r Records) (dropped int, err error) {
 // evictOldestLocked drops whole buffered groups, oldest first, until at least n
 // rows are gone, and returns how many it actually dropped. Whole groups only:
 // splitting one would strip a metric from a Result while leaving its snapshot,
-// which is the invariant grouping exists to protect. Caller holds mu.
+// which is the invariant grouping exists to protect. Groups under a claim are
+// skipped — they have been handed to a session and may still need re-sending
+// under their sequence. Caller holds mu.
 func (s *Store) evictOldestLocked(n int) int {
 	dropped := 0
-	for dropped < n && len(s.mem) > 0 {
-		dropped += s.mem[0].n
-		s.memRows -= s.mem[0].n
-		s.mem = s.mem[1:]
+	out := make([]memGroup, 0, len(s.mem))
+	for _, g := range s.mem {
+		if dropped < n && !s.claimedLocked(g.owner, g.gid) {
+			dropped += g.n
+			s.memRows -= g.n
+			continue
+		}
+		out = append(out, g)
 	}
-	s.mem = append([]memGroup(nil), s.mem...)
+	s.mem = out
 	return dropped
 }
 
-// oldestLocked is the arrival time of the oldest record still held in memory,
-// counting the in-flight batch (which is older than anything in mem). Zero when
-// memory is empty, which never triggers a spill because time.Since(zero) is
-// compared only when there is something to spill.
+// claimedLocked reports whether a group is inside its owner's in-flight claim.
+// Caller holds mu.
+func (s *Store) claimedLocked(owner string, gid uint64) bool {
+	c, ok := s.cursors[owner]
+	return ok && c.claim.covers(gid)
+}
+
+// oldestLocked is the arrival time of the oldest record still held in memory.
+// Now when memory is empty, which never triggers a spill because the comparison
+// is only reached when there is something to spill.
 func (s *Store) oldestLocked() time.Time {
-	if s.inflight != nil && len(s.inflight.groups) > 0 {
-		return s.inflight.groups[0].at
-	}
 	if len(s.mem) > 0 {
 		return s.mem[0].at
 	}
@@ -284,27 +357,21 @@ func (s *Store) oldestLocked() time.Time {
 }
 
 // spillLocked writes the whole memory tier to one new segment and enforces the
-// store's caps. The in-flight batch is written first and keeps its sequence via
-// the claim, so it stays both the oldest group and a claimed one — the uploader
-// then re-sends it under the same sequence from disk, exactly as it would have
-// from memory.
+// store's caps. Claimed groups are written along with everything else and keep
+// their group ids, so the claims addressing them stay valid — a session then
+// re-sends its packet under the same sequence from disk, exactly as it would
+// have from memory.
 //
 // Nothing in the Store is mutated until the segment is safely renamed into
 // place, so a failure anywhere leaves the buffer intact for the next attempt —
 // which is what lets Append tolerate a broken disk. Caller holds mu.
 func (s *Store) spillLocked(now time.Time) (dropped int, err error) {
-	if s.inflight == nil && len(s.mem) == 0 {
+	if len(s.mem) == 0 {
 		return 0, nil
 	}
 
-	groups := make([]memGroup, 0, len(s.mem)+1)
-	if s.inflight != nil {
-		groups = append(groups, s.inflight.groups...)
-	}
-	groups = append(groups, s.mem...)
-
 	seg := s.nextSeg
-	tmp, lines, err := writeSegmentTemp(s.dir, groups)
+	tmp, lines, err := writeSegmentTemp(s.dir, s.mem)
 	if err != nil {
 		return 0, err
 	}
@@ -318,34 +385,26 @@ func (s *Store) spillLocked(now time.Time) (dropped int, err error) {
 		lines[i].seg = seg
 	}
 
-	// Build the post-spill index without touching s yet.
+	// Build the post-spill index and claim set without touching s yet.
 	index := make([]diskGroup, 0, len(s.disk)+len(lines))
 	index = append(index, s.disk...)
-	claim := s.claim
-	if s.inflight != nil && len(index) == 0 && claim == nil {
-		// A memory in-flight batch can only exist when the disk backlog was empty
-		// (NextBatch serves disk before memory), so the spilled in-flight lands at
-		// the head — exactly where a claim addresses it. The guard keeps that
-		// reasoning enforced rather than assumed.
-		claim = &diskClaim{seq: s.inflight.seq, n: len(s.inflight.groups)}
-	}
 	index = append(index, lines...)
 
-	index, claim = expirePrefix(index, claim, now.Add(-s.retention))
-	index, dropped = capOldestUnclaimed(index, claim, s.maxRows)
+	claims := s.copyClaimsLocked()
+	index = expireIndex(index, now.Add(-s.retention))
+	// Everything live now lives in index (the buffer is being emptied into it),
+	// so counting against index alone is the whole picture.
+	reconcileClaims(claims, index, nil)
+	index, dropped = capOldest(index, claims, s.maxRows)
 
 	nextSeg := seg + 1
-	head := headOf(index, nextSeg)
 	prev := s.stateLocked()
-	next := walState{V: stateFormat, NextSeq: s.durableSeq, HeadSeg: head.seg, HeadGrp: head.grp}
-	if claim != nil {
-		next.ClaimSeq, next.ClaimN = claim.seq, claim.n
-	}
+	next := s.stateWithLocked(claims)
 
 	// State first, segment second. A crash in between leaves a claim describing
 	// groups that never became visible, which Open clamps away — bounded loss.
-	// The reverse order would leave the in-flight groups on disk with no claim,
-	// so they would be re-issued under a NEW sequence and the server, unable to
+	// The reverse order would leave the claimed groups on disk with no claim, so
+	// they would be re-issued under a NEW sequence and the server, unable to
 	// recognise them as the packet it may already hold, would ingest them twice.
 	if err = writeState(s.dir, next); err != nil {
 		return 0, err
@@ -360,55 +419,96 @@ func (s *Store) spillLocked(now time.Time) (dropped int, err error) {
 	}
 	published = true
 
-	s.disk, s.claim, s.head, s.nextSeg = index, claim, head, nextSeg
-	s.inflight, s.mem, s.memRows = nil, nil, 0
+	s.disk, s.nextSeg = index, nextSeg
+	s.applyClaimsLocked(claims)
+	s.mem, s.memRows = nil, 0
 	s.gcLocked()
 	return dropped, nil
 }
 
-// expirePrefix drops leading groups that arrived before cutoff and shrinks a
-// claim that covered any of them. Expiry is always a prefix because arrival
-// times are non-decreasing across the index: spills happen in time order and
-// preserve arrival order within themselves.
+// copyClaimsLocked snapshots the in-flight claims by value, so expiry and the
+// cap can adjust them while a spill is still able to fail and leave the store
+// untouched. Caller holds mu.
+func (s *Store) copyClaimsLocked() map[string]*claim {
+	out := make(map[string]*claim, len(s.cursors))
+	for name, c := range s.cursors {
+		if c.claim != nil {
+			cp := *c.claim
+			out[name] = &cp
+		}
+	}
+	return out
+}
+
+// applyClaimsLocked commits a snapshot back onto the cursors: a name missing
+// from it lost its claim. Caller holds mu.
+func (s *Store) applyClaimsLocked(claims map[string]*claim) {
+	for name, c := range s.cursors {
+		c.claim = claims[name]
+	}
+}
+
+// expireIndex drops leading groups that arrived before cutoff. Expiry is always
+// a prefix because arrival times are non-decreasing across the index: spills
+// happen in time order and preserve arrival order within themselves.
 //
-// A claim losing groups mirrors what the old store's unconditional retention
-// delete did to already-tagged rows: past the window, server-core has pruned the
-// dedup entry, so replaying the packet would be re-ingested as new.
-func expirePrefix(index []diskGroup, claim *diskClaim, cutoff time.Time) ([]diskGroup, *diskClaim) {
+// Only the durable tier expires. The memory tier cannot: memBufferAge forces a
+// spill long before the retention window, so nothing buffered is ever old
+// enough.
+func expireIndex(index []diskGroup, cutoff time.Time) []diskGroup {
 	drop := 0
 	for drop < len(index) && index[drop].at.Before(cutoff) {
 		drop++
 	}
 	if drop == 0 {
-		return index, claim
+		return index
 	}
-	if claim != nil {
-		if claim.n <= drop {
-			claim = nil
-		} else {
-			claim = &diskClaim{seq: claim.seq, n: claim.n - drop}
-		}
-	}
-	return append([]diskGroup(nil), index[drop:]...), claim
+	return append([]diskGroup(nil), index[drop:]...)
 }
 
-// capOldestUnclaimed enforces the row cap by dropping the oldest UNCLAIMED whole
-// groups, and reports how many rows went. Whole-group eviction preserves the
+// reconcileClaims re-counts every claim against the groups that survive, and
+// drops one that lost all of them.
+//
+// A claim losing groups mirrors what the old store's unconditional retention
+// delete did to already-tagged rows: past the window, server-core has pruned the
+// dedup entry, so replaying the packet would be re-ingested as new. Shrinking it
+// keeps the sequence honest about what it now carries; losing everything leaves
+// nothing to send under it, so the sequence is burned.
+func reconcileClaims(claims map[string]*claim, disk []diskGroup, mem []memGroup) {
+	for name, cl := range claims {
+		got := countClaimed(name, cl, disk, mem)
+		if got == 0 {
+			delete(claims, name)
+			continue
+		}
+		cl.n = got
+	}
+}
+
+// capOldest enforces the row cap by dropping the oldest UNCLAIMED whole groups,
+// and reports how many rows went. Whole-group eviction preserves the
 // indivisible-Result invariant, so this may drop slightly more than the exact
 // overflow; the actual count is what gets returned and logged.
 //
-// The claimed head is never evicted: it has been handed to the uploader and may
-// still need re-sending under its sequence. Evicting from behind it leaves the
-// index describing less than the files hold; gcLocked then deletes every
+// This is also the multi-server backpressure policy. The index is in arrival
+// order, so the oldest groups are by construction those of whichever server has
+// been unable to receive for longest: a server offline for a week sheds its own
+// backlog while a healthy one, whose groups are acked and removed within
+// seconds, never accumulates enough to be a candidate. No cursor is explicitly
+// forced forward — the groups simply stop existing, and a cursor only ever
+// addresses what the index still holds.
+//
+// Claimed groups are never evicted: they have been handed to a session and may
+// still need re-sending under their sequence. Evicting from behind one leaves
+// the index describing less than the files hold; gcLocked then deletes every
 // segment the index no longer references, which is what keeps the cap real even
-// while a claim pins the head in place.
+// while a claim pins an old group in place.
 //
 // What can survive is the evicted tail of a segment that still holds live
-// groups — at most the two segments the evicted run starts and ends in, since
-// the run is contiguous. A restart rescans those and brings those groups back:
-// they are unclaimed, unsent, in their original position and within retention,
-// so the next spill evicts them again.
-func capOldestUnclaimed(index []diskGroup, claim *diskClaim, maxRows int) ([]diskGroup, int) {
+// groups. A restart rescans those and brings those groups back: they are
+// unclaimed, unsent, in their original position and within retention, so the
+// next spill evicts them again.
+func capOldest(index []diskGroup, claims map[string]*claim, maxRows int) ([]diskGroup, int) {
 	total := 0
 	for _, g := range index {
 		total += g.n
@@ -416,44 +516,51 @@ func capOldestUnclaimed(index []diskGroup, claim *diskClaim, maxRows int) ([]dis
 	if total <= maxRows {
 		return index, 0
 	}
-	keep := 0
-	if claim != nil {
-		keep = claim.n
+	out := make([]diskGroup, 0, len(index))
+	dropped := 0
+	for _, g := range index {
+		if total > maxRows && !claims[g.owner].covers(g.gid) {
+			total -= g.n
+			dropped += g.n
+			continue
+		}
+		out = append(out, g)
 	}
-	cut, dropped := keep, 0
-	for total > maxRows && cut < len(index) {
-		dropped += index[cut].n
-		total -= index[cut].n
-		cut++
-	}
-	if cut == keep {
-		return index, 0
-	}
-	out := make([]diskGroup, 0, len(index)-(cut-keep))
-	out = append(out, index[:keep]...)
-	out = append(out, index[cut:]...)
 	return out, dropped
-}
-
-// headOf is the consumed-prefix pointer implied by a live index. With nothing
-// live it points past every existing segment, which is what makes them all
-// collectable.
-func headOf(index []diskGroup, nextSeg uint64) diskPos {
-	if len(index) == 0 {
-		return diskPos{seg: nextSeg}
-	}
-	return diskPos{seg: index[0].seg, grp: index[0].line}
-}
-
-func (s *Store) refreshHeadLocked() {
-	s.head = headOf(s.disk, s.nextSeg)
 }
 
 // stateLocked renders the current bookkeeping. Caller holds mu.
 func (s *Store) stateLocked() walState {
-	st := walState{V: stateFormat, NextSeq: s.durableSeq, HeadSeg: s.head.seg, HeadGrp: s.head.grp}
-	if s.claim != nil {
-		st.ClaimSeq, st.ClaimN = s.claim.seq, s.claim.n
+	return s.stateWithLocked(s.claimsLocked())
+}
+
+// claimsLocked is the live claim set by reference, for rendering state without
+// copying. Caller holds mu.
+func (s *Store) claimsLocked() map[string]*claim {
+	out := make(map[string]*claim, len(s.cursors))
+	for name, c := range s.cursors {
+		if c.claim != nil {
+			out[name] = c.claim
+		}
+	}
+	return out
+}
+
+// stateWithLocked renders the bookkeeping with a given claim set, which a spill
+// uses to persist the claims it is about to commit. Caller holds mu.
+func (s *Store) stateWithLocked(claims map[string]*claim) walState {
+	st := walState{
+		V:       stateFormat,
+		NextSeq: s.durableSeq,
+		NextGid: s.nextGid,
+		Cursors: make(map[string]cursorState, len(s.cursors)),
+	}
+	for name, c := range s.cursors {
+		cs := cursorState{Acked: c.acked}
+		if cl := claims[name]; cl != nil {
+			cs.ClaimSeq, cs.ClaimFrom, cs.ClaimTo, cs.ClaimN = cl.seq, cl.from, cl.to, cl.n
+		}
+		st.Cursors[name] = cs
 	}
 	return st
 }
@@ -465,13 +572,13 @@ func (s *Store) saveStateLocked() error {
 // gcLocked deletes every segment the live index no longer references. Caller
 // holds mu.
 //
-// Liveness rather than "before the head" is what makes the row cap real. While
-// a claim sits unacknowledged — which is the whole of a long outage, since the
-// claim is only released by an ack — the head cannot move past it, so a
-// head-based sweep would keep every segment behind it forever while each spill
-// added another. Disk then grew without limit on exactly the path this store
-// exists for. A segment nothing in the index points at owes nothing and can go
-// regardless of where the head is.
+// Liveness rather than a consumed-prefix sweep is what makes the row cap real.
+// While a claim sits unacknowledged — which is the whole of a long outage, since
+// the claim is only released by an ack — a prefix could not move past it, so
+// every segment behind it would be kept forever while each spill added another.
+// Disk then grew without limit on exactly the path this store exists for. It is
+// also what makes N consumers cheap: a segment is collectable as soon as the
+// last server owing anything in it has acked, with no per-segment refcounting.
 func (s *Store) gcLocked() {
 	segs, err := listSegments(s.dir)
 	if err != nil {
@@ -489,62 +596,37 @@ func (s *Store) gcLocked() {
 	}
 }
 
-// NextBatch returns the next packet to send, or ok=false when there is nothing.
+// NextBatch returns the next packet to send to one server, or ok=false when that
+// server is owed nothing.
 //
-// Order is FIFO across both tiers, which is what the server's fault detectors
-// rely on (a target's rounds arriving out of order would be folded twice):
+// Order is FIFO within the server's own groups, which the server's fault
+// detectors rely on (a target's rounds arriving out of order would be folded
+// twice):
 //
-//  1. a memory batch already claimed and not yet acked — re-served under the
-//     SAME sequence, so a dropped session re-sends rather than loses it;
-//  2. the disk backlog, the claimed head first, then unclaimed groups —
-//     everything on disk is older than anything in memory, because memory only
-//     spills in arrival order and only ever appends a segment;
+//  1. a batch already claimed and not yet acked — re-served under the SAME
+//     sequence, so a dropped session re-sends rather than loses it;
+//  2. otherwise the durable backlog, oldest first — everything on disk is older
+//     than anything in memory, because memory only spills in arrival order and
+//     only ever appends a segment;
 //  3. finally the memory buffer.
 //
 // Step 3 is the case a healthy agent is always in, and it touches no disk.
-func (s *Store) NextBatch(maxItems int) (Batch, bool, error) {
+//
+// A batch never mixes the two tiers. A claim over durable groups must itself be
+// durable before the packet goes out (a crash otherwise re-issues them under a
+// different sequence, which the server cannot dedup), while a claim over
+// buffered groups needs no write at all because a crash loses those groups
+// anyway. Stopping at the boundary keeps each batch in exactly one of those
+// regimes instead of paying the write for every packet a healthy agent sends.
+func (s *Store) NextBatch(server string, maxItems int) (Batch, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.inflight != nil {
-		return s.inflight.batch(), true, nil
+	c, ok := s.cursors[server]
+	if !ok {
+		return Batch{}, false, fmt.Errorf("wal: unknown server %q", server)
 	}
-	b, ok, err := s.nextDiskBatchLocked(maxItems)
-	if err != nil || ok {
-		return b, ok, err
-	}
-	return s.nextMemBatchLocked(maxItems)
-}
 
-// nextMemBatchLocked claims whole groups from the memory buffer, up to maxItems
-// rows (always at least one group, so a single oversized group still makes
-// progress). The claimed groups move into s.inflight rather than being dropped:
-// until the ack lands they may still have to be re-sent or spilled. Caller holds
-// mu.
-func (s *Store) nextMemBatchLocked(maxItems int) (Batch, bool, error) {
-	if len(s.mem) == 0 {
-		return Batch{}, false, nil
-	}
-	take, rows := 0, 0
-	for take < len(s.mem) && (take == 0 || rows+s.mem[take].n <= maxItems) {
-		rows += s.mem[take].n
-		take++
-	}
-	seq, err := s.allocSeqLocked()
-	if err != nil {
-		return Batch{}, false, err
-	}
-	mb := &memBatch{seq: seq, groups: append([]memGroup(nil), s.mem[:take]...)}
-	s.mem = append([]memGroup(nil), s.mem[take:]...)
-	s.memRows -= rows
-	s.inflight = mb
-	return mb.batch(), true, nil
-}
-
-// nextDiskBatchLocked serves the spilled backlog: the already-claimed head first
-// so a failed/crashed upload re-sends the same sequence, otherwise up to
-// maxItems rows of unclaimed groups under a new sequence. Caller holds mu.
-func (s *Store) nextDiskBatchLocked(maxItems int) (Batch, bool, error) {
 	// Expire stale groups before any of them can be claimed. This used to ride on
 	// every Append, but appends now usually stop at memory, so without it a
 	// backlog spilled during a long outage could be uploaded after sitting past
@@ -556,56 +638,111 @@ func (s *Store) nextDiskBatchLocked(maxItems int) (Batch, bool, error) {
 		return Batch{}, false, err
 	}
 
-	if s.claim != nil {
-		b, err := s.loadClaimLocked()
+	if c.claim != nil {
+		b, err := s.loadClaimLocked(server, c.claim)
 		if err != nil {
 			return Batch{}, false, err
 		}
 		return b, true, nil
 	}
-	if len(s.disk) == 0 {
-		return Batch{}, false, nil
+	if b, ok, err := s.nextDiskBatchLocked(server, c, maxItems); err != nil || ok {
+		return b, ok, err
 	}
+	return s.nextMemBatchLocked(server, c, maxItems)
+}
 
-	// Claim whole result-groups: take up to maxItems rows, never splitting a
-	// group, so one Append (one collector Result) never rides two sequences — its
-	// metrics, events, inventory and interface snapshot always travel together
-	// even when the backlog exceeds maxItems. A single group larger than maxItems
-	// is sent whole, so progress is always made.
+// nextDiskBatchLocked claims whole groups from the durable backlog. Caller holds
+// mu and has established the server has no claim outstanding.
+func (s *Store) nextDiskBatchLocked(server string, c *cursor, maxItems int) (Batch, bool, error) {
 	take, rows := 0, 0
-	for take < len(s.disk) && (take == 0 || rows+s.disk[take].n <= maxItems) {
-		rows += s.disk[take].n
+	var first, last uint64
+	for _, g := range s.disk {
+		if g.owner != server || g.gid <= c.acked {
+			continue
+		}
+		// Claim whole result-groups: take up to maxItems rows, never splitting a
+		// group, so one Append (one collector Result) never rides two sequences —
+		// its metrics, events, inventory and interface snapshot always travel
+		// together even when the backlog exceeds maxItems. A single group larger
+		// than maxItems is sent whole, so progress is always made.
+		if take > 0 && rows+g.n > maxItems {
+			break
+		}
+		if take == 0 {
+			first = g.gid
+		}
+		last = g.gid
+		rows += g.n
 		take++
+	}
+	if take == 0 {
+		return Batch{}, false, nil
 	}
 
 	seq, err := s.allocSeqLocked()
 	if err != nil {
 		return Batch{}, false, err
 	}
-	s.claim = &diskClaim{seq: seq, n: take}
+	c.claim = &claim{seq: seq, from: first, to: last, n: take}
 	if err := s.saveStateLocked(); err != nil {
 		// The claim never became durable, so nothing may be sent under it: a
 		// crash would leave those groups unclaimed and they would go out again
 		// under a different sequence, which the server cannot dedup.
-		s.claim = nil
+		c.claim = nil
 		return Batch{}, false, err
 	}
-	b, err := s.loadClaimLocked()
+	b, err := s.loadClaimLocked(server, c.claim)
 	if err != nil {
 		return Batch{}, false, err
 	}
 	return b, true, nil
 }
 
+// nextMemBatchLocked claims whole groups from the memory buffer. The groups stay
+// in the buffer rather than moving to a side list: until the ack lands they may
+// still have to be re-served or spilled, and leaving them in place is what lets
+// a spill carry them across with their group ids — and therefore the claim —
+// intact. Caller holds mu.
+func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batch, bool, error) {
+	rows := 0
+	var first, last uint64
+	recs := make([]Records, 0, 8)
+	for _, g := range s.mem {
+		if g.owner != server || g.gid <= c.acked {
+			continue
+		}
+		if len(recs) > 0 && rows+g.n > maxItems {
+			break
+		}
+		if len(recs) == 0 {
+			first = g.gid
+		}
+		last = g.gid
+		rows += g.n
+		recs = append(recs, g.rec)
+	}
+	if len(recs) == 0 {
+		return Batch{}, false, nil
+	}
+	seq, err := s.allocSeqLocked()
+	if err != nil {
+		return Batch{}, false, err
+	}
+	c.claim = &claim{seq: seq, from: first, to: last, n: len(recs)}
+	return flatten(seq, recs), true, nil
+}
+
 // expireLocked drops backlog past the retention window and makes the removal
 // durable. Caller holds mu.
 func (s *Store) expireLocked(now time.Time) error {
-	index, claim := expirePrefix(s.disk, s.claim, now.Add(-s.retention))
+	index := expireIndex(s.disk, now.Add(-s.retention))
 	if len(index) == len(s.disk) {
 		return nil
 	}
-	s.disk, s.claim = index, claim
-	s.refreshHeadLocked()
+	s.disk = index
+	claims := s.claimsLocked()
+	reconcileClaims(claims, s.disk, s.mem)
+	s.applyClaimsLocked(claims)
 	if err := s.saveStateLocked(); err != nil {
 		return err
 	}
@@ -613,29 +750,31 @@ func (s *Store) expireLocked(now time.Time) error {
 	return nil
 }
 
-// loadClaimLocked reads the claimed head groups back into a packet. Caller holds
-// mu and has verified s.claim is set.
-func (s *Store) loadClaimLocked() (Batch, error) {
-	n := s.claim.n
-	if n > len(s.disk) {
-		n = len(s.disk)
+// loadClaimLocked reads a claim's groups back into the packet to send. It spans
+// both tiers because a claim taken from memory migrates to disk wholesale when a
+// spill happens under it; disk before memory is already group-id order. Caller
+// holds mu.
+func (s *Store) loadClaimLocked(server string, cl *claim) (Batch, error) {
+	var dg []diskGroup
+	for _, g := range s.disk {
+		if g.owner == server && cl.covers(g.gid) {
+			dg = append(dg, g)
+		}
 	}
-	recs, err := readGroups(s.dir, s.disk[:n])
-	if err != nil {
-		return Batch{}, err
+	recs := make([]Records, 0, cl.n)
+	if len(dg) > 0 {
+		loaded, err := readGroups(s.dir, dg)
+		if err != nil {
+			return Batch{}, err
+		}
+		recs = append(recs, loaded...)
 	}
-	b := Batch{Sequence: s.claim.seq}
-	for _, r := range recs {
-		b.Metrics = append(b.Metrics, r.Metrics...)
-		b.Events = append(b.Events, r.Events...)
-		b.Inventory = append(b.Inventory, r.Inventory...)
-		b.Snapshots = append(b.Snapshots, r.Snapshots...)
-		b.GameRuns = append(b.GameRuns, r.GameRuns...)
-		b.GameBuckets = append(b.GameBuckets, r.GameBuckets...)
-		b.GameGaps = append(b.GameGaps, r.GameGaps...)
-		b.GameHostSeconds = append(b.GameHostSeconds, r.GameHostSeconds...)
+	for _, g := range s.mem {
+		if g.owner == server && cl.covers(g.gid) {
+			recs = append(recs, g.rec)
+		}
 	}
-	return b, nil
+	return flatten(cl.seq, recs), nil
 }
 
 // allocSeqLocked hands out the next packet sequence, reserving a fresh block
@@ -672,27 +811,32 @@ func (s *Store) setDurableSeqLocked(v uint64) error {
 	return nil
 }
 
-// Ack releases the samples of an acknowledged packet. A memory-served packet is
-// simply forgotten — the whole point of the tier is that it never reached disk
-// to be deleted from. An ack for anything else (a duplicate, a late reply for a
-// packet already released) is a no-op rather than an error.
-func (s *Store) Ack(seq uint64) error {
+// Ack releases one server's acknowledged packet: its cursor moves past the
+// claimed groups and they stop being owed to it. An ack for anything else (a
+// duplicate, a late reply for a packet already released, an unknown server) is a
+// no-op rather than an error.
+//
+// Only a packet that had durable groups costs a write. A memory-served packet is
+// simply forgotten — the whole point of that tier is that it never reached disk
+// to be deleted from, and a watermark that is not persisted only ever
+// under-reports what was delivered, which after a restart addresses groups that
+// no longer exist.
+func (s *Store) Ack(server string, seq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.inflight != nil && s.inflight.seq == seq {
-		s.inflight = nil
+
+	c, ok := s.cursors[server]
+	if !ok || c.claim == nil || c.claim.seq != seq {
 		return nil
 	}
-	if s.claim == nil || s.claim.seq != seq {
+	cl := c.claim
+	c.acked = cl.to
+	c.claim = nil
+
+	touchedDisk := s.dropClaimedLocked(server, cl)
+	if !touchedDisk {
 		return nil
 	}
-	n := s.claim.n
-	if n > len(s.disk) {
-		n = len(s.disk)
-	}
-	s.disk = append([]diskGroup(nil), s.disk[n:]...)
-	s.claim = nil
-	s.refreshHeadLocked()
 	if err := s.saveStateLocked(); err != nil {
 		return err
 	}
@@ -700,14 +844,51 @@ func (s *Store) Ack(seq uint64) error {
 	return nil
 }
 
+// dropClaimedLocked removes a claim's groups from both tiers and reports whether
+// any of them were durable. Caller holds mu.
+func (s *Store) dropClaimedLocked(server string, cl *claim) bool {
+	touchedDisk := false
+	out := make([]diskGroup, 0, len(s.disk))
+	for _, g := range s.disk {
+		if g.owner == server && cl.covers(g.gid) {
+			touchedDisk = true
+			continue
+		}
+		out = append(out, g)
+	}
+	if touchedDisk {
+		s.disk = out
+	}
+
+	if len(s.mem) > 0 {
+		kept := make([]memGroup, 0, len(s.mem))
+		for _, g := range s.mem {
+			if g.owner == server && cl.covers(g.gid) {
+				s.memRows -= g.n
+				continue
+			}
+			kept = append(kept, g)
+		}
+		s.mem = kept
+	}
+	return touchedDisk
+}
+
 // FastForward durably raises the next-sequence allocator to at least
 // watermark+1 so the WAL stops re-emitting sequences the server has already
 // consumed. It exists to recover the one case where the local allocator falls
-// behind the server: the WAL was recreated/reset (next_seq back near 1) while
-// the agent kept its enrollment and the server still retains far higher packet
+// behind a server: the WAL was recreated/reset (next_seq back near 1) while the
+// agent kept its enrollment and the server still retains far higher packet
 // sequences. Without this, every fresh batch reuses an already-stored
 // (agent_id, sequence) and the server silently dedups it — telemetry is
 // suppressed for as long as the counter takes to climb past the watermark.
+//
+// The allocator is shared by every server and so is this: a watermark from one
+// server raises the counter for all of them. That is harmless because a
+// sequence only has to be unique per (agent, server) pair — skipping ahead
+// leaves gaps, which every server tolerates (it takes MAX, never requires
+// contiguity) — and it is what keeps the recovery working when the server that
+// remembers the high watermark is not the one that reconnects first.
 //
 // The allocator is never lowered: a normal ack whose watermark equals the
 // just-sent sequence leaves next_seq untouched (target <= current), so ordinary
@@ -750,22 +931,31 @@ func (s *Store) FastForward(watermark uint64) error {
 	return nil
 }
 
-// Pending returns the number of samples not yet acknowledged, across both tiers
-// — buffered, claimed-but-unacked, and spilled. It backs the agent.wal_pending
-// metric, which is a backlog signal rather than a disk-usage one, so counting
-// only the durable groups would read as "nothing queued" on an agent whose
-// uploads are failing but whose buffer has not yet aged into a spill.
-func (s *Store) Pending() int {
+// Pending returns the number of samples one server has not yet acknowledged,
+// across both tiers — buffered, claimed-but-unacked, and spilled. It backs that
+// server's agent.wal_pending metric, which is a backlog signal rather than a
+// disk-usage one, so counting only the durable groups would read as "nothing
+// queued" on an agent whose uploads are failing but whose buffer has not yet
+// aged into a spill. Per server rather than store-wide for the same reason: one
+// server being unreachable says nothing about the health of another's link.
+func (s *Store) Pending(server string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := s.memRows
-	if s.inflight != nil {
-		for _, g := range s.inflight.groups {
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return 0
+	}
+	n := 0
+	for _, g := range s.disk {
+		if g.owner == server && g.gid > c.acked {
 			n += g.n
 		}
 	}
-	for _, g := range s.disk {
-		n += g.n
+	for _, g := range s.mem {
+		if g.owner == server && g.gid > c.acked {
+			n += g.n
+		}
 	}
 	return n
 }

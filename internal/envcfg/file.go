@@ -6,7 +6,13 @@
 // existing validation/range/aggregation path over the layered view, so the file
 // path reuses all env semantics (including the token vs token-file mutual
 // exclusion and the "set but empty" rejection) and every error still names the
-// NETTACT_AGENT_* variable — YAML keys correspond 1:1 to those variables.
+// NETTACT_AGENT_* variable — scalar YAML keys correspond 1:1 to those variables.
+//
+// The one exception is `servers:`. A list of records has no environment form —
+// the whole model here is one key, one variable, one string — so it is carried
+// beside the map rather than flattened into it, and validated by Load like
+// everything else. It is the file-only setting because it is the one setting
+// with no scalar shape, not because files are privileged.
 //
 // Precedence: config file > environment > built-in defaults. Parsing is strict
 // (unknown keys and syntax errors fail with a locating message); a config
@@ -35,26 +41,55 @@ const (
 	workingDirConfig = "nettact-agent.yaml"
 )
 
-// fileConfig mirrors the YAML schema. Every field is a pointer so an omitted key
-// (or an explicit YAML null) stays nil ("unset", falls through to the
-// environment), while a present key — even an empty string — flattens onto its
-// environment variable and carries the env "set but empty" semantics. Unknown
-// keys are rejected by the strict decoder in LoadFile.
+// File is a parsed configuration file: the scalar settings flattened onto their
+// environment-variable names, plus the servers list, which has no such form. The
+// zero File means "no configuration file", so a caller with only an environment
+// passes it and nothing changes.
+type File struct {
+	env     map[string]string
+	servers []serverEntryFile
+}
+
+// fileConfig mirrors the YAML schema. Every scalar field is a pointer so an
+// omitted key (or an explicit YAML null) stays nil ("unset", falls through to
+// the environment), while a present key — even an empty string — flattens onto
+// its environment variable and carries the env "set but empty" semantics.
+// Unknown keys are rejected by the strict decoder in LoadFile.
 type fileConfig struct {
-	ServerURL           *string          `yaml:"server_url"`
-	DataDir             *string          `yaml:"data_dir"`
-	EnrollToken         *string          `yaml:"enroll_token"`
-	EnrollTokenFile     *string          `yaml:"enroll_token_file"`
-	TLSInsecure         *bool            `yaml:"tls_insecure"`
-	UploadInterval      *string          `yaml:"upload_interval"`
-	WireFormat          *string          `yaml:"wire_format"`
-	Permissions         *scalarOrList    `yaml:"permissions"`
-	ProbeAccess         *probeAccessFile `yaml:"probe_access"`
-	MinProbeInterval    *string          `yaml:"min_probe_interval"`
-	MaxProbeConcurrency *int             `yaml:"max_probe_concurrency"`
-	SnapshotMinInterval *string          `yaml:"snapshot_min_interval"`
-	SnapshotTimeout     *string          `yaml:"snapshot_timeout"`
-	MaxTraceConcurrency *int             `yaml:"max_trace_concurrency"`
+	Servers             []serverEntryFile `yaml:"servers"`
+	ServerURL           *string           `yaml:"server_url"`
+	DataDir             *string           `yaml:"data_dir"`
+	EnrollToken         *string           `yaml:"enroll_token"`
+	EnrollTokenFile     *string           `yaml:"enroll_token_file"`
+	TLSInsecure         *bool             `yaml:"tls_insecure"`
+	UploadInterval      *string           `yaml:"upload_interval"`
+	WireFormat          *string           `yaml:"wire_format"`
+	Permissions         *scalarOrList     `yaml:"permissions"`
+	ProbeAccess         *probeAccessFile  `yaml:"probe_access"`
+	MinProbeInterval    *string           `yaml:"min_probe_interval"`
+	MaxProbeConcurrency *int              `yaml:"max_probe_concurrency"`
+	SnapshotMinInterval *string           `yaml:"snapshot_min_interval"`
+	SnapshotTimeout     *string           `yaml:"snapshot_timeout"`
+	MaxTraceConcurrency *int              `yaml:"max_trace_concurrency"`
+}
+
+// serverEntryFile is one entry of the `servers:` list — everything that can
+// differ between two servers this agent reports to.
+//
+// permissions and probe_access appear here as well as at the top level, and the
+// two levels do NOT mean the same thing. A top-level permissions list is the
+// default grant an entry inherits when it names none; an entry's own list
+// replaces it. A top-level probe_access is the machine's floor, and an entry's
+// can only narrow it further — a server can be told to reach less than the
+// machine allows, never more.
+type serverEntryFile struct {
+	Name            *string          `yaml:"name"`
+	URL             *string          `yaml:"url"`
+	EnrollToken     *string          `yaml:"enroll_token"`
+	EnrollTokenFile *string          `yaml:"enroll_token_file"`
+	TLSInsecure     *bool            `yaml:"tls_insecure"`
+	Permissions     *scalarOrList    `yaml:"permissions"`
+	ProbeAccess     *probeAccessFile `yaml:"probe_access"`
 }
 
 // probeAccessFile is the nested probe_access group. It is a plain struct (no
@@ -148,30 +183,31 @@ func (fc *fileConfig) flatten() map[string]string {
 	return m
 }
 
-// LoadFile reads and strictly parses a YAML config file into a map keyed by
-// NETTACT_AGENT_* variable names, suitable for Layered. Unknown keys and syntax
+// LoadFile reads and strictly parses a YAML config file. The scalar settings
+// come back keyed by NETTACT_AGENT_* variable names, suitable for Layered; the
+// servers list rides along beside them (see File). Unknown keys and syntax
 // errors fail with the file name and the decoder's line/field location. An empty
-// or comment-only file yields an empty map (equivalent to pure-env operation).
-func LoadFile(path string) (map[string]string, error) {
+// or comment-only file yields an empty File (equivalent to pure-env operation).
+func LoadFile(path string) (File, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("config file %q: %w", path, err)
+		return File{}, fmt.Errorf("config file %q: %w", path, err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	var fc fileConfig
 	if err := dec.Decode(&fc); err != nil {
 		if errors.Is(err, io.EOF) {
-			return map[string]string{}, nil
+			return File{env: map[string]string{}}, nil
 		}
-		return nil, fmt.Errorf("config file %q: %w", path, err)
+		return File{}, fmt.Errorf("config file %q: %w", path, err)
 	}
 	// The config is a single mapping; a second document is almost certainly a
 	// mistake (a stray `---`), so reject it rather than silently ignore it.
 	if err := dec.Decode(new(yaml.Node)); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("config file %q: expected a single YAML document", path)
+		return File{}, fmt.Errorf("config file %q: expected a single YAML document", path)
 	}
-	return fc.flatten(), nil
+	return File{env: fc.flatten(), servers: fc.Servers}, nil
 }
 
 // Layered returns a Lookup that resolves a name from file first (a parsed config
@@ -179,9 +215,9 @@ func LoadFile(path string) (map[string]string, error) {
 // file values win per-key over the environment while unset file keys inherit the
 // environment — and because both token sources can now come from different
 // layers, Load's existing token/token-file mutual-exclusion still triggers.
-func Layered(file map[string]string, fallback Lookup) Lookup {
+func Layered(file File, fallback Lookup) Lookup {
 	return func(name string) (string, bool) {
-		if v, ok := file[name]; ok {
+		if v, ok := file.env[name]; ok {
 			return v, true
 		}
 		return fallback(name)

@@ -16,7 +16,7 @@ import (
 )
 
 func TestRunRejectsInvalidAndExpiredRequestsWithoutProbing(t *testing.T) {
-	e := New(nil, permission.Set{}, permission.Set{}, permission.Set{}, 1, nil)
+	e := New(nil, permission.Set{}, permission.Set{}, permission.Set{}, NewLimiter(1), nil)
 	for _, tc := range []struct {
 		name   string
 		req    pcfg.TraceRequest
@@ -36,7 +36,7 @@ func TestRunRejectsInvalidAndExpiredRequestsWithoutProbing(t *testing.T) {
 	}
 
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
-	e = New(nil, granted, granted, granted, 1, nil)
+	e = New(nil, granted, granted, granted, NewLimiter(1), nil)
 	// A spent budget (the server pushed a window the trace can no longer fit in) is
 	// terminal-at-start, and never sends a probe.
 	for _, budgetMs := range []int{0, -1} {
@@ -126,7 +126,7 @@ func TestRunEgressTraceSucceedsThroughScriptedTunnel(t *testing.T) {
 	}
 	// supported/effective deliberately EMPTY: the host stack cannot trace at all,
 	// and the in-tunnel path must not care.
-	e := New(guard, permission.Set{}, granted, permission.Set{}, 1, resolver)
+	e := New(guard, permission.Set{}, granted, permission.Set{}, NewLimiter(1), resolver)
 
 	res := e.Run(context.Background(), egressRequest(), time.Now())
 	if res.Status != telemetry.TraceStatusSucceeded {
@@ -165,7 +165,7 @@ func TestRunEgressTraceFailsClosed(t *testing.T) {
 		{"nil_resolver", nil, reasonEgressNotAvailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := New(guard, granted, granted, granted, 1, tc.resolver)
+			e := New(guard, granted, granted, granted, NewLimiter(1), tc.resolver)
 			res := e.Run(context.Background(), egressRequest(), time.Now())
 			if res.Status != telemetry.TraceStatusFailed || res.Reason != tc.reason {
 				t.Fatalf("result = %s/%s, want failed/%s", res.Status, res.Reason, tc.reason)
@@ -202,7 +202,7 @@ func TestRunEgressSentinelMidSweepKeepsItsOwnReason(t *testing.T) {
 					return EgressReply{}, fmt.Errorf("%w: mid-sweep", tc.err)
 				}, nil
 			}
-			e := New(guard, granted, granted, granted, 1, resolver)
+			e := New(guard, granted, granted, granted, NewLimiter(1), resolver)
 			res := e.Run(context.Background(), egressRequest(), time.Now())
 			if res.Status != telemetry.TraceStatusFailed || res.Reason != tc.reason {
 				t.Fatalf("result = %s/%s, want failed/%s", res.Status, res.Reason, tc.reason)
@@ -223,7 +223,7 @@ func TestRunEgressPermissionAndModeGates(t *testing.T) {
 	// unsupported (the platform cannot execute it), while the egress request
 	// above proves the tunnel path skips that capability gate. Regression pin
 	// for the granted-vs-effective split.
-	e := New(guard, permission.Set{}, granted, permission.Set{}, 1, neverResolve)
+	e := New(guard, permission.Set{}, granted, permission.Set{}, NewLimiter(1), neverResolve)
 	host := egressRequest()
 	host.EgressProxyID, host.EgressConfigSerial = "", 0
 	res := e.Run(context.Background(), host, time.Now())
@@ -235,7 +235,7 @@ func TestRunEgressPermissionAndModeGates(t *testing.T) {
 	}
 
 	// No grant at all: the egress request is a policy denial, resolver untouched.
-	e = New(guard, permission.Set{}, permission.Set{}, permission.Set{}, 1, neverResolve)
+	e = New(guard, permission.Set{}, permission.Set{}, permission.Set{}, NewLimiter(1), neverResolve)
 	res = e.Run(context.Background(), egressRequest(), time.Now())
 	if res.Status != telemetry.TraceStatusUnsupported || res.Reason != reasonPermissionDenied {
 		t.Fatalf("ungranted result = %s/%s, want unsupported/permission_denied", res.Status, res.Reason)
@@ -243,7 +243,7 @@ func TestRunEgressPermissionAndModeGates(t *testing.T) {
 	assertAttestation(t, res)
 
 	// TCP through a tunnel is not plannable; a request claiming it is malformed.
-	e = New(guard, granted, granted, granted, 1, neverResolve)
+	e = New(guard, granted, granted, granted, NewLimiter(1), neverResolve)
 	bad := egressRequest()
 	bad.Mode, bad.TCPPort = pcfg.TraceModeTCP, 443
 	res = e.Run(context.Background(), bad, time.Now())

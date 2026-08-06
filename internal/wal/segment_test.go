@@ -19,17 +19,17 @@ import (
 // state.json, so it is worth pinning directly.
 func TestDiskClaimSurvivesRestart(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(11), metric(12)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(11), metric(12)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil { // the agent is offline: this went durable
 		t.Fatalf("Flush: %v", err)
 	}
-	sent, ok, err := s.NextBatch(500)
+	sent, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -38,12 +38,12 @@ func TestDiskClaimSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir)
+	again, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = again.Close() })
-	got, ok, err := again.NextBatch(500)
+	got, ok, err := again.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("after restart: ok=%v err=%v", ok, err)
 	}
@@ -54,10 +54,10 @@ func TestDiskClaimSurvivesRestart(t *testing.T) {
 	if len(got.Metrics) != 2 || got.Metrics[0].Value != 11 || got.Metrics[1].Value != 12 {
 		t.Fatalf("packet content changed across the restart: %+v", got.Metrics)
 	}
-	if err := again.Ack(got.Sequence); err != nil {
+	if err := again.Ack(srvA, got.Sequence); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := again.NextBatch(500); ok {
+	if _, ok, _ := again.NextBatch(srvA, 500); ok {
 		t.Fatal("acked packet was served again")
 	}
 	if n := storedRows(t, again); n != 0 {
@@ -70,12 +70,12 @@ func TestDiskClaimSurvivesRestart(t *testing.T) {
 // or discarding the whole segment, would turn a torn tail into a total loss.
 func TestTornSegmentTailKeepsEarlierGroups(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}); err != nil {
+		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}, srvA); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -99,12 +99,12 @@ func TestTornSegmentTailKeepsEarlierGroups(t *testing.T) {
 	}
 	f.Close()
 
-	again, err := Open(dir)
+	again, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatalf("a torn tail must not stop the store opening: %v", err)
 	}
 	t.Cleanup(func() { _ = again.Close() })
-	b, ok, err := again.NextBatch(500)
+	b, ok, err := again.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -127,15 +127,15 @@ func TestForeignFilesAreIgnored(t *testing.T) {
 		}
 	}
 
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
-	b, ok, err := s.NextBatch(500)
+	b, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok || len(b.Metrics) != 1 {
 		t.Fatalf("NextBatch = (%+v, %v, %v)", b.Metrics, ok, err)
 	}
@@ -155,7 +155,7 @@ func TestStaleTempFilesAreRemovedOnOpen(t *testing.T) {
 	if err := os.WriteFile(stale, []byte("half a spill"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,11 +171,11 @@ func TestStaleTempFilesAreRemovedOnOpen(t *testing.T) {
 // claim is discarded and the sequence burned.
 func TestOversizedClaimIsDropped(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil {
@@ -189,17 +189,17 @@ func TestOversizedClaimIsDropped(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("readState = (%+v, %v, %v)", st, found, err)
 	}
-	st.ClaimSeq, st.ClaimN = 42, 9 // more groups than were ever written
+	st.Cursors[srvA] = cursorState{ClaimSeq: 42, ClaimFrom: 1, ClaimTo: 9, ClaimN: 9} // more groups than were ever written
 	if err := writeState(dir, st); err != nil {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir)
+	again, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = again.Close() })
-	b, ok, err := again.NextBatch(500)
+	b, ok, err := again.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -217,7 +217,7 @@ func TestOversizedClaimIsDropped(t *testing.T) {
 // would keep every spill's file forever.
 func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,13 +230,13 @@ func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 	s.mu.Unlock()
 
 	// Claim a packet from disk and never ack it.
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(0)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(0)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	claimed, ok, err := s.NextBatch(10)
+	claimed, ok, err := s.NextBatch(srvA, 10)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -244,7 +244,7 @@ func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 	// The outage continues: telemetry keeps arriving and keeps spilling.
 	for round := 0; round < 30; round++ {
 		for i := 0; i < 10; i++ {
-			if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}); err != nil {
+			if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}, srvA); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -267,7 +267,7 @@ func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 	}
 
 	// And the claimed packet is still intact and still its own sequence.
-	again, ok, err := s.NextBatch(10)
+	again, ok, err := s.NextBatch(srvA, 10)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch after the spills: ok=%v err=%v", ok, err)
 	}
@@ -284,11 +284,11 @@ func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 // under sequences the server cannot recognise as duplicates.
 func TestCorruptStateStartsOver(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir)
+	s, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -298,7 +298,7 @@ func TestCorruptStateStartsOver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir)
+	again, err := Open(dir, []string{srvA})
 	if err != nil {
 		t.Fatalf("a corrupt state file must not stop the store opening: %v", err)
 	}
@@ -306,14 +306,14 @@ func TestCorruptStateStartsOver(t *testing.T) {
 	if n := storedRows(t, again); n != 0 {
 		t.Fatalf("%d rows survived an unreadable state file, want the backlog discarded", n)
 	}
-	if _, ok, err := again.NextBatch(500); ok || err != nil {
+	if _, ok, err := again.NextBatch(srvA, 500); ok || err != nil {
 		t.Fatalf("NextBatch = (%v, %v), want nothing to serve", ok, err)
 	}
 	// Still usable afterwards.
-	if _, err := again.Append(Records{Metrics: []telemetry.Metric{metric(2)}}); err != nil {
+	if _, err := again.Append(Records{Metrics: []telemetry.Metric{metric(2)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := again.NextBatch(500); !ok || err != nil {
+	if _, ok, err := again.NextBatch(srvA, 500); !ok || err != nil {
 		t.Fatalf("post-recovery NextBatch = (%v, %v)", ok, err)
 	}
 }

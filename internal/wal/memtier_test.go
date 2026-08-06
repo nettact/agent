@@ -16,6 +16,14 @@ import (
 // no packet is ever lost, duplicated, or reordered across the boundary between
 // the two.
 
+// srvA and srvB are configured server names. Most tests need only one — the
+// tier's contract is per server and does not change with how many there are —
+// so srvA is the default and srvB appears where two consumers is the point.
+const (
+	srvA = "alpha"
+	srvB = "beta"
+)
+
 // tempWALDir returns a directory to hold a WAL, removed on a best-effort basis
 // when the test ends.
 //
@@ -44,7 +52,7 @@ func tempWALDir(t *testing.T) string {
 
 func openTemp(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(tempWALDir(t), "wal"))
+	s, err := Open(filepath.Join(tempWALDir(t), "wal"), []string{srvA})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -85,21 +93,21 @@ func storedRows(t *testing.T, s *Store) int {
 func TestDrainingAgentWritesNothingToDisk(t *testing.T) {
 	s := openTemp(t)
 	for i := 0; i < 200; i++ {
-		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}); err != nil {
+		if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}, srvA); err != nil {
 			t.Fatalf("Append %d: %v", i, err)
 		}
-		b, ok, err := s.NextBatch(500)
+		b, ok, err := s.NextBatch(srvA, 500)
 		if err != nil || !ok {
 			t.Fatalf("NextBatch %d: ok=%v err=%v", i, ok, err)
 		}
-		if err := s.Ack(b.Sequence); err != nil {
+		if err := s.Ack(srvA, b.Sequence); err != nil {
 			t.Fatalf("Ack %d: %v", i, err)
 		}
 	}
 	if n := storedRows(t, s); n != 0 {
 		t.Fatalf("a draining agent wrote %d rows to disk; the memory tier must absorb all of it", n)
 	}
-	if p := s.Pending(); p != 0 {
+	if p := s.Pending(srvA); p != 0 {
 		t.Fatalf("Pending = %d after every packet was acked, want 0", p)
 	}
 }
@@ -108,14 +116,14 @@ func TestDrainingAgentWritesNothingToDisk(t *testing.T) {
 // same packet under the same sequence, exactly as the disk tier always did.
 func TestUnackedMemoryBatchIsReservedUntilAcked(t *testing.T) {
 	s := openTemp(t)
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1), metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1), metric(2)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
-	first, ok, err := s.NextBatch(500)
+	first, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
-	again, ok, err := s.NextBatch(500)
+	again, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("re-NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -123,10 +131,10 @@ func TestUnackedMemoryBatchIsReservedUntilAcked(t *testing.T) {
 		t.Fatalf("unacked packet changed: first seq=%d n=%d, again seq=%d n=%d",
 			first.Sequence, len(first.Metrics), again.Sequence, len(again.Metrics))
 	}
-	if err := s.Ack(first.Sequence); err != nil {
+	if err := s.Ack(srvA, first.Sequence); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := s.NextBatch(500); ok {
+	if _, ok, _ := s.NextBatch(srvA, 500); ok {
 		t.Fatal("acked packet was served again")
 	}
 }
@@ -137,7 +145,7 @@ func TestUnackedMemoryBatchIsReservedUntilAcked(t *testing.T) {
 // arrive out of order and be folded twice.
 func TestSpilledBacklogIsServedBeforeMemory(t *testing.T) {
 	s := openTemp(t)
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(100)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(100)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil { // the agent was offline: this went durable
@@ -147,21 +155,21 @@ func TestSpilledBacklogIsServedBeforeMemory(t *testing.T) {
 		t.Fatal("Flush did not spill the buffer")
 	}
 	// Newer telemetry arrives after the spill and stays in memory.
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(200)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(200)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 
-	b, ok, err := s.NextBatch(500)
+	b, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
 	if len(b.Metrics) != 1 || b.Metrics[0].Value != 100 {
 		t.Fatalf("memory jumped the disk backlog: got %+v", b.Metrics)
 	}
-	if err := s.Ack(b.Sequence); err != nil {
+	if err := s.Ack(srvA, b.Sequence); err != nil {
 		t.Fatal(err)
 	}
-	b2, ok, err := s.NextBatch(500)
+	b2, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("second NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -178,22 +186,22 @@ func TestSpilledBacklogIsServedBeforeMemory(t *testing.T) {
 // sequence from disk rather than renumbering or reordering it.
 func TestSpillPreservesTheClaimedPacket(t *testing.T) {
 	s := openTemp(t)
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
-	inflight, ok, err := s.NextBatch(500)
+	inflight, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
 	// More telemetry arrives, then the whole tier goes durable (long outage).
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	got, ok, err := s.NextBatch(500)
+	got, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("post-spill NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -203,10 +211,10 @@ func TestSpillPreservesTheClaimedPacket(t *testing.T) {
 	if len(got.Metrics) != 1 || got.Metrics[0].Value != 1 {
 		t.Fatalf("in-flight packet changed content: %+v", got.Metrics)
 	}
-	if err := s.Ack(got.Sequence); err != nil {
+	if err := s.Ack(srvA, got.Sequence); err != nil {
 		t.Fatal(err)
 	}
-	next, ok, err := s.NextBatch(500)
+	next, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch after ack: ok=%v err=%v", ok, err)
 	}
@@ -219,23 +227,23 @@ func TestSpillPreservesTheClaimedPacket(t *testing.T) {
 func TestCloseFlushesSoRestartLosesNothing(t *testing.T) {
 	dir := tempWALDir(t)
 	path := filepath.Join(dir, "wal")
-	s, err := Open(path)
+	s, err := Open(path, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(7)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(7)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	again, err := Open(path)
+	again, err := Open(path, []string{srvA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = again.Close() })
-	b, ok, err := again.NextBatch(500)
+	b, ok, err := again.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("after restart: ok=%v err=%v", ok, err)
 	}
@@ -254,15 +262,15 @@ func TestSequencesNeverRepeatAcrossRestarts(t *testing.T) {
 	seen := map[uint64]bool{}
 
 	for restart := 0; restart < 3; restart++ {
-		s, err := Open(path)
+		s, err := Open(path, []string{srvA})
 		if err != nil {
 			t.Fatal(err)
 		}
 		for i := 0; i < 5; i++ {
-			if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}); err != nil {
+			if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(float64(i))}}, srvA); err != nil {
 				t.Fatal(err)
 			}
-			b, ok, err := s.NextBatch(500)
+			b, ok, err := s.NextBatch(srvA, 500)
 			if err != nil || !ok {
 				t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 			}
@@ -270,7 +278,7 @@ func TestSequencesNeverRepeatAcrossRestarts(t *testing.T) {
 				t.Fatalf("sequence %d reused after restart %d — the server would dedup it away", b.Sequence, restart)
 			}
 			seen[b.Sequence] = true
-			if err := s.Ack(b.Sequence); err != nil {
+			if err := s.Ack(srvA, b.Sequence); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -287,7 +295,7 @@ func TestBufferSpillsOnceItAges(t *testing.T) {
 	s := openTemp(t)
 	// Backdate the first group past the age limit, simulating an outage without
 	// making the test wait one out.
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
@@ -297,7 +305,7 @@ func TestBufferSpillsOnceItAges(t *testing.T) {
 		t.Fatalf("nothing should be durable yet, got %d rows", n)
 	}
 
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if n := storedRows(t, s); n != 2 {
@@ -318,17 +326,17 @@ func TestFastForwardRecoversWhenTheWatermarkIsInsideAReservedBlock(t *testing.T)
 	s := openTemp(t)
 
 	// A fresh WAL issues sequence 1 and reserves the block behind it.
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
-	first, ok, err := s.NextBatch(500)
+	first, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
 	}
 	if first.Sequence != 1 {
 		t.Fatalf("first sequence = %d, want 1", first.Sequence)
 	}
-	if err := s.Ack(first.Sequence); err != nil {
+	if err := s.Ack(srvA, first.Sequence); err != nil {
 		t.Fatal(err)
 	}
 
@@ -339,10 +347,10 @@ func TestFastForwardRecoversWhenTheWatermarkIsInsideAReservedBlock(t *testing.T)
 		t.Fatalf("FastForward: %v", err)
 	}
 
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
-	next, ok, err := s.NextBatch(500)
+	next, ok, err := s.NextBatch(srvA, 500)
 	if err != nil || !ok {
 		t.Fatalf("post-FastForward NextBatch: ok=%v err=%v", ok, err)
 	}
@@ -368,14 +376,14 @@ func TestSpillFailureDoesNotRejectTheAppend(t *testing.T) {
 	s.mu.Unlock()
 
 	// Force the age trigger so this append must try to spill.
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	s.mu.Lock()
 	s.mem[0].at = time.Now().UTC().Add(-memBufferAge - time.Second)
 	s.mu.Unlock()
 
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(2)}}, srvA); err != nil {
 		t.Fatalf("a failed spill must not reject records the buffer already holds: %v", err)
 	}
 	s.mu.Lock()
@@ -392,7 +400,7 @@ func TestSpillFailureDoesNotRejectTheAppend(t *testing.T) {
 // a spill happens to run.
 func TestExpiredBacklogIsNotServedAfterTheWindow(t *testing.T) {
 	s := openTemp(t)
-	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}); err != nil {
+	if _, err := s.Append(Records{Metrics: []telemetry.Metric{metric(1)}}, srvA); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil {
@@ -406,7 +414,7 @@ func TestExpiredBacklogIsNotServedAfterTheWindow(t *testing.T) {
 	}
 	s.mu.Unlock()
 
-	if _, ok, err := s.NextBatch(500); err != nil || ok {
+	if _, ok, err := s.NextBatch(srvA, 500); err != nil || ok {
 		t.Fatalf("expired backlog was served: ok=%v err=%v", ok, err)
 	}
 	if n := storedRows(t, s); n != 0 {

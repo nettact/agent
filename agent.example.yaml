@@ -1,10 +1,12 @@
 # nettact-agent — example configuration file.
 #
 # Precedence (highest first): config file > environment > built-in defaults.
-# Every key below corresponds 1:1 to a NETTACT_AGENT_* environment variable, and
-# a file value overrides that variable per key (unset keys fall through to the
-# environment). Validation, ranges, and error messages are shared with the
-# environment path, so an error still names the NETTACT_AGENT_* variable.
+# Every scalar key below corresponds 1:1 to a NETTACT_AGENT_* environment
+# variable, and a file value overrides that variable per key (unset keys fall
+# through to the environment). Validation, ranges, and error messages are shared
+# with the environment path, so an error still names the NETTACT_AGENT_*
+# variable. The one exception is `servers:` — a list of records has no
+# environment form, so it exists only here.
 #
 # Loading this file (first match wins):
 #   --config <path>                              (CLI flag)
@@ -24,11 +26,50 @@
 # Server base URL. Required (no default). Must be http(s).
 server_url: http://host:12450
 
-# Agent state directory (holds agent.key, agent.json, wal.db). Default ./agent-data.
+# Agent state directory (holds agent.key, agent.json, wal/). Default ./agent-data.
 #data_dir: ./agent-data
 
 # Skip TLS verification — LAN self-signed servers only. Default false.
 #tls_insecure: false
+
+# --- Reporting to more than one server --------------------------------------
+#
+# One agent can report to several servers at once — a home server and an
+# employer's, say. They are fully independent: separate credentials, separate
+# probe assignments, separate outages, and (below) separate permission grants.
+#
+# Use `servers:` INSTEAD OF server_url / enroll_token / enroll_token_file /
+# tls_insecure. Setting both is an error rather than a merge, because the order
+# of the list is meaningful and a mixed config has no obvious first entry.
+#
+# `name` is required and must be unique. It keys the saved credential and the
+# queued backlog, so renaming an entry re-enrolls it and discards its queue —
+# it cannot be derived from the URL, which a user may edit. The single-server
+# form above behaves exactly like one entry named "default", so spelling that
+# out is a lossless way to add a second server later.
+#
+# The FIRST entry additionally owns game/frame capture: the sensor is one child
+# process and only one server can configure it or receive its data.
+#
+#servers:
+#  - name: default
+#    url: http://host:12450
+#    enroll_token_file: /run/secrets/home_enroll_token
+#  - name: work
+#    url: https://nettact.corp.example:12450
+#    enroll_token_file: /run/secrets/work_enroll_token
+#    #tls_insecure: false
+#    # Per-server permission grant, replacing the top-level `permissions` for
+#    # this server only. This is how one machine tells a home server it may read
+#    # host metrics while telling an employer's it may only run basic probes.
+#    permissions:
+#      - probe.icmp
+#      - probe.dns
+#    # Per-server target-access narrowing. The top-level `probe_access` below is
+#    # the machine's floor and cannot be widened here: a target must pass BOTH.
+#    #probe_access:
+#    #  mode: allowlist
+#    #  allowlist: [cidr:10.0.0.0/8]
 
 # WAL drain cadence — how often buffered telemetry is uploaded. Default 30s.
 # Lower values make dashboards fresher at the cost of ~linearly more server

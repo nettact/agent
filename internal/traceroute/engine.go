@@ -85,16 +85,36 @@ type Engine struct {
 	// request then fails closed with egress_not_available.
 	egress EgressResolver
 
-	sem  chan struct{} // per-Agent concurrency limiter
+	sem  chan struct{} // machine-wide concurrency limiter, shared across servers
 	caps capabilities
 }
 
-// New builds an Engine. concurrency <= 0 selects DefaultConcurrency. The
-// permission views are the agent's immutable process-wide sets; supported must
-// already reflect this build+runtime's real ICMP/TCP capability (see Supported).
-func New(guard *netguard.Guard, effective, granted, supported permission.Set, concurrency int, egress EgressResolver) *Engine {
+// Limiter bounds simultaneously executing traces on this machine.
+//
+// It is created once and handed to every server's Engine, rather than each
+// engine sizing its own. An agent reporting to several servers builds an engine
+// per server — permissions and the target-access guard are per server, so the
+// adjudication has to be — but what the limit protects is not: raw sockets,
+// probe threads and the burst of packets they emit are the machine's, and they
+// do not become more plentiful because a second server asked for a trace.
+type Limiter chan struct{}
+
+// NewLimiter builds the machine's trace-concurrency budget. concurrency <= 0
+// selects DefaultConcurrency.
+func NewLimiter(concurrency int) Limiter {
 	if concurrency <= 0 {
 		concurrency = DefaultConcurrency
+	}
+	return make(Limiter, concurrency)
+}
+
+// New builds an Engine for one server. The permission views are that server's
+// immutable sets; supported must already reflect this build+runtime's real
+// ICMP/TCP capability (see Supported). lim is the machine-wide budget — pass the
+// same Limiter to every engine.
+func New(guard *netguard.Guard, effective, granted, supported permission.Set, lim Limiter, egress EgressResolver) *Engine {
+	if lim == nil {
+		lim = NewLimiter(0)
 	}
 	return &Engine{
 		guard:     guard,
@@ -102,7 +122,7 @@ func New(guard *netguard.Guard, effective, granted, supported permission.Set, co
 		granted:   granted,
 		supported: supported,
 		egress:    egress,
-		sem:       make(chan struct{}, concurrency),
+		sem:       lim,
 		caps:      detectCapabilities(),
 	}
 }

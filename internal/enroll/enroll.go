@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,6 +49,17 @@ func BuildRequest(priv ed25519.PrivateKey, token, hostname, platform, version st
 	}
 }
 
+// ErrRejected marks an enrollment the server ANSWERED and refused — a spent or
+// expired token, a site at its agent quota, a schema it will not accept.
+//
+// It exists because the two ways enrollment fails call for opposite responses. A
+// server that cannot be reached is a transient condition the agent retries out
+// of on its own, and telling the user their token is bad would have them discard
+// a token that is still perfectly good. A server that replied "no" will keep
+// replying "no" until a human does something. Only a reply can distinguish them,
+// so only this path can carry the distinction.
+var ErrRejected = errors.New("server rejected the enrollment")
+
 // Post performs the HTTP POST /api/v1/enroll exchange (standalone path).
 func Post(ctx context.Context, serverURL string, insecure bool,
 	req protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
@@ -73,7 +85,15 @@ func Post(ctx context.Context, serverURL string, insecure bool,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return protoenroll.EnrollResponse{}, fmt.Errorf("enroll failed (%s): %s", resp.Status, string(msg))
+		err := fmt.Errorf("enroll failed (%s): %s", resp.Status, string(msg))
+		// 4xx is the server having read the request and refused it. 5xx is not:
+		// a server that is starting up, out of disk, or behind a proxy returning
+		// 502 will accept the very same token once it recovers, so it stays in
+		// the retryable class.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return protoenroll.EnrollResponse{}, fmt.Errorf("%w: %v", ErrRejected, err)
+		}
+		return protoenroll.EnrollResponse{}, err
 	}
 
 	var er protoenroll.EnrollResponse

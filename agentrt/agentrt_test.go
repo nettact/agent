@@ -7,12 +7,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/nettact/agent/internal/identity"
+	protoenroll "github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/wire"
 )
@@ -35,18 +37,130 @@ func TestSubprotocolFor(t *testing.T) {
 	}
 }
 
+// TestConfigNormalizeServerRules pins what a server list has to satisfy before
+// any of it is acted on. Each rule guards something that would otherwise fail
+// far from its cause: an unnamed entry has nowhere to keep its credential, two
+// entries under one name share a credential and a WAL cursor while running two
+// sessions (the superseded-kick loop written as a configuration), and an entry
+// with neither a URL nor an injected transport has nothing to dial.
+func TestConfigNormalizeServerRules(t *testing.T) {
+	policy := permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault}
+	dialer := wire.Dialer(func(context.Context, string) (wire.Conn, error) { return nil, errors.New("unused") })
+	enroller := func(context.Context, protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
+		return protoenroll.EnrollResponse{}, errors.New("unused")
+	}
+
+	for _, tc := range []struct {
+		name    string
+		servers []ServerConfig
+		want    string // "" means the configuration must be accepted
+	}{{
+		name: "no servers",
+		want: "must name at least one server",
+	}, {
+		name:    "nameless entry",
+		servers: []ServerConfig{{URL: "https://home.example"}},
+		want:    "Servers[0] has no name",
+	}, {
+		name: "duplicate names",
+		servers: []ServerConfig{
+			{Name: "home", URL: "https://a.example"},
+			{Name: "home", URL: "https://b.example"},
+		},
+		want: `duplicate server name "home"`,
+	}, {
+		name:    "no url and no injected transport",
+		servers: []ServerConfig{{Name: "home"}},
+		want:    "needs a URL unless both Dialer and Enroller are set",
+	}, {
+		// Half of the injected pair is not enough: the default HTTP enroller still
+		// needs a URL to POST to.
+		name:    "url-less with only a dialer",
+		servers: []ServerConfig{{Name: "home", Dialer: dialer}},
+		want:    "needs a URL unless both Dialer and Enroller are set",
+	}, {
+		name:    "url-less with only an enroller",
+		servers: []ServerConfig{{Name: "home", Enroller: enroller}},
+		want:    "needs a URL unless both Dialer and Enroller are set",
+	}, {
+		// The desktop's own server: nothing addresses it by URL, and both halves of
+		// the exchange are injected.
+		name:    "url-less with both injected",
+		servers: []ServerConfig{{Name: "local", Dialer: dialer, Enroller: enroller}},
+	}, {
+		name:    "ordinary single server",
+		servers: []ServerConfig{{Name: "default", URL: "https://home.example"}},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Servers: tc.servers, Policy: policy}
+			err := cfg.normalize()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("normalize() = %v, want the configuration accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("normalize() = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// agentDataDir returns a DataDir for a Run, removed at test end with a retry.
+//
+// Deliberately not t.TempDir(): Run's WAL writes and renames segment files right
+// up to the moment it closes, and Windows can keep a just-closed file in the
+// directory listing a fraction longer than Close suggests — long enough for
+// t.TempDir's single RemoveAll to fail with "The directory is not empty" and
+// fail an otherwise passing test. Same workaround, for the same reason, as the
+// conn package's WAL tests.
+func agentDataDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "nettact-agentrt-test-")
+	if err != nil {
+		t.Fatalf("make temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			err := os.RemoveAll(dir)
+			if err == nil {
+				if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+					return
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("remove temp dir %s: %v", dir, err)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
+// TestRevokedCredentialOutcomeDependsOnDeletion pins what a 4004 does to the
+// runner, which turns entirely on whether the dead credential could be removed.
+//
+// Revocation is no longer terminal: the runner deletes that server's credential
+// and re-enrolls in place, so one server being deleted cannot stop the others.
+// This Config carries no TokenSource, so the re-enrollment has nothing to enroll
+// with and the runner stops with ErrEnroll — proof it got as far as trying. When
+// the deletion fails instead, the stale credential is still on disk and looping
+// would only be revoked again, so the runner stops on that failure and never
+// reaches enrollment.
 func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		blockDeletion bool
-		wantRevoked   bool
 	}{
-		{name: "deleted", wantRevoked: true},
-		{name: "delete-fails", blockDeletion: true, wantRevoked: false},
+		{name: "deleted"},
+		{name: "delete-fails", blockDeletion: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dataDir := t.TempDir()
-			if err := identity.SaveCredential(dataDir, identity.Credential{
+			dataDir := agentDataDir(t)
+			if err := identity.SaveCredential(dataDir, "default", identity.Credential{
 				AgentID: "agent-test", SiteID: "site-test", AgentToken: "test-token",
 			}); err != nil {
 				t.Fatalf("save credential: %v", err)
@@ -109,7 +223,8 @@ func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			err := Run(ctx, Config{
-				ServerURL: srv.URL, DataDir: dataDir, WireFormat: "json",
+				Servers: []ServerConfig{{Name: "default", URL: srv.URL}},
+				DataDir: dataDir, WireFormat: "json",
 				// Short, not long. The session drains once on connect and then on
 				// this interval; an hour-long one means that if the first drain
 				// happens to run before the heartbeat has written anything, the
@@ -124,15 +239,32 @@ func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 			default:
 				t.Fatal("server did not reach the revocation step")
 			}
-			if got := errors.Is(err, ErrRevoked); got != tc.wantRevoked {
-				t.Fatalf("errors.Is(%v, ErrRevoked) = %v; want %v", err, got, tc.wantRevoked)
+			if err == nil {
+				t.Fatal("revoked session returned nil; want a terminal outcome")
 			}
-			if tc.wantRevoked {
-				if _, statErr := os.Stat(filepath.Join(dataDir, "agent.json")); !errors.Is(statErr, os.ErrNotExist) {
-					t.Fatalf("credential still exists after revocation: %v", statErr)
+			if tc.blockDeletion {
+				// The failure the runner stopped on is the deletion, not an
+				// enrollment it must never have attempted with a live credential
+				// still on disk.
+				if !strings.Contains(err.Error(), "delete revoked credential") {
+					t.Fatalf("blocked-deletion outcome = %v, want the deletion failure named", err)
 				}
-			} else if err == nil {
-				t.Fatal("deletion failure returned nil")
+				if errors.Is(err, ErrEnroll) {
+					t.Fatalf("blocked-deletion outcome = %v, want no re-enrollment attempt", err)
+				}
+				return
+			}
+			// The deletion succeeded, so the runner re-enrolled — and with no
+			// TokenSource that is where it stopped.
+			if !errors.Is(err, ErrEnroll) {
+				t.Fatalf("post-deletion outcome = %v, want ErrEnroll from the re-enrollment", err)
+			}
+			creds, loadErr := identity.LoadCredentials(dataDir)
+			if loadErr != nil {
+				t.Fatalf("load credentials: %v", loadErr)
+			}
+			if _, ok := creds["default"]; ok {
+				t.Fatalf("revoked credential still on disk: %+v", creds)
 			}
 		})
 	}

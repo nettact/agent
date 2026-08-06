@@ -21,13 +21,18 @@ import (
 //
 //	000000000000000001.seg   one spill's worth of groups, one JSON line each
 //	000000000000000002.seg
-//	state.json               allocator position, consumed prefix, active claim
+//	state.json               allocator positions and one cursor per server
 //
 // A spill writes a WHOLE new segment — it is never appended to — because a spill
 // already is the old store's "one transaction": composing it in a temp file and
 // publishing it with a rename makes it atomically all-or-nothing, so no reader
-// can ever observe half a spill. Consuming is a forward move of the head pointer
-// in state.json, and a segment is deleted outright once the head has passed it.
+// can ever observe half a spill. Consuming moves a server's cursor forward in
+// state.json, and a segment is deleted once no server still owes anything in it.
+//
+// Every line carries the group id and the owning server, so the files are
+// self-describing: a scan can rebuild the live set from the cursors alone, which
+// is what lets a restart tell "server A already acked this" from "server B has
+// not reached it yet" for two groups sitting side by side.
 //
 // Durability: both segment and state files are fsynced before their rename, but
 // the containing directory is never fsynced (there is no portable way to on
@@ -44,54 +49,60 @@ const (
 	segSuffix   = ".seg"
 	tmpPattern  = "wal-*.tmp"
 	stateName   = "state.json"
-	stateFormat = 1
+	stateFormat = 2
 )
 
-// segLine is one group as stored: the arrival time that drives retention, and
-// the Records themselves. One line is one indivisible group — the invariant the
-// old row-level store needed an explicit group id to protect is structural here.
+// segLine is one group as stored: the group id, the server it belongs to, the
+// arrival time that drives retention, and the Records themselves. One line is
+// one indivisible group — the invariant the old row-level store needed an
+// explicit group id to protect is structural here.
 type segLine struct {
-	At time.Time `json:"at"`
-	R  Records   `json:"r"`
+	At    time.Time `json:"at"`
+	Gid   uint64    `json:"gid"`
+	Owner string    `json:"owner"`
+	R     Records   `json:"r"`
 }
 
 // diskGroup locates one live group without holding its payload: the segment it
-// is in, the byte range of its line, plus the two facts the store reasons about
-// constantly (arrival time for retention, row count for caps and Pending).
-// Keeping offsets means serving a claim reads only the claimed lines rather than
-// re-scanning a segment that may hold thousands of groups.
+// is in, the byte range of its line, plus the facts the store reasons about
+// constantly (group id and owner for cursor arithmetic, arrival time for
+// retention, row count for caps and Pending). Keeping offsets means serving a
+// claim reads only the claimed lines rather than re-scanning a segment that may
+// hold thousands of groups.
 type diskGroup struct {
-	seg  uint64
-	line int // 0-based position within the segment; what the head pointer counts
-	off  int64
-	size int
-	at   time.Time
-	n    int
+	gid   uint64
+	owner string
+	seg   uint64
+	line  int // 0-based position within the segment
+	off   int64
+	size  int
+	at    time.Time
+	n     int
 }
 
-// diskPos is the consumed-prefix pointer: everything in segments before seg is
-// dead, as are the first grp lines of seg itself.
-type diskPos struct {
-	seg uint64
-	grp int
-}
-
-// diskClaim marks the first n live groups as belonging to an already-issued
-// packet. It replaces the per-row packet_seq tag the SQLite store used, and is
-// sufficient because claims are only ever taken from the head.
-type diskClaim struct {
-	seq uint64
-	n   int
+// cursorState is one server's persisted position. The claim fields are omitted
+// when there is none in flight, so a store whose servers are all idle renders a
+// state file barely longer than the allocator positions.
+type cursorState struct {
+	Acked     uint64 `json:"acked"`
+	ClaimSeq  uint64 `json:"claim_seq,omitempty"`
+	ClaimFrom uint64 `json:"claim_from,omitempty"`
+	ClaimTo   uint64 `json:"claim_to,omitempty"`
+	ClaimN    int    `json:"claim_n,omitempty"`
 }
 
 // walState is state.json. Small and rewritten whole; there is no partial update.
+//
+// NextGid rides along with every write for one reason: a cursor's Acked is a gid,
+// so a restart that handed out gids below a persisted watermark would declare
+// fresh groups already-delivered. Both are written together, so Acked < NextGid
+// holds in every state file that was ever published, and Open only has to take
+// the maximum of what it finds.
 type walState struct {
-	V        int    `json:"v"`
-	NextSeq  uint64 `json:"next_seq"`
-	HeadSeg  uint64 `json:"head_seg"`
-	HeadGrp  int    `json:"head_grp"`
-	ClaimSeq uint64 `json:"claim_seq,omitempty"`
-	ClaimN   int    `json:"claim_n,omitempty"`
+	V       int                    `json:"v"`
+	NextSeq uint64                 `json:"next_seq"`
+	NextGid uint64                 `json:"next_gid"`
+	Cursors map[string]cursorState `json:"cursors,omitempty"`
 }
 
 // segPath renders a segment's path. The counter is zero-padded so a lexical
@@ -173,7 +184,7 @@ func writeSegmentTemp(dir string, groups []memGroup) (tmpPath string, index []di
 	var off int64
 	for _, g := range groups {
 		var line []byte
-		line, err = json.Marshal(segLine{At: g.at, R: g.rec})
+		line, err = json.Marshal(segLine{At: g.at, Gid: g.gid, Owner: g.owner, R: g.rec})
 		if err != nil {
 			return "", nil, err
 		}
@@ -181,7 +192,9 @@ func writeSegmentTemp(dir string, groups []memGroup) (tmpPath string, index []di
 		if _, err = w.Write(line); err != nil {
 			return "", nil, err
 		}
-		index = append(index, diskGroup{line: len(index), off: off, size: len(line), at: g.at, n: g.n})
+		index = append(index, diskGroup{
+			gid: g.gid, owner: g.owner, line: len(index), off: off, size: len(line), at: g.at, n: g.n,
+		})
 		off += int64(len(line))
 	}
 	if err = w.Flush(); err != nil {
@@ -223,7 +236,8 @@ func scanSegment(path string, seg uint64) ([]diskGroup, error) {
 				break
 			}
 			out = append(out, diskGroup{
-				seg: seg, line: len(out), off: off, size: len(line), at: sl.At, n: rowsOf(sl.R),
+				gid: sl.Gid, owner: sl.Owner, seg: seg, line: len(out),
+				off: off, size: len(line), at: sl.At, n: rowsOf(sl.R),
 			})
 			off += int64(len(line))
 		}

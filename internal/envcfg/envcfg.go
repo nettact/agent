@@ -30,8 +30,10 @@ type Lookup func(string) (string, bool)
 const maxTokenFileBytes = 4 << 10
 
 // Load parses the environment into an agentrt.Config. lookup is injectable for
-// tests (pass os.LookupEnv in production).
-func Load(lookup Lookup) (agentrt.Config, error) {
+// tests (pass os.LookupEnv in production); file carries the one setting that has
+// no environment form — the servers list — and is the zero File when there is no
+// configuration file.
+func Load(lookup Lookup, file File) (agentrt.Config, error) {
 	var errs []error
 	add := func(err error) {
 		if err != nil {
@@ -41,32 +43,10 @@ func Load(lookup Lookup) (agentrt.Config, error) {
 
 	cfg := agentrt.Config{}
 
-	// SERVER_URL (required).
-	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_SERVER_URL", &errs); ok {
-		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			add(fmt.Errorf("NETTACT_AGENT_SERVER_URL must be a http(s) URL, got %q", v))
-		} else {
-			cfg.ServerURL = v
-		}
-	} else if !present(lookup, "NETTACT_AGENT_SERVER_URL") {
-		add(errors.New("NETTACT_AGENT_SERVER_URL is required"))
-	}
-
 	// DATA_DIR (default ./agent-data).
 	cfg.DataDir = "./agent-data"
 	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_DATA_DIR", &errs); ok {
 		cfg.DataDir = v
-	}
-
-	// TLS_INSECURE (bool, default false).
-	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_TLS_INSECURE", &errs); ok {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			add(fmt.Errorf("NETTACT_AGENT_TLS_INSECURE must be a boolean, got %q", v))
-		} else {
-			cfg.Insecure = b
-		}
 	}
 
 	// UPLOAD_INTERVAL (duration, default 30s — the protocol constant, so the
@@ -91,22 +71,217 @@ func Load(lookup Lookup) (agentrt.Config, error) {
 		}
 	}
 
-	// PERMISSIONS.
+	// PERMISSIONS — the agent-wide default grant, inherited by any server entry
+	// that does not name its own.
 	cfg.Policy = loadPolicy(lookup, &errs)
 
-	// PROBE ACCESS.
+	// PROBE ACCESS — the machine's floor. A server entry may narrow it, never
+	// widen it.
 	cfg.ProbeAccess = loadProbeAccess(lookup, &errs)
 
 	// LIMITS.
 	cfg.Limits = loadLimits(lookup, &errs)
 
-	// TOKEN (mutually exclusive sources; read the file now).
-	cfg.TokenSource = loadTokenSource(lookup, &errs)
+	// SERVERS (the list, or the single-server variables as one entry).
+	cfg.Servers = loadServers(lookup, file, &errs)
 
 	if len(errs) > 0 {
 		return agentrt.Config{}, errors.Join(errs...)
 	}
 	return cfg, nil
+}
+
+// defaultServerName is the entry name the single-server form produces.
+//
+// It is fixed rather than derived so that spelling the same server out as a
+// one-element servers list keeps the credential and the queued backlog: name the
+// entry "default" and nothing re-enrolls. Deriving it from the URL instead would
+// make editing an address look like adding a machine.
+const defaultServerName = "default"
+
+// singleServerVars are the settings that describe a server without the list
+// form. They exist as the ordinary one-server spelling, and are refused
+// alongside a servers list rather than merged into it — a config that says both
+// has two answers for which server is first, and the first is the one that owns
+// frame capture.
+var singleServerVars = []string{
+	"NETTACT_AGENT_SERVER_URL",
+	"NETTACT_AGENT_ENROLL_TOKEN",
+	"NETTACT_AGENT_ENROLL_TOKEN_FILE",
+	"NETTACT_AGENT_TLS_INSECURE",
+}
+
+// loadServers builds the server list. A `servers:` list in the configuration
+// file wins outright; otherwise the single-server variables describe one entry.
+func loadServers(lookup Lookup, file File, errs *[]error) []agentrt.ServerConfig {
+	if len(file.servers) == 0 {
+		return []agentrt.ServerConfig{singleServer(lookup, errs)}
+	}
+
+	for _, name := range singleServerVars {
+		if present(lookup, name) {
+			*errs = append(*errs, fmt.Errorf("`servers:` and %s are mutually exclusive; put the setting inside the servers entry", name))
+		}
+	}
+
+	out := make([]agentrt.ServerConfig, 0, len(file.servers))
+	seen := make(map[string]bool, len(file.servers))
+	for i, e := range file.servers {
+		label := fmt.Sprintf("servers[%d]", i)
+		sc := agentrt.ServerConfig{}
+
+		// Every entry names itself. The name keys the credential and the queued
+		// backlog, so it cannot be derived from a field the user may edit: a
+		// changed URL would silently look like a different machine and re-enroll.
+		switch {
+		case e.Name == nil || strings.TrimSpace(*e.Name) == "":
+			*errs = append(*errs, fmt.Errorf("%s: name is required", label))
+		default:
+			sc.Name = strings.TrimSpace(*e.Name)
+			if err := validServerName(sc.Name); err != nil {
+				*errs = append(*errs, fmt.Errorf("%s: %w", label, err))
+			}
+			if seen[sc.Name] {
+				*errs = append(*errs, fmt.Errorf("%s: duplicate server name %q", label, sc.Name))
+			}
+			seen[sc.Name] = true
+			label = fmt.Sprintf("servers[%s]", sc.Name)
+		}
+
+		if e.URL == nil || strings.TrimSpace(*e.URL) == "" {
+			*errs = append(*errs, fmt.Errorf("%s: url is required", label))
+		} else if v := strings.TrimSpace(*e.URL); !validServerURL(v) {
+			*errs = append(*errs, fmt.Errorf("%s: url must be a http(s) URL, got %q", label, v))
+		} else {
+			sc.URL = v
+		}
+
+		if e.TLSInsecure != nil {
+			sc.Insecure = *e.TLSInsecure
+		}
+		sc.TokenSource = entryTokenSource(label, e, errs)
+
+		if e.Permissions != nil {
+			granted := parsePermissions(label+".permissions", e.Permissions.csv(), errs)
+			sc.Policy = &permission.Policy{Granted: granted, Source: permission.SourceServerConfig}
+		}
+		if e.ProbeAccess != nil {
+			p := parseProbeAccess(label+".probe_access", e.ProbeAccess, errs)
+			sc.ProbeNarrow = &p
+		}
+		out = append(out, sc)
+	}
+	return out
+}
+
+// singleServer builds the one entry the environment form describes.
+func singleServer(lookup Lookup, errs *[]error) agentrt.ServerConfig {
+	sc := agentrt.ServerConfig{Name: defaultServerName}
+	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_SERVER_URL", errs); ok {
+		if !validServerURL(v) {
+			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_SERVER_URL must be a http(s) URL, got %q", v))
+		} else {
+			sc.URL = v
+		}
+	} else if !present(lookup, "NETTACT_AGENT_SERVER_URL") {
+		*errs = append(*errs, errors.New("NETTACT_AGENT_SERVER_URL is required (or configure a `servers:` list)"))
+	}
+
+	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_TLS_INSECURE", errs); ok {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_TLS_INSECURE must be a boolean, got %q", v))
+		} else {
+			sc.Insecure = b
+		}
+	}
+	sc.TokenSource = loadTokenSource(lookup, errs)
+	return sc
+}
+
+// validServerURL reports whether v addresses a server.
+func validServerURL(v string) bool {
+	u, err := url.Parse(v)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+// validServerName enforces the charset the name has to survive: it becomes a key
+// in agent.json and in the WAL's state file, and appears in every log line the
+// server's session writes.
+func validServerName(name string) error {
+	if len(name) > 64 {
+		return fmt.Errorf("name %q is too long (max 64 characters)", name)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return fmt.Errorf("name %q may only contain lowercase letters, digits, '-' and '_'", name)
+		}
+	}
+	return nil
+}
+
+// entryTokenSource resolves one server entry's enrollment token, applying the
+// same rules the environment form does: the two sources are mutually exclusive,
+// the file is read now rather than at enrollment time (so a bad path fails at
+// startup, when someone is watching), and neither being set is not an error —
+// the entry may already hold a credential, and the runner only asks for a token
+// when it does not.
+func entryTokenSource(label string, e serverEntryFile, errs *[]error) func(context.Context) (string, error) {
+	tokSet := e.EnrollToken != nil
+	fileSet := e.EnrollTokenFile != nil
+	if tokSet && fileSet {
+		*errs = append(*errs, fmt.Errorf("%s: enroll_token and enroll_token_file are mutually exclusive", label))
+		return nil
+	}
+	if fileSet {
+		token, err := readTokenFile(strings.TrimSpace(*e.EnrollTokenFile))
+		if err != nil {
+			*errs = append(*errs, fmt.Errorf("%s.enroll_token_file: %w", label, err))
+			return nil
+		}
+		return func(context.Context) (string, error) { return token, nil }
+	}
+	if tokSet {
+		token := strings.TrimSpace(*e.EnrollToken)
+		if token == "" {
+			*errs = append(*errs, fmt.Errorf("%s: enroll_token is set but empty", label))
+			return nil
+		}
+		return func(context.Context) (string, error) { return token, nil }
+	}
+	return func(context.Context) (string, error) {
+		return "", fmt.Errorf("%s: first enrollment needs enroll_token or enroll_token_file: %w", label, agentrt.ErrNoEnrollmentToken)
+	}
+}
+
+// readTokenFile reads and validates an enrollment-token file. The read is
+// bounded to one byte past the limit before allocating, so a huge local file
+// cannot be slurped whole just to be rejected.
+func readTokenFile(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("is set but empty")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		// *PathError already renders as `open <path>: <cause>`, so it names
+		// the path without this repeating it.
+		return "", err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
+	_ = f.Close()
+	if err != nil {
+		return "", fmt.Errorf("reading %q failed: %w", path, err)
+	}
+	if len(data) > maxTokenFileBytes {
+		return "", fmt.Errorf("%q is too large", path)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("%q is empty", path)
+	}
+	return token, nil
 }
 
 func present(lookup Lookup, name string) bool {
@@ -141,8 +316,19 @@ func loadPolicy(lookup Lookup, errs *[]error) permission.Policy {
 		*errs = append(*errs, errors.New("NETTACT_AGENT_PERMISSIONS is set but empty; use `none` or unset it"))
 		return permission.Policy{Granted: permission.Set{}, Source: permission.SourceEnvironment}
 	}
-	if strings.EqualFold(t, "none") {
-		return permission.Policy{Granted: permission.Set{}, Source: permission.SourceEnvironment}
+	return permission.Policy{
+		Granted: parsePermissions("NETTACT_AGENT_PERMISSIONS", t, errs),
+		Source:  permission.SourceEnvironment,
+	}
+}
+
+// parsePermissions turns a CSV grant into a validated set. label names the
+// setting in any error, so the same parser serves the environment variable and a
+// per-server entry in the configuration file.
+func parsePermissions(label, csv string, errs *[]error) permission.Set {
+	t := strings.TrimSpace(csv)
+	if strings.EqualFold(t, "none") || t == "" {
+		return permission.Set{}
 	}
 	granted := permission.Set{}
 	for _, tok := range strings.Split(t, ",") {
@@ -151,15 +337,15 @@ func loadPolicy(lookup Lookup, errs *[]error) permission.Policy {
 			continue
 		}
 		if tok == "*" || strings.EqualFold(tok, "all") {
-			*errs = append(*errs, errors.New("NETTACT_AGENT_PERMISSIONS: wildcards (\"*\"/\"all\") are not supported; list explicit permissions"))
+			*errs = append(*errs, fmt.Errorf("%s: wildcards (\"*\"/\"all\") are not supported; list explicit permissions", label))
 			continue
 		}
 		granted.Add(permission.ID(tok))
 	}
 	if err := permission.Validate(granted); err != nil {
-		*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_PERMISSIONS: %w", err))
+		*errs = append(*errs, fmt.Errorf("%s: %w", label, err))
 	}
-	return permission.Policy{Granted: granted, Source: permission.SourceEnvironment}
+	return granted
 }
 
 // loadProbeAccess builds the probe target-access policy.
@@ -171,29 +357,71 @@ func loadProbeAccess(lookup Lookup, errs *[]error) probepolicy.Policy {
 	if !modeSet && !allowSet && !denySet {
 		return probepolicy.Default()
 	}
+	return buildProbeAccess(probeAccessInput{
+		label:    "NETTACT_AGENT_PROBE",
+		modeName: "NETTACT_AGENT_PROBE_ACCESS_MODE",
+		allowLbl: "NETTACT_AGENT_PROBE_ALLOWLIST",
+		denyLbl:  "NETTACT_AGENT_PROBE_DENYLIST",
+		mode:     modeV,
+		allow:    allowV,
+		deny:     denyV,
+		denySet:  denySet,
+	}, errs)
+}
 
-	mode := probepolicy.Mode(strings.ToLower(strings.TrimSpace(modeV)))
+// parseProbeAccess builds the narrowing policy of one server entry.
+func parseProbeAccess(label string, pa *probeAccessFile, errs *[]error) probepolicy.Policy {
+	in := probeAccessInput{
+		label:    label,
+		modeName: label + ".mode",
+		allowLbl: label + ".allowlist",
+		denyLbl:  label + ".denylist",
+	}
+	if pa.Mode != nil {
+		in.mode = *pa.Mode
+	}
+	if pa.Allowlist != nil {
+		in.allow = pa.Allowlist.csv()
+	}
+	if pa.Denylist != nil {
+		in.deny = pa.Denylist.csv()
+		in.denySet = true
+	}
+	return buildProbeAccess(in, errs)
+}
+
+// probeAccessInput is one probe-access group's raw values plus the labels used
+// to report a problem with them.
+type probeAccessInput struct {
+	label                       string
+	modeName, allowLbl, denyLbl string
+	mode, allow, deny           string
+	denySet                     bool
+}
+
+func buildProbeAccess(in probeAccessInput, errs *[]error) probepolicy.Policy {
+	mode := probepolicy.Mode(strings.ToLower(strings.TrimSpace(in.mode)))
 	if mode != probepolicy.ModeAllowlist && mode != probepolicy.ModeDenylist {
-		*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_PROBE_ACCESS_MODE must be 'allowlist' or 'denylist' when any probe-access variable is set, got %q", modeV))
+		*errs = append(*errs, fmt.Errorf("%s must be 'allowlist' or 'denylist' when any probe-access setting is present, got %q", in.modeName, in.mode))
 		return probepolicy.Default()
 	}
 
-	allow := parseSelectors("NETTACT_AGENT_PROBE_ALLOWLIST", allowV, errs)
+	allow := parseSelectors(in.allowLbl, in.allow, errs)
 	// A literal "none" denylist means "deny nothing".
 	var deny []probepolicy.Selector
-	denyIsNone := denySet && strings.EqualFold(strings.TrimSpace(denyV), "none")
+	denyIsNone := in.denySet && strings.EqualFold(strings.TrimSpace(in.deny), "none")
 	if !denyIsNone {
-		deny = parseSelectors("NETTACT_AGENT_PROBE_DENYLIST", denyV, errs)
+		deny = parseSelectors(in.denyLbl, in.deny, errs)
 	}
 
 	switch mode {
 	case probepolicy.ModeAllowlist:
 		if len(allow) == 0 {
-			*errs = append(*errs, errors.New("NETTACT_AGENT_PROBE_ALLOWLIST must be non-empty in allowlist mode"))
+			*errs = append(*errs, fmt.Errorf("%s must be non-empty in allowlist mode", in.allowLbl))
 		}
 	case probepolicy.ModeDenylist:
 		if len(deny) == 0 && !denyIsNone {
-			*errs = append(*errs, errors.New("NETTACT_AGENT_PROBE_DENYLIST must be non-empty (or `none`) in denylist mode"))
+			*errs = append(*errs, fmt.Errorf("%s must be non-empty (or `none`) in denylist mode", in.denyLbl))
 		}
 	}
 	return probepolicy.Policy{Mode: mode, Allow: allow, Deny: deny}
@@ -291,32 +519,9 @@ func loadTokenSource(lookup Lookup, errs *[]error) func(context.Context) (string
 
 	if fileSet {
 		path := strings.TrimSpace(fileV)
-		if path == "" {
-			*errs = append(*errs, errors.New("NETTACT_AGENT_ENROLL_TOKEN_FILE is set but empty"))
-			return nil
-		}
-		// Bound the read to one byte past the limit before allocating, so a huge
-		// local file cannot be slurped whole just to be rejected.
-		f, err := os.Open(path)
+		token, err := readTokenFile(path)
 		if err != nil {
-			// *PathError already renders as `open <path>: <cause>`, so it names
-			// the path without this repeating it.
 			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: %w", err))
-			return nil
-		}
-		data, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
-		_ = f.Close()
-		if err != nil {
-			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: reading %q failed: %w", path, err))
-			return nil
-		}
-		if len(data) > maxTokenFileBytes {
-			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: %q is too large", path))
-			return nil
-		}
-		token := strings.TrimSpace(string(data))
-		if token == "" {
-			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: %q is empty", path))
 			return nil
 		}
 		return func(context.Context) (string, error) { return token, nil }
@@ -333,6 +538,6 @@ func loadTokenSource(lookup Lookup, errs *[]error) func(context.Context) (string
 
 	// Neither set: enrollment can only proceed from a pre-existing credential.
 	return func(context.Context) (string, error) {
-		return "", errors.New("first run requires NETTACT_AGENT_ENROLL_TOKEN or NETTACT_AGENT_ENROLL_TOKEN_FILE")
+		return "", fmt.Errorf("first run requires NETTACT_AGENT_ENROLL_TOKEN or NETTACT_AGENT_ENROLL_TOKEN_FILE: %w", agentrt.ErrNoEnrollmentToken)
 	}
 }
