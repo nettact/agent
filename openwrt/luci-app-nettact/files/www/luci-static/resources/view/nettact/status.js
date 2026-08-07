@@ -44,6 +44,11 @@ return view.extend({
 					E('br'), E('small', {}, st.binary_path) ])
 				: E('em', {}, _('not downloaded yet')) ],
 			[ _('Storage mode'), st.mode === 'flash' ? _('Flash') : _('RAM (re-downloaded each boot)') ],
+			[ _('Configuration'), st.config_source === 'manual'
+				? E('span', {}, [ _('Hand-written — LuCI settings are ignored'),
+					E('br'), E('small', {}, st.config_path) ])
+				: E('span', {}, [ _('Generated from these settings'),
+					E('br'), E('small', {}, st.config_path) ]) ],
 			[ _('Architecture'), st.arch || E('em', {}, _('unrecognised')) ]
 		];
 

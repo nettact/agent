@@ -146,6 +146,11 @@ do_install() {
 
 	mkdir -p "$dir" || return 1
 
+	# A download is the other moment a mode switch becomes visible, so the stale
+	# copy goes here too: the LuCI "download / update binary" button must not
+	# leave the flash copy behind after the user moved the agent into RAM.
+	nettact_prune_stale_binary
+
 	# The temp file must sit on the SAME filesystem as its destination so the
 	# final move is a rename rather than a copy: a half-copied binary that procd
 	# then executes is exactly the failure this avoids.

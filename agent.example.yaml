@@ -106,7 +106,8 @@ server_url: http://host:12450
 
 # --- Probe target-access policy ---------------------------------------------
 # Governs which targets probes may reach (deny always wins). Omit the whole
-# group to keep the default (allowlist of private/LAN scopes).
+# group to keep the default: an allowlist of scope:lan + scope:public, denying
+# scope:loopback, scope:link-local and scope:metadata.
 
 #probe_access:
 #  # allowlist (default-deny; allowlist must be non-empty) or denylist

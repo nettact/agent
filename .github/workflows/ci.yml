@@ -125,7 +125,7 @@ jobs:
                    openwrt/*/control/{postinst,prerm,postrm} \
                    openwrt/nettact-agent/files/etc/init.d/nettact \
                    openwrt/nettact-agent/files/usr/lib/nettact/*.sh \
-                   openwrt/luci-app-nettact/files/usr/libexec/rpcd/nettact
+                   openwrt/luci-app-nettact/files/usr/libexec/rpcd/luci.nettact
           do
             [ -f "$f" ] || continue
             sh -n "$f" || { echo "shell syntax error: $f"; fail=1; }
@@ -181,6 +181,7 @@ jobs:
 
           for f in etc/config/nettact etc/init.d/nettact \
                    usr/lib/nettact/fetch.sh usr/lib/nettact/launch.sh \
+                   usr/lib/nettact/genconfig.sh \
                    usr/lib/nettact/common.sh lib/upgrade/keep.d/nettact; do
             need nettact-agent "$f"
           done
@@ -190,7 +191,8 @@ jobs:
             echo "nettact-agent: ships an agent binary; it is meant to download one"; fail=1
           fi
           # A script opkg unpacks without the executable bit never runs.
-          for f in etc/init.d/nettact usr/lib/nettact/fetch.sh usr/lib/nettact/launch.sh; do
+          for f in etc/init.d/nettact usr/lib/nettact/fetch.sh \
+                   usr/lib/nettact/launch.sh usr/lib/nettact/genconfig.sh; do
             [ -x ".tmp/x/nettact-agent/data/$f" ] \
               || { echo "nettact-agent: $f is not executable"; fail=1; }
           done
@@ -199,13 +201,17 @@ jobs:
 
           for f in www/luci-static/resources/view/nettact/status.js \
                    www/luci-static/resources/view/nettact/settings.js \
+                   www/luci-static/resources/nettact/permcatalog.js \
                    usr/share/luci/menu.d/luci-app-nettact.json \
                    usr/share/rpcd/acl.d/luci-app-nettact.json \
-                   usr/libexec/rpcd/nettact \
+                   usr/libexec/rpcd/luci.nettact \
                    usr/lib/lua/luci/i18n/nettact.zh-cn.lmo; do
             need luci-app-nettact "$f"
           done
-          [ -x .tmp/x/luci-app-nettact/data/usr/libexec/rpcd/nettact ] \
+          # The file name IS the ubus object name (rpcd does not prepend
+          # "luci." for shell backends), so a rename here silently breaks every
+          # RPC the views make with -32000 "Object not found".
+          [ -x .tmp/x/luci-app-nettact/data/usr/libexec/rpcd/luci.nettact ] \
             || { echo "luci-app-nettact: rpcd backend is not executable"; fail=1; }
 
           # Every ubus method the views call must be granted by the ACL, or the

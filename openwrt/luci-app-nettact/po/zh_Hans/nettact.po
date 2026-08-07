@@ -8,13 +8,8 @@ msgstr ""
 msgid "NetTact Agent"
 msgstr "NetTact 探针"
 
-msgid ""
-"The agent runs network probes on this router and pushes the results to a "
-"NetTact server. The binary itself is not part of the package; it is "
-"downloaded on first start."
-msgstr ""
-"探针在本路由器上执行网络探测，并将结果推送到 NetTact 服务器。安装包中不含可执行"
-"文件，首次启动时才会下载。"
+msgid "The agent runs network probes on this router and pushes the results to a NetTact server. The binary itself is not part of the package; it is downloaded on first start. Everything below is rendered into /var/etc/nettact/agent.yaml each time the service starts."
+msgstr "探针在本路由器上执行网络探测，并将结果推送到 NetTact 服务器。安装包中不含可执行文件，首次启动时才会下载。下面的设置会在每次启动服务时渲染成 /var/etc/nettact/agent.yaml。"
 
 msgid "Connection"
 msgstr "连接"
@@ -22,8 +17,23 @@ msgstr "连接"
 msgid "Enabled"
 msgstr "启用"
 
-msgid "The agent stays stopped until this is on and a server address is set."
-msgstr "只有在启用并填写服务器地址后，探针才会启动。"
+msgid "The agent stays stopped until this is on and a server is configured."
+msgstr "只有在启用并配置了服务器后，探针才会启动。"
+
+msgid "Report to"
+msgstr "上报给"
+
+msgid "One agent can report to several servers at once, each with its own credential, probe assignments and permissions."
+msgstr "一个探针可以同时向多台服务器上报，每台服务器各有自己的凭据、监控项与权限。"
+
+msgid "One server"
+msgstr "单台服务器"
+
+msgid "Several servers — configured in the list at the bottom of this page"
+msgstr "多台服务器 —— 在本页底部的列表中配置"
+
+msgid "Add at least one entry under \"Servers\" first."
+msgstr "请先在「服务器列表」中添加至少一条。"
 
 msgid "Server URL"
 msgstr "服务器地址"
@@ -42,6 +52,15 @@ msgid ""
 "enrolled; after that it can be cleared."
 msgstr "服务器签发的一次性令牌。注册成功后即不再使用，可以清空。"
 
+msgid "Enrollment token file"
+msgstr "注册令牌文件"
+
+msgid "A file on this router holding the one-time token, instead of the token itself."
+msgstr "本机上保存一次性令牌的文件路径，用来代替直接填写令牌。"
+
+msgid "Set either a token or a token file, not both."
+msgstr "令牌与令牌文件只能填一个。"
+
 msgid "Skip TLS verification"
 msgstr "跳过 TLS 验证"
 
@@ -53,8 +72,262 @@ msgstr "接受无法验证的服务器证书。仅适用于自建 CA 或你自�
 msgid "Upload interval"
 msgstr "上报间隔"
 
-msgid "How often buffered telemetry is sent, e.g. 30s or 2m."
-msgstr "缓存的遥测数据多久上报一次，例如 30s 或 2m。"
+msgid "How often buffered telemetry is sent, e.g. 30s or 2m. Shorter means fresher dashboards and more work for the server."
+msgstr "缓存的遥测数据多久上报一次，例如 30s 或 2m。间隔越短仪表盘越新，服务器的写入压力也越大。"
+
+msgid "Telemetry format"
+msgstr "遥测格式"
+
+msgid "Protobuf is smaller and faster; JSON is readable in a packet capture."
+msgstr "Protobuf 更小更快；JSON 便于在抓包里直接阅读。"
+
+msgid "Protobuf (default)"
+msgstr "Protobuf（默认）"
+
+msgid "JSON"
+msgstr "JSON"
+
+# --- 数据采集 ---------------------------------------------------------------
+
+msgid "Data collection"
+msgstr "数据采集"
+
+msgid "Applies to every server unless an entry under \"Servers\" sets its own."
+msgstr "对所有服务器生效，除非某台服务器在「服务器列表」里单独设置了自己的。"
+
+msgid "Permissions"
+msgstr "权限"
+
+msgid "What this router may collect and report. A permission list REPLACES the built-in set; it does not add to it."
+msgstr "本路由器可以采集并上报哪些数据。权限是整体替换语义，不是在内置集合上增删。"
+
+msgid "Recommended — the built-in set: standard probes plus basic network state"
+msgstr "推荐 —— 内置默认集：标准探测 + 基础网络状态"
+
+msgid "Recommended + host metrics — adds CPU, memory, disk, load, uptime, throughput and temperature"
+msgstr "推荐 + 主机指标 —— 再加 CPU、内存、磁盘、负载、运行时长、网络吞吐与温度"
+
+msgid "Everything — including process and connection snapshots (process names, owning users, remote addresses)"
+msgstr "全部 —— 含进程与连接快照（会读取进程名、所属用户、远程地址）"
+
+msgid "Nothing — grant only what the agent needs to stay up"
+msgstr "不授予 —— 只保留探针维持运行所必需的功能"
+
+msgid "Custom — pick individually"
+msgstr "自定义 —— 逐条勾选"
+
+msgid "Permissions (custom)"
+msgstr "权限（自定义）"
+
+msgid "Ticking a permission also ticks the ones it needs; unticking one also unticks whatever needed it."
+msgstr "勾选某项会自动带上它依赖的父权限；取消某项也会一并取消依赖它的子权限。"
+
+msgid "%s also requires %s."
+msgstr "%s 还需要同时授予 %s。"
+
+msgid "not available on a router"
+msgstr "路由器上不可用"
+
+msgid "Probes"
+msgstr "探测"
+
+msgid "Network state"
+msgstr "网络状态"
+
+msgid "Host metrics"
+msgstr "主机指标"
+
+msgid "Process snapshot"
+msgstr "进程快照"
+
+msgid "Connection snapshot"
+msgstr "连接快照"
+
+msgid "Path diagnostics"
+msgstr "路径诊断"
+
+msgid "Other"
+msgstr "其它"
+
+msgid "ICMP probe"
+msgstr "ICMP 探测"
+
+msgid "DNS probe"
+msgstr "DNS 探测"
+
+msgid "HTTP probe"
+msgstr "HTTP 探测"
+
+msgid "HTTP extended probe"
+msgstr "HTTP 扩展探测"
+
+msgid "TCP probe"
+msgstr "TCP 探测"
+
+msgid "NAT probe"
+msgstr "NAT 探测"
+
+msgid "Gateway probe"
+msgstr "网关探测"
+
+msgid "Interface status read"
+msgstr "网卡状态读取"
+
+msgid "Interface address read"
+msgstr "网卡地址读取"
+
+msgid "Wi-Fi status read"
+msgstr "Wi-Fi 状态读取"
+
+msgid "Wi-Fi SSID read"
+msgstr "Wi-Fi SSID 读取"
+
+msgid "Neighbor table read"
+msgstr "邻居表读取"
+
+msgid "Neighbor hostname read"
+msgstr "邻居主机名读取"
+
+msgid "CPU read"
+msgstr "CPU 读取"
+
+msgid "Memory read"
+msgstr "内存读取"
+
+msgid "Disk read"
+msgstr "磁盘读取"
+
+msgid "Load read"
+msgstr "负载读取"
+
+msgid "Uptime read"
+msgstr "运行时长读取"
+
+msgid "Network I/O read"
+msgstr "网络 I/O 读取"
+
+msgid "Temperature read"
+msgstr "温度读取"
+
+msgid "Process basics"
+msgstr "进程基础信息"
+
+msgid "Process owner"
+msgstr "进程所属用户"
+
+msgid "Process resources"
+msgstr "进程资源占用"
+
+msgid "Process disk I/O"
+msgstr "进程磁盘 I/O"
+
+msgid "Connection summary"
+msgstr "连接概要"
+
+msgid "Local address"
+msgstr "本地地址"
+
+msgid "Remote address"
+msgstr "远程地址"
+
+msgid "Connection owner"
+msgstr "连接所属进程"
+
+msgid "ICMP path diagnostics"
+msgstr "ICMP 路径诊断"
+
+msgid "TCP path diagnostics"
+msgstr "TCP 路径诊断"
+
+msgid "Game process detection"
+msgstr "游戏进程识别"
+
+msgid "Game frame data"
+msgstr "游戏帧数据读取"
+
+msgid "GPU and video memory"
+msgstr "GPU 与显存读取"
+
+# --- 探测目标范围 -----------------------------------------------------------
+
+msgid "Target access"
+msgstr "探测目标范围"
+
+msgid "Which addresses probes may reach. A denied target stays denied even if something else allows it."
+msgstr "探测可以访问哪些地址。拒绝优先：一个目标只要被拒绝，就算别处允许也仍然拒绝。"
+
+msgid "Default — LAN and public allowed; loopback, link-local and metadata denied"
+msgstr "默认 —— 允许局域网与公网；拒绝回环、链路本地与云元数据地址"
+
+msgid "Allowlist — nothing is reachable except what is listed"
+msgstr "白名单 —— 只有列出的目标可达"
+
+msgid "Denylist — everything is reachable except what is listed"
+msgstr "黑名单 —— 除列出的目标外都可达"
+
+msgid "Allowed targets"
+msgstr "允许的目标"
+
+msgid "Selectors: scope:lan, scope:public, cidr:10.0.0.0/8, ip:192.0.2.1, host:example.com"
+msgstr "选择器写法：scope:lan、scope:public、cidr:10.0.0.0/8、ip:192.0.2.1、host:example.com"
+
+msgid "Denied targets"
+msgstr "拒绝的目标"
+
+msgid "Leave empty in denylist mode to deny nothing."
+msgstr "黑名单模式下留空表示不拒绝任何目标。"
+
+msgid "Must start with scope:, cidr:, ip: or host:"
+msgstr "必须以 scope:、cidr:、ip: 或 host: 开头"
+
+msgid "Missing a value after \"%s:\""
+msgstr "「%s:」后面缺少内容"
+
+msgid "Unknown scope \"%s\". Use one of: %s"
+msgstr "无法识别的范围「%s」。可用值：%s"
+
+msgid "A cidr: selector needs a prefix length, e.g. cidr:10.0.0.0/8"
+msgstr "cidr: 选择器需要带前缀长度，例如 cidr:10.0.0.0/8"
+
+msgid "Unknown selector kind \"%s\". Use scope:, cidr:, ip: or host:"
+msgstr "无法识别的选择器类型「%s」。请使用 scope:、cidr:、ip: 或 host:"
+
+# --- 稳定性限制 -------------------------------------------------------------
+
+msgid "Stability limits"
+msgstr "稳定性限制"
+
+msgid "Leave these empty unless the router is struggling; every one of them has a sensible default."
+msgstr "除非路由器扛不住，否则全部留空即可 —— 每一项都有合理的默认值。"
+
+msgid "Minimum probe interval"
+msgstr "最小探测间隔"
+
+msgid "Floor on how often one monitor may run, whatever the server asks for."
+msgstr "单个监控项的执行频率下限，服务器要求得再频繁也不会突破。"
+
+msgid "Maximum concurrent probes"
+msgstr "最大并发探测数"
+
+msgid "Minimum snapshot interval"
+msgstr "最小快照间隔"
+
+msgid "Floor on how often an incident interface snapshot may be collected."
+msgstr "故障现场网卡快照的采集频率下限。"
+
+msgid "Snapshot timeout"
+msgstr "快照超时"
+
+msgid "Maximum concurrent traceroutes"
+msgstr "最大并发路由追踪数"
+
+msgid "Must be a duration such as 500ms, 30s or 2m."
+msgstr "必须是时长，例如 500ms、30s 或 2m。"
+
+msgid "Must be between %s and %s."
+msgstr "取值必须在 %s 到 %s 之间。"
+
+# --- 程序文件 ---------------------------------------------------------------
 
 msgid "Binary"
 msgstr "程序文件"
@@ -62,15 +335,8 @@ msgstr "程序文件"
 msgid "Where to keep the agent"
 msgstr "探针存放位置"
 
-msgid ""
-"The agent is about 11 MB. In RAM mode it is downloaded to /tmp on every boot "
-"and uses no flash at all — the right choice for an 8 or 16 MB router. In "
-"flash mode it is downloaded once and survives a reboot offline. Either way "
-"the router keeps its identity and never has to enroll twice."
-msgstr ""
-"探针约 11 MB。内存模式下每次开机都会下载到 /tmp，完全不占用闪存，适合 8MB 或 "
-"16MB 的路由器；闪存模式只下载一次，断网重启也能直接运行。两种模式都会保留身份"
-"信息，不需要重复注册。"
+msgid "The agent is about 11 MB. In RAM mode it is downloaded to /tmp on every boot and uses no flash at all — the right choice for an 8 or 16 MB router. In flash mode it is downloaded once and survives a reboot offline. Switching back to RAM deletes the flash copy at the next start, so the space is returned. Either way the router keeps its identity and never has to enroll twice."
+msgstr "探针约 11 MB。内存模式下每次开机都会下载到 /tmp，完全不占用闪存，适合 8MB 或 16MB 的路由器；闪存模式只下载一次，断网重启也能直接运行。从闪存切回内存时，下次启动会删除闪存上的那份，空间会真正还回来。两种模式都会保留身份信息，不需要重复注册。"
 
 msgid "RAM — re-download each boot, no flash used"
 msgstr "内存 — 每次开机重新下载，不占闪存"
@@ -103,6 +369,40 @@ msgid ""
 "The version list could not be fetched (%s). Enter a release tag such as "
 "v1.2.3, or \"latest\"."
 msgstr "无法获取版本列表（%s）。请手动填写版本号，例如 v1.2.3，或填 latest。"
+
+msgid "unknown error"
+msgstr "未知错误"
+
+# --- 服务器列表 -------------------------------------------------------------
+
+msgid "Servers"
+msgstr "服务器列表"
+
+msgid "Used only when \"Report to\" above is set to several servers. The first entry comes first on the wire. Renaming an entry makes the agent enroll again and discards whatever it had queued for that server, so pick a name and keep it."
+msgstr "仅在上方「上报给」选择了多台服务器时生效。列表顺序即上报顺序。重命名某一条会让探针重新注册，并丢弃为该服务器积压的数据 —— 名字定下来后就别再改。"
+
+msgid "Add a server"
+msgstr "添加服务器"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "Lowercase letters, digits, \"-\" and \"_\". Identifies the saved credential; it is not shown to the server."
+msgstr "只能用小写字母、数字、「-」和「_」。它标识本机保存的凭据，不会展示给服务器。"
+
+msgid "A name is required."
+msgstr "名称不能为空。"
+
+msgid "Lowercase letters, digits, \"-\" and \"_\" only, up to 64 characters."
+msgstr "只能包含小写字母、数字、「-」和「_」，最长 64 个字符。"
+
+msgid "Another entry already uses this name."
+msgstr "已有另一条使用了这个名称。"
+
+msgid "A server address is required."
+msgstr "服务器地址不能为空。"
+
+# --- 状态页 -----------------------------------------------------------------
 
 msgid "Status"
 msgstr "状态"
@@ -151,6 +451,15 @@ msgstr "闪存"
 
 msgid "RAM (re-downloaded each boot)"
 msgstr "内存（每次开机重新下载）"
+
+msgid "Configuration"
+msgstr "配置来源"
+
+msgid "Generated from these settings"
+msgstr "由本页设置生成"
+
+msgid "Hand-written — LuCI settings are ignored"
+msgstr "手写配置 —— 本页设置不生效"
 
 msgid "Architecture"
 msgstr "架构"

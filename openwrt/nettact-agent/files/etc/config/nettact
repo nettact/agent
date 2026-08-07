@@ -4,11 +4,18 @@
 # cannot spare on flash. It is downloaded on demand instead, either into RAM on
 # every boot or once onto the overlay. See 'mode' below.
 #
+# Everything except the four binary/service options is rendered into a YAML
+# configuration for the agent at /var/etc/nettact/agent.yaml (tmpfs) each time
+# the service starts. To hand-write a configuration instead — the whole agent
+# schema is documented in the module's agent.example.yaml — create
+# /etc/nettact/agent.yaml and the init script will use that file verbatim and
+# generate nothing.
+#
 # Edit here or in LuCI (Services -> NetTact), then: /etc/init.d/nettact restart
 
 config nettact 'main'
-	# Master switch. The service starts nothing until this is 1 AND server_url
-	# is set, so installing the package cannot make a router phone home.
+	# Master switch. The service starts nothing until this is 1 AND a server is
+	# configured, so installing the package cannot make a router phone home.
 	option enabled '0'
 
 	# Where the agent binary lives.
@@ -17,9 +24,19 @@ config nettact 'main'
 	#           boot. Right for 8/16 MB devices.
 	#   flash - downloaded once to /usr/lib/nettact. Boots offline, needs
 	#           ~11 MB free on the overlay.
+	# Switching back to 'ram' deletes the flash copy at the next service start
+	# or download, so the space is actually returned.
 	# The agent's IDENTITY is unaffected: agent.key and agent.json always live
 	# in /etc/nettact/data, so the router never re-enrolls either way.
 	option mode 'ram'
+
+	# --- Server connection ---------------------------------------------------
+
+	# 'single' uses server_url/enroll_token below. 'multi' ignores them and uses
+	# the repeatable `config server` sections at the end of this file instead.
+	# The two are mutually exclusive in the agent, so this switch — rather than
+	# a guess about which one you meant — decides which is rendered.
+	option server_mode 'single'
 
 	# The NetTact server this agent reports to, e.g. https://nettact.example.com
 	option server_url ''
@@ -29,12 +46,77 @@ config nettact 'main'
 	# is ignored. Safe to clear once the router shows as enrolled.
 	option enroll_token ''
 
+	# A file holding the one-time token instead of the token itself. Mutually
+	# exclusive with enroll_token.
+	#option enroll_token_file '/etc/nettact/enroll-token'
+
 	# Accept a server TLS certificate that does not verify. Only for a private
 	# CA or an IP-address server you control.
 	option tls_insecure '0'
 
 	# How often buffered telemetry is uploaded.
 	option upload_interval '30s'
+
+	# Telemetry wire format: protobuf (default) or json.
+	#option wire_format 'protobuf'
+
+	# --- Permissions ---------------------------------------------------------
+
+	# What this router is allowed to collect and report. The presets are the
+	# same ones the console offers when you enroll an agent.
+	#   default      - the agent's built-in grant: standard probes, interface
+	#                  and Wi-Fi status, path diagnostics. ('recommended' is
+	#                  accepted as an alias.) Leave it here unless you have a
+	#                  reason not to.
+	#   host_metrics - the above plus CPU, memory, disk, load, uptime, network
+	#                  throughput and temperature.
+	#   full         - everything, including process and connection snapshots
+	#                  (process names, owning users, remote addresses).
+	#   none         - grant nothing beyond what is strictly required.
+	#   custom       - exactly the `permissions` list below.
+	# Any grant REPLACES the built-in one rather than adding to it, and a
+	# permission whose parent is missing is a startup error, not a warning.
+	# An unrecognised value here stops the service rather than quietly falling
+	# back to the default — collecting more than you asked for must never be
+	# something you have to notice for yourself.
+	option permission_mode 'default'
+
+	#list permissions 'probe.icmp'
+	#list permissions 'probe.dns'
+	#list permissions 'probe.http'
+	#list permissions 'probe.tcp'
+
+	# --- Probe target access -------------------------------------------------
+
+	# Which targets probes may reach; deny always wins over allow. Leave the
+	# mode unset to keep the default (LAN and public allowed; loopback,
+	# link-local and cloud-metadata addresses denied).
+	#
+	# Selector syntax: scope:<loopback|lan|link-local|public|metadata|any>,
+	# cidr:<prefix>, ip:<address>, host:<name>.
+	#option probe_access_mode 'allowlist'
+	#list probe_allowlist 'scope:lan'
+	#list probe_denylist 'cidr:10.9.0.0/16'
+
+	# --- Stability limits ----------------------------------------------------
+	# All optional; omit to accept the agent's defaults.
+
+	# Minimum interval between probes of one monitor. Default 1s. [200ms, 10m]
+	#option min_probe_interval '1s'
+
+	# Maximum simultaneously executing probes. Default 16. [1, 256]
+	#option max_probe_concurrency '16'
+
+	# Minimum interval between incident interface snapshots. Default 3s. [1s, 10m]
+	#option snapshot_min_interval '3s'
+
+	# Timeout for one incident snapshot collection. Default 10s. [1s, 60s]
+	#option snapshot_timeout '10s'
+
+	# Maximum simultaneously executing incident traceroutes. Default 4. [1, 64]
+	#option max_trace_concurrency '4'
+
+	# --- Where the binary comes from -----------------------------------------
 
 	# Where binaries are fetched from. Point this at a local mirror to avoid
 	# the internet entirely; it must serve the same layout as the default:
@@ -45,3 +127,38 @@ config nettact 'main'
 
 	# 'latest', or a pinned release tag such as v1.2.3.
 	option version 'latest'
+
+# --- Reporting to more than one server ---------------------------------------
+#
+# Used only when server_mode is 'multi'. One agent can report to several servers
+# at once — a home server and an employer's, say — and they are fully
+# independent: separate credentials, separate probe assignments, separate
+# outages, and separate permission grants.
+#
+# `name` is required and must be unique. It keys the saved credential and the
+# queued backlog, so RENAMING an entry re-enrolls it and discards its queue. It
+# cannot be derived from the URL, which you may legitimately edit. Lowercase
+# letters, digits, '-' and '_' only, up to 64 characters.
+#
+# Order matters: entries are sent to the agent in file order.
+#
+# A per-entry `permission_mode`/`permissions` replaces the machine-wide grant
+# above for that server only. A per-entry probe_access can only NARROW the
+# machine-wide one — a target must pass both.
+
+#config server
+#	option name 'home'
+#	option url 'https://nettact.example.com'
+#	option enroll_token ''
+#	option tls_insecure '0'
+#	option permission_mode 'default'
+
+#config server
+#	option name 'work'
+#	option url 'https://nettact.corp.example'
+#	option enroll_token ''
+#	option permission_mode 'custom'
+#	list permissions 'probe.icmp'
+#	list permissions 'probe.dns'
+#	option probe_access_mode 'allowlist'
+#	list probe_allowlist 'cidr:10.0.0.0/8'

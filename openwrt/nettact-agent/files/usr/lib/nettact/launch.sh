@@ -42,6 +42,11 @@ done
 
 # 3. A binary. In ram mode this runs on every boot (/tmp is empty again); in
 #    flash mode only the first time, or after a sysupgrade wiped it.
+#
+#    Pruning first is what makes a flash -> ram switch actually give the space
+#    back: the mode change alone would leave the old ~11 MB copy on the overlay
+#    forever, and freeing the overlay is the entire reason someone switches.
+nettact_prune_stale_binary
 if [ ! -x "$BIN" ]; then
 	nettact_log "agent binary missing at $BIN; fetching"
 	if ! /usr/lib/nettact/fetch.sh install; then

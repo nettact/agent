@@ -28,13 +28,33 @@ check() {
 
 cat > "$STUB/uci" <<'EOF'
 #!/bin/sh
-# Answers from the environment so each case can set its own config.
-case "$*" in
-	*nettact.main.mode*) printf '%s' "${T_MODE:-ram}" ;;
-	*nettact.main.download_base*) printf '%s' "${T_BASE:-}" ;;
-	*nettact.main.version*) printf '%s' "${T_VERSION:-}" ;;
-	*) : ;;
+# Answers `uci -q get <key>` from the environment.
+#
+# T_UCI carries a whole config as newline-separated key=value lines, which is
+# what the genconfig checks need; T_MODE/T_BASE/T_VERSION are the older
+# single-option shorthands and still win when set.
+[ "$1" = "-q" ] && shift
+[ "$1" = "get" ] || exit 1
+key="$2"
+
+case "$key" in
+	nettact.main.mode)          [ -n "${T_MODE:-}" ] && { printf '%s' "$T_MODE"; exit 0; } ;;
+	nettact.main.download_base) [ -n "${T_BASE:-}" ] && { printf '%s' "$T_BASE"; exit 0; } ;;
+	nettact.main.version)       [ -n "${T_VERSION:-}" ] && { printf '%s' "$T_VERSION"; exit 0; } ;;
 esac
+
+# The loop must not run in a subshell, or `found` never reaches this scope.
+found=
+while IFS= read -r line; do
+	case "$line" in
+		"$key="*) found="${line#*=}"; break ;;
+	esac
+done <<INNER
+${T_UCI:-}
+INNER
+[ -n "$found" ] || exit 1
+printf '%s' "$found"
+exit 0
 EOF
 
 cat > "$STUB/opkg" <<'EOF'
@@ -119,6 +139,268 @@ check "/usr/lib/nettact/nettact-agent" "$(T_MODE=flash nettact_bin)" "flash mode
 check "ram" "$(T_MODE=nonsense nettact_mode)" "unknown mode falls back to ram"
 check "/etc/nettact/data" "$NETTACT_DATA_DIR" "identity stays on flash"
 
+# --- stale-binary pruning ----------------------------------------------------
+#
+# Switching from flash to ram is something people do BECAUSE the overlay is
+# full, so leaving the old ~11 MB copy behind defeats the entire point. The
+# other half of this is just as important: the flash directory also holds the
+# package's own scripts, so the prune must take two files and nothing else.
+
+echo "stale binary pruning:"
+
+# A `VAR=x func` prefix persists after the call in some shells, so the earlier
+# T_MODE cases could still be in scope here and would answer the mode lookup
+# ahead of T_UCI. Clear it, and drive these cases through T_UCI alone.
+unset T_MODE 2>/dev/null || true
+T_UCI=""
+export T_UCI
+
+PRUNE="$STUB/flashdir"
+NETTACT_FLASH_DIR="$PRUNE"
+
+reset_flashdir() {
+	rm -rf "$PRUNE"
+	mkdir -p "$PRUNE"
+	: > "$PRUNE/nettact-agent"
+	: > "$PRUNE/.nettact-agent.download"
+	: > "$PRUNE/common.sh"
+	: > "$PRUNE/launch.sh"
+	: > "$PRUNE/fetch.sh"
+	: > "$PRUNE/genconfig.sh"
+}
+
+reset_flashdir
+T_UCI="nettact.main.mode=flash"
+nettact_prune_stale_binary
+[ -f "$PRUNE/nettact-agent" ] \
+	&& printf '  ok   %-28s -> kept\n' "flash mode: binary" \
+	|| { printf '  FAIL %-28s -> deleted\n' "flash mode: binary"; fail=1; }
+
+reset_flashdir
+T_UCI="nettact.main.mode=ram"
+nettact_prune_stale_binary
+[ -f "$PRUNE/nettact-agent" ] \
+	&& { printf '  FAIL %-28s -> kept\n' "ram mode: binary"; fail=1; } \
+	|| printf '  ok   %-28s -> deleted\n' "ram mode: binary"
+[ -f "$PRUNE/.nettact-agent.download" ] \
+	&& { printf '  FAIL %-28s -> kept\n' "ram mode: partial download"; fail=1; } \
+	|| printf '  ok   %-28s -> deleted\n' "ram mode: partial download"
+for keep in common.sh launch.sh fetch.sh genconfig.sh; do
+	[ -f "$PRUNE/$keep" ] \
+		&& printf '  ok   %-28s -> kept\n' "ram mode: $keep" \
+		|| { printf '  FAIL %-28s -> DELETED\n' "ram mode: $keep"; fail=1; }
+done
+
+# Nothing to prune must not be an error: launch.sh runs this on every start.
+rm -f "$PRUNE/nettact-agent" "$PRUNE/.nettact-agent.download"
+if nettact_prune_stale_binary; then
+	printf '  ok   %-28s -> succeeds\n' "ram mode: nothing to prune"
+else
+	printf '  FAIL %-28s -> non-zero exit\n' "ram mode: nothing to prune"; fail=1
+fi
+
+NETTACT_FLASH_DIR=/usr/lib/nettact
+T_UCI=""
+
+# --- generated agent configuration -------------------------------------------
+#
+# genconfig.sh renders /var/etc/nettact/agent.yaml from UCI. Two of its rules can
+# take a router off the air if they break, and neither shows up until the agent
+# refuses to start: `servers:` and `server_url:` are mutually exclusive, and an
+# "unset" option must be omitted rather than rendered as an empty value.
+
+echo "generated configuration:"
+
+GEN="$STUB/genconfig.sh"
+sed "s#^\. /usr/lib/nettact/common.sh#. $HERE/nettact-agent/files/usr/lib/nettact/common.sh#" \
+	"$HERE/nettact-agent/files/usr/lib/nettact/genconfig.sh" > "$GEN"
+chmod 0755 "$GEN"
+
+# gen <what> <config> — render and stash the document in $GENOUT.
+gen() {
+	GENOUT="$(T_UCI="$2" "$GEN" print 2>/dev/null || echo 'RENDER FAILED')"
+}
+
+has() { # has <label> <line>
+	case "
+$GENOUT" in
+		*"
+$2"*) printf '  ok   %-28s -> %s\n' "$1" "$2" ;;
+		*) printf '  FAIL %-28s -> missing: %s\n' "$1" "$2"; fail=1 ;;
+	esac
+}
+
+hasnt() { # hasnt <label> <substring>
+	case "$GENOUT" in
+		*"$2"*) printf '  FAIL %-28s -> present: %s\n' "$1" "$2"; fail=1 ;;
+		*) printf '  ok   %-28s -> absent: %s\n' "$1" "$2" ;;
+	esac
+}
+
+gen single 'nettact.main.server_url=https://a.example.com
+nettact.main.enroll_token=tok123'
+has "single.server_url" "server_url: 'https://a.example.com'"
+has "single.enroll_token" "enroll_token: 'tok123'"
+hasnt "single.no servers list" "servers:"
+# An unset boolean must not render at all: false is already the agent's default,
+# and an empty value would be a startup error rather than a default.
+hasnt "single.tls off is omitted" "tls_insecure:"
+hasnt "single.no empty values" ": ''"
+
+gen tls 'nettact.main.server_url=https://a.example.com
+nettact.main.tls_insecure=1'
+has "single.tls on" "tls_insecure: true"
+
+# A quote in a token must survive as data, not end the YAML scalar early.
+gen quoting "nettact.main.server_url=https://a.example.com
+nettact.main.enroll_token=it's"
+has "quoting.doubled" "enroll_token: 'it''s'"
+
+# permission_mode: default means "say nothing and let the agent use its own".
+gen perm-default 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=default
+nettact.main.permissions=probe.icmp probe.dns'
+hasnt "perm.default omits the key" "permissions:"
+
+gen perm-none 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=none'
+has "perm.none" "permissions: 'none'"
+
+# The named presets. These are the ones that silently did nothing before: the
+# settings page stores the preset NAME, so a mode without a branch here renders
+# no `permissions:` key at all — which reads as the agent's built-in grant, not
+# as an error. The full lists are checked against protocol/permission.Bundles()
+# by openwrt/permcatalog_test.go; here we only prove the branch fires.
+gen perm-host-metrics 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=host_metrics'
+has "perm.host_metrics expands" "permissions:"
+has "perm.host_metrics cpu" "  - 'host.cpu.read'"
+has "perm.host_metrics temp" "  - 'host.temperature.read'"
+has "perm.host_metrics keeps base" "  - 'probe.icmp'"
+hasnt "perm.host_metrics no process" "host.process.basic.read"
+
+gen perm-full 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=full'
+has "perm.full expands" "  - 'host.process.basic.read'"
+has "perm.full game" "  - 'game.gpu.read'"
+
+# `default` and its alias mean the agent's own built-in grant, which is what
+# saying nothing produces.
+gen perm-recommended 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=recommended'
+hasnt "perm.recommended omits key" "permissions:"
+
+# An unrecognised mode must NOT fall through to the default grant: we would be
+# collecting something the user did not ask for and nothing would say so.
+# Capture the status through a `||` list — a bare failing assignment would trip
+# `set -e` and silently end the whole run here.
+GENOUT="$(T_UCI='nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=nonee' "$GEN" print 2>/dev/null)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] && [ -z "$GENOUT" ]; then
+	printf '  ok   %-28s -> refuses to render\n' "perm.unknown mode"
+else
+	printf '  FAIL %-28s -> rendered anyway (rc=%s)\n' "perm.unknown mode" "$rc"; fail=1
+fi
+
+gen perm-custom 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=custom
+nettact.main.permissions=probe.icmp probe.http'
+has "perm.custom key" "permissions:"
+has "perm.custom item 1" "  - 'probe.icmp'"
+has "perm.custom item 2" "  - 'probe.http'"
+
+# Custom with nothing picked means "grant nothing". Rendering an empty list
+# instead would be rejected at startup and take the router down.
+gen perm-custom-empty 'nettact.main.server_url=https://a.example.com
+nettact.main.permission_mode=custom'
+has "perm.custom empty" "permissions: 'none'"
+
+gen access-default 'nettact.main.server_url=https://a.example.com'
+hasnt "access.unset omits group" "probe_access:"
+
+gen access-allow 'nettact.main.server_url=https://a.example.com
+nettact.main.probe_access_mode=allowlist
+nettact.main.probe_allowlist=scope:lan host:*.example.com'
+has "access.mode" "  mode: 'allowlist'"
+has "access.allow item" "    - 'scope:lan'"
+# A selector with a glob must reach the file verbatim rather than being expanded
+# against whatever happens to be in the working directory.
+has "access.glob survives" "    - 'host:*.example.com'"
+hasnt "access.no denylist" "denylist:"
+
+# Denylist mode with nothing denied has to be spelled out; the agent rejects an
+# empty denylist but accepts the literal `none`.
+gen access-deny-none 'nettact.main.server_url=https://a.example.com
+nettact.main.probe_access_mode=denylist'
+has "access.deny none" "  denylist: 'none'"
+
+gen limits 'nettact.main.server_url=https://a.example.com
+nettact.main.upload_interval=15s
+nettact.main.wire_format=json
+nettact.main.min_probe_interval=2s
+nettact.main.max_probe_concurrency=8
+nettact.main.snapshot_min_interval=5s
+nettact.main.snapshot_timeout=20s
+nettact.main.max_trace_concurrency=2'
+has "limits.upload" "upload_interval: '15s'"
+has "limits.wire" "wire_format: 'json'"
+has "limits.min probe" "min_probe_interval: '2s'"
+has "limits.probe concurrency" "max_probe_concurrency: 8"
+has "limits.snapshot interval" "snapshot_min_interval: '5s'"
+has "limits.snapshot timeout" "snapshot_timeout: '20s'"
+has "limits.trace concurrency" "max_trace_concurrency: 2"
+
+# The two numeric settings decode as int, not string. Quoting them makes every
+# config that sets one fail to unmarshal.
+hasnt "limits.probe count unquoted" "max_probe_concurrency: '"
+hasnt "limits.trace count unquoted" "max_trace_concurrency: '"
+
+# A value that is not a number is quoted instead, so a ':' or '#' in it cannot
+# corrupt the surrounding document; the agent then rejects that one key.
+gen limits-bad 'nettact.main.server_url=https://a.example.com
+nettact.main.max_probe_concurrency=lots'
+has "limits.bad int stays quoted" "max_probe_concurrency: 'lots'"
+
+# Multi-server. The single-server keys must be entirely absent: the agent treats
+# a config carrying both as an error, not a merge.
+gen multi 'nettact.main.server_mode=multi
+nettact.main.server_url=https://ignored.example.com
+nettact.main.enroll_token=ignored
+nettact.@server[0]=server
+nettact.@server[0].name=home
+nettact.@server[0].url=https://home.example.com
+nettact.@server[0].enroll_token=htok
+nettact.@server[1]=server
+nettact.@server[1].name=work
+nettact.@server[1].url=https://work.example.com
+nettact.@server[1].tls_insecure=1
+nettact.@server[1].permission_mode=custom
+nettact.@server[1].permissions=probe.icmp
+nettact.@server[1].probe_access_mode=allowlist
+nettact.@server[1].probe_allowlist=cidr:10.0.0.0/8'
+has "multi.list" "servers:"
+has "multi.first name" "  - name: 'home'"
+has "multi.first url" "    url: 'https://home.example.com'"
+has "multi.first token" "    enroll_token: 'htok'"
+has "multi.second name" "  - name: 'work'"
+has "multi.second tls" "    tls_insecure: true"
+has "multi.second perms" "      - 'probe.icmp'"
+has "multi.second access" "      mode: 'allowlist'"
+has "multi.second allow" "        - 'cidr:10.0.0.0/8'"
+hasnt "multi.no server_url" "server_url:"
+hasnt "multi.no top token" "enroll_token: 'ignored'"
+
+# An entry with no url cannot be rendered into anything the agent accepts.
+# Skipping it keeps the other servers working instead of failing the whole start.
+gen multi-partial 'nettact.main.server_mode=multi
+nettact.@server[0]=server
+nettact.@server[0].name=broken
+nettact.@server[1]=server
+nettact.@server[1].name=good
+nettact.@server[1].url=https://good.example.com'
+has "multi.skips broken entry" "  - name: 'good'"
+hasnt "multi.broken not rendered" "'broken'"
+
 # --- rpcd status backend ---------------------------------------------------
 #
 # The log array is built by a shell loop, and getting that wrong is invisible:
@@ -127,6 +409,23 @@ check "/etc/nettact/data" "$NETTACT_DATA_DIR" "identity stays on flash"
 # empty one. The LuCI panel just stays blank, with no error anywhere.
 
 echo "rpcd status:"
+
+# rpcd derives the ubus object name from the *file name* of the shell script in
+# /usr/libexec/rpcd — no "luci." is prepended (that only happens for ucode
+# plugins under /usr/share/rpcd/ucode). So the script must literally be named
+# after the object the views call, or every RPC fails with -32000 "Object not
+# found" while the script itself tests perfectly fine in isolation. That is the
+# exact bug this guards: the script was once named "nettact" while the ACL and
+# both views asked for "luci.nettact". Checked before anything reads the file,
+# so a mismatch reports itself rather than surfacing as a sed error.
+obj="luci.nettact"
+rpcd_src="$HERE/luci-app-nettact/files/usr/libexec/rpcd/$obj"
+if [ -f "$rpcd_src" ]; then
+	printf '  ok   %-28s -> script named %s\n' "ubus.object" "$obj"
+else
+	printf '  FAIL %-28s -> no rpcd/%s (object name mismatch)\n' "ubus.object" "$obj"
+	exit 1
+fi
 
 cat > "$STUB/jshn.sh" <<'EOF'
 # Enough of jshn to observe what the CURRENT shell accumulated.
@@ -170,14 +469,14 @@ chmod 0755 "$STUB/logread" "$STUB/ubus" "$STUB/logger"
 RPCD="$STUB/rpcd-nettact"
 sed -e "s#^\. /usr/share/libubox/jshn.sh#. $STUB/jshn.sh#" \
     -e "s#^\. /usr/lib/nettact/common.sh#. $HERE/nettact-agent/files/usr/lib/nettact/common.sh#" \
-    "$HERE/luci-app-nettact/files/usr/libexec/rpcd/nettact" > "$RPCD"
+    "$rpcd_src" > "$RPCD"
 chmod 0755 "$RPCD"
 
 out="$(T_ARCH=x86_64 "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
 got="$(printf '%s' "$out" | sed -n 's/.*log_entries:\([0-9]*\).*/\1/p')"
 check "3" "${got:-0}" "status returns the log lines"
 
-for key in running enabled enrolled binary_present mode log; do
+for key in running enabled enrolled binary_present mode config_source config_path log; do
 	case " $out " in
 		*" $key"*) printf '  ok   %-28s -> present\n' "status.$key" ;;
 		*) printf '  FAIL %-28s -> missing\n' "status.$key"; fail=1 ;;
@@ -201,6 +500,15 @@ for m in status versions fetch fetch_status service; do
 		printf '  ok   %-28s -> granted\n' "acl.$m"
 	else
 		printf '  FAIL %-28s -> not granted\n' "acl.$m"; fail=1
+	fi
+done
+
+# Both callers must ask for that same object name.
+for f in "$acl" "$HERE"/luci-app-nettact/files/www/luci-static/resources/view/nettact/*.js; do
+	if grep -q "$obj" "$f"; then
+		printf '  ok   %-28s -> calls %s\n' "obj.$(basename "$f")" "$obj"
+	else
+		printf '  FAIL %-28s -> does not reference %s\n' "obj.$(basename "$f")" "$obj"; fail=1
 	fi
 done
 

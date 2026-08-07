@@ -10,7 +10,7 @@ STOP=10
 . /usr/lib/nettact/common.sh
 
 start_service() {
-	local enabled server_url enroll_token tls_insecure upload_interval
+	local enabled cfg
 
 	config_load nettact
 	config_get_bool enabled main enabled 0
@@ -18,37 +18,57 @@ start_service() {
 		return 0
 	fi
 
-	config_get server_url main server_url
-	if [ -z "$server_url" ]; then
-		nettact_err "server_url is not set; not starting (configure it in LuCI or /etc/config/nettact)"
-		return 0
-	fi
-	config_get enroll_token main enroll_token
-	config_get_bool tls_insecure main tls_insecure 0
-	config_get upload_interval main upload_interval 30s
-
 	# Identity lives on flash in every mode: agent.key and agent.json are a few
 	# hundred bytes, and losing them would mean re-enrolling with a one-time
 	# token the user no longer has.
 	mkdir -p "$NETTACT_DATA_DIR"
 	chmod 0700 "$NETTACT_DATA_DIR"
 
+	# The agent's settings travel as a YAML file rendered from UCI, not as
+	# environment variables. `servers:` — reporting to more than one server — is
+	# a list of records, and the environment model is one key, one variable, one
+	# string, so a file is the only shape that can carry it. Rendering the WHOLE
+	# document rather than just that one key keeps a single answer to "where did
+	# this setting come from"; the file lands on tmpfs, so the enrollment token
+	# still never comes to rest on flash a second time.
+	#
+	# A hand-written config at the agent's own conventional path takes over
+	# completely: we render nothing and point the agent at it, so the two can
+	# never disagree about which file is live.
+	cfg="$(nettact_config_file)"
+	if nettact_config_is_generated; then
+		if ! /usr/lib/nettact/genconfig.sh render; then
+			nettact_err "could not render $NETTACT_GEN_CONFIG; not starting"
+			return 1
+		fi
+		# Asking the rendered document is more honest than re-deriving the
+		# answer from UCI: whichever spelling of "a server" the mode produced,
+		# exactly one of these two keys is present when one was configured.
+		# -E, not a BRE alternation: `\|` is a GNU extension busybox grep does
+		# not have, and it would silently match nothing here.
+		if ! grep -qE '^(server_url:|servers:)' "$cfg"; then
+			nettact_err "no server configured; not starting (set server_url in LuCI, or add a 'config server' section to /etc/config/nettact)"
+			return 0
+		fi
+	else
+		# A hand-written config is in charge, so drop whatever a previous
+		# generated run left on tmpfs. It holds a copy of the enrollment token
+		# and nothing reads it any more; leaving it also contradicts the status
+		# page, which now names the hand-written file as the live one.
+		rm -f "$NETTACT_GEN_CONFIG"
+		nettact_log "using the hand-written $NETTACT_USER_CONFIG; UCI settings are ignored"
+	fi
+
 	procd_open_instance nettact
 	procd_set_param command /bin/sh /usr/lib/nettact/launch.sh
 
-	# Config travels as environment rather than a rendered YAML file: every
-	# option the agent takes already has a NETTACT_AGENT_* variable, so there is
-	# no generated file to go stale, and the enrollment token never lands on
-	# flash in a second place. (A hand-written /etc/nettact/agent.yaml still
-	# wins if an advanced user drops one — the agent prefers a file over env.)
+	# Two variables, and no more. DATA_DIR stays in the environment on purpose:
+	# the agent prefers a file value per key, so a hand-written config that omits
+	# data_dir still keeps its identity on flash instead of landing wherever
+	# procd happens to leave the working directory.
 	procd_set_param env \
-		NETTACT_AGENT_SERVER_URL="$server_url" \
-		NETTACT_AGENT_DATA_DIR="$NETTACT_DATA_DIR" \
-		NETTACT_AGENT_TLS_INSECURE="$tls_insecure" \
-		NETTACT_AGENT_UPLOAD_INTERVAL="$upload_interval"
-	if [ -n "$enroll_token" ]; then
-		procd_append_param env NETTACT_AGENT_ENROLL_TOKEN="$enroll_token"
-	fi
+		NETTACT_AGENT_CONFIG_FILE="$cfg" \
+		NETTACT_AGENT_DATA_DIR="$NETTACT_DATA_DIR"
 
 	# Retry forever, 10s apart: an agent that cannot reach its server yet is the
 	# normal state during boot, not a reason to give up. The 3600s threshold is
@@ -58,6 +78,14 @@ start_service() {
 	procd_set_param stderr 1
 	procd_set_param pidfile /var/run/nettact.pid
 	procd_close_instance
+}
+
+stop_service() {
+	# The rendered config is regenerated at every start, so leaving it behind
+	# would only keep a copy of the enrollment token in tmpfs for no reason.
+	if nettact_config_is_generated; then
+		rm -f "$NETTACT_GEN_CONFIG"
+	fi
 }
 
 service_triggers() {

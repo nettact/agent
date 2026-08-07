@@ -88,8 +88,9 @@ build_one() {
 	for f in \
 		"$stage/data/etc/init.d/nettact" \
 		"$stage/data/usr/lib/nettact/fetch.sh" \
+		"$stage/data/usr/lib/nettact/genconfig.sh" \
 		"$stage/data/usr/lib/nettact/launch.sh" \
-		"$stage/data/usr/libexec/rpcd/nettact"
+		"$stage/data/usr/libexec/rpcd/luci.nettact"
 	do
 		[ -f "$f" ] && chmod 0755 "$f"
 	done

@@ -50,6 +50,16 @@ status() {
 	json_add_string mode "$(nettact_mode)"
 	json_add_string arch "$(/usr/lib/nettact/fetch.sh arch 2>/dev/null)"
 
+	# Which configuration the agent actually reads. A hand-written file takes
+	# over completely, and someone wondering why a LuCI change did nothing needs
+	# to be told that here rather than in a log line they never see.
+	if nettact_config_is_generated; then
+		json_add_string config_source generated
+	else
+		json_add_string config_source manual
+	fi
+	json_add_string config_path "$(nettact_config_file)"
+
 	# Collect first, then loop OUTSIDE a pipeline. Every stage of a pipeline is
 	# its own subshell in ash, so a `logread | while read` loop would call
 	# json_add_string in a child process and the parent would close and emit an

@@ -25,7 +25,9 @@ fi
 /etc/init.d/nettact disable 2>/dev/null
 
 # The downloaded binary is not owned by the package (it was fetched, not
-# installed), so opkg will not remove it.
+# installed), so opkg will not remove it. The rendered config is not owned
+# either, and it holds a copy of the enrollment token.
 rm -f /usr/lib/nettact/nettact-agent
 rm -rf /tmp/nettact
+rm -rf /var/etc/nettact
 exit 0
