@@ -474,10 +474,19 @@ func Run(ctx context.Context, cfg Config) error {
 	// more plentiful because a second server asked for a trace.
 	traceLimit := traceroute.NewLimiter(cfg.Limits.MaxTraceConcurrency)
 
+	// Likewise one probe budget for the machine, shared by every server's probe
+	// collectors. Limits is process-level, not per server, so there is no
+	// reconciling to do: an agent has one MaxProbeConcurrency however many servers
+	// it reports to, which is right — the sockets and ICMP handles the probes hold
+	// are the machine's, and a second server asking for the same target is more
+	// probing, not more capacity. Sizing it per server would multiply the budget by
+	// the number of servers and by the number of probe kinds, which is no budget.
+	probeGate := collector.NewProbeGate(cfg.Limits.MaxProbeConcurrency)
+
 	runtimes := make([]*serverRuntime, len(cfg.Servers))
 	for i, sc := range cfg.Servers {
 		runtimes[i] = buildServer(sc, views[i], reports[i], outbox, p,
-			cfg.Limits, cfg.UploadInterval, traceLimit, hostname)
+			cfg.Limits, cfg.UploadInterval, traceLimit, probeGate, hostname)
 	}
 
 	// The game sensor is a child process streaming a line per second, so unlike
@@ -599,19 +608,39 @@ func Run(ctx context.Context, cfg Config) error {
 	// server, because the backlog depth is per server — one server being
 	// unreachable says nothing about how far behind another is, and a single
 	// number would report the worst of them to all of them.
+	//
+	// It also carries the probe-overload report, which is the opposite case: the
+	// concurrency budget is the machine's, so every server hears the same figure.
+	// Each has monitors that went quiet because of it, and each needs to be able
+	// to say why.
 	start := time.Now()
 	hbWG.Add(1)
 	go func() {
 		defer hbWG.Done()
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
+		overloadSince := time.Now()
 		emit := func() {
 			now := time.Now().UTC()
+			// Drain the refused-probe count on its own, longer cadence. Sustained
+			// overload would otherwise put an event on every heartbeat — 120 an
+			// hour per server — to repeat one fact the operator already acted on
+			// or chose not to.
+			var overload []telemetry.Event
+			if window := time.Since(overloadSince); window >= probeOverloadWindow {
+				if n := probeGate.TakeOverload(); n > 0 {
+					overload = append(overload, probeOverloadEvent(now, n, window, cfg.Limits.MaxProbeConcurrency))
+				}
+				overloadSince = time.Now()
+			}
 			for _, name := range names {
-				_, _ = outbox.Append(wal.Records{Metrics: []telemetry.Metric{
-					{TS: now, Kind: telemetry.AgentUptime, Target: "agent", Layer: telemetry.LayerLocal, Value: time.Since(start).Seconds(), Unit: telemetry.UnitSec},
-					{TS: now, Kind: telemetry.AgentWALPending, Target: "agent", Layer: telemetry.LayerLocal, Value: float64(outbox.Pending(name)), Unit: telemetry.UnitCount},
-				}}, name)
+				_, _ = outbox.Append(wal.Records{
+					Metrics: []telemetry.Metric{
+						{TS: now, Kind: telemetry.AgentUptime, Target: "agent", Layer: telemetry.LayerLocal, Value: time.Since(start).Seconds(), Unit: telemetry.UnitSec},
+						{TS: now, Kind: telemetry.AgentWALPending, Target: "agent", Layer: telemetry.LayerLocal, Value: float64(outbox.Pending(name)), Unit: telemetry.UnitCount},
+					},
+					Events: overload,
+				}, name)
 			}
 		}
 		emit()

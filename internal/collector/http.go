@@ -32,11 +32,11 @@ var errTooManyRedirects = errors.New("too many redirects")
 // server-configured URL set (architecture §4 service layer). Each URL carries
 // its own per-target params (timeout, interval, method, status acceptance,
 // keyword match, headers/body, redirect + TLS policy) and is probed on its own
-// schedule via schedState.
+// schedule and its own goroutine via probeRunner.
 type HTTPCollector struct {
-	sched   *schedState
 	guard   *netguard.Guard
 	proxies *proxydial.Manager
+	*probeRunner
 
 	// allowExtended is whether probe.http.extended is effective, so a defensive
 	// re-check at request-build time never sends a non-basic request the monitor
@@ -52,9 +52,9 @@ type HTTPCollector struct {
 	clients map[string]*http.Client
 }
 
-func NewHTTPCollector(guard *netguard.Guard, proxies *proxydial.Manager, allowExtended bool) *HTTPCollector {
+func NewHTTPCollector(guard *netguard.Guard, proxies *proxydial.Manager, allowExtended bool, gate *ProbeGate) *HTTPCollector {
 	return &HTTPCollector{
-		sched:         newSchedState(pcfg.DefaultHTTPInterval),
+		probeRunner:   newProbeRunner(pcfg.DefaultHTTPInterval, gate),
 		guard:         guard,
 		proxies:       proxies,
 		allowExtended: allowExtended,
@@ -69,7 +69,7 @@ func (c *HTTPCollector) SetTargets(targets []pcfg.ProbeTarget) {
 			urls = append(urls, t)
 		}
 	}
-	c.sched.set(urls)
+	c.setTargets(urls)
 }
 
 func (c *HTTPCollector) Name() string { return "http" }
@@ -229,32 +229,53 @@ func (c *HTTPCollector) classifyRedirect(req *http.Request, proxy *proxydial.Dia
 	return nil
 }
 
+// Collect hands back the requests that finished since the last pass and starts
+// the targets that have come due — see probeRunner for why they no longer run
+// inline.
 func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
-	targets := c.sched.due(time.Now())
-	if len(targets) == 0 {
+	return c.collect(ctx, c.runTarget), nil
+}
+
+// httpTimeout is the per-request budget: the configured TimeoutMs, else the
+// default. It is what pcfg.CycleDeadline derives for an http target.
+func httpTimeout(p pcfg.ProbeParams) time.Duration {
+	if p.TimeoutMs > 0 {
+		return time.Duration(p.TimeoutMs) * time.Millisecond
+	}
+	return pcfg.DefaultHTTPTimeout
+}
+
+// runTarget probes one URL on its own goroutine, under a slot from the
+// machine-wide budget.
+func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
+	t := sp.Target
+	// Defensive re-check: a non-basic HTTP request requires probe.http.extended.
+	// The monitor evaluator already excludes such targets when the permission is
+	// absent, so this only fires on a policy/eval drift — skip silently, never a
+	// metric. Checked before the budget so a target that will not be probed
+	// cannot consume a slot or count as overload.
+	if !c.allowExtended && httpParamsNeedExtended(t.Params) {
 		return Result{}, nil
 	}
-
+	timeout := httpTimeout(t.Params)
+	if c.gate.Acquire(ctx, gateWaitDeadline(sp.NextDue, timeout)) != AdmittedOK {
+		// Cancelled (shutdown or a superseded generation) or shut out by the
+		// budget. Nothing was requested, so nothing is reported: a fabricated
+		// failure would replay from the WAL as a false service outage.
+		return Result{}, nil
+	}
+	defer c.gate.Release()
+	// A run aborted by cancellation (agent shutdown) must not fabricate request
+	// failures — they would replay from the WAL as a false service outage on the
+	// next start.
+	if ctx.Err() != nil {
+		return Result{}, nil
+	}
+	// Stamped where the measurement happens: after the wait for a slot, not when
+	// the pass that scheduled it began.
 	now := time.Now().UTC()
 	var res Result
-	for _, t := range targets {
-		// A pass aborted by run cancellation (agent shutdown) must not fabricate
-		// request failures — they would replay from the WAL as a false service
-		// outage on the next start.
-		if ctx.Err() != nil {
-			break
-		}
-		// Defensive re-check: a non-basic HTTP request requires probe.http.extended.
-		// The monitor evaluator already excludes such targets when the permission is
-		// absent, so this only fires on a policy/eval drift — skip silently, never a
-		// metric.
-		if !c.allowExtended && httpParamsNeedExtended(t.Params) {
-			continue
-		}
-		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
-		if timeout <= 0 {
-			timeout = pcfg.DefaultHTTPTimeout
-		}
+	{
 		// Resolve the pinned egress proxy. A pin that cannot be honored is a probe
 		// FAILURE reported as such — never a direct dial, which would send the request
 		// from the real egress IP the operator routed away from and make an "up" verdict
@@ -263,7 +284,7 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		if perr != nil {
 			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.HTTPOK, telemetry.HTTPErrorClass, nil, perr)...)
 			res.Events = append(res.Events, proxyFailureEvent(now, t, "HTTP request not attempted"))
-			continue
+			return res, nil
 		}
 		method := t.Params.Method
 		if method == "" {
@@ -283,7 +304,7 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 		req, err := http.NewRequestWithContext(cctx, method, t.Target, bodyReader)
 		if err != nil {
 			cancel()
-			continue
+			return Result{}, nil
 		}
 		for k, v := range t.Params.Headers {
 			// Go's transport reads the Host header from req.Host, not req.Header, so a
@@ -307,10 +328,10 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 			var be *netguard.BlockedError
 			if errors.As(err, &be) {
 				res.Blocked = append(res.Blocked, blockedFromErr(t, be))
-				continue
+				return res, nil
 			}
 			if ctx.Err() != nil {
-				break // the request was aborted by the cancelled run, not the service
+				return Result{}, nil // the request was aborted by the cancelled run, not the service
 			}
 			// Classify the transport failure (DNS/refused/timeout/unreachable/TLS) so a
 			// fired alert records WHY, not just "unavailable", with the raw transport
@@ -338,7 +359,7 @@ func (c *HTTPCollector) Collect(ctx context.Context) (Result, error) {
 				ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService,
 				Severity: telemetry.SeverityWarn, Message: msg,
 			})
-			continue
+			return res, nil
 		}
 		status := resp.StatusCode
 
@@ -466,6 +487,3 @@ func statusAccepted(status int, accepted string) bool {
 	}
 	return false
 }
-
-// SetMinInterval applies the local per-target probe-interval floor (stability limit).
-func (c *HTTPCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

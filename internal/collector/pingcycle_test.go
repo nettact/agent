@@ -61,7 +61,7 @@ func TestPingCycleSpreadsEchoesAcrossInterval(t *testing.T) {
 	p := &gwTestPlatform{}
 	nextDue := clk.Now().Add(10 * time.Second)
 
-	r := pingCycle(context.Background(), p, "1.1.1.1", pcfg.ProbeParams{}, nextDue)
+	r := pingCycle(context.Background(), p, "1.1.1.1", pcfg.ProbeParams{}, nextDue, nil)
 
 	if r.Loss != 0 || r.Received != 5 {
 		t.Fatalf("cycle = %+v, want 5 received / 0%% loss", r)
@@ -89,7 +89,7 @@ func TestPingCycleFailFastOnLoss(t *testing.T) {
 	clk := stubCycleClock(t)
 	p := &gwTestPlatform{recv: func(int) bool { return false }}
 
-	r := pingCycle(context.Background(), p, "1.1.1.1", pcfg.ProbeParams{}, clk.Now().Add(10*time.Second))
+	r := pingCycle(context.Background(), p, "1.1.1.1", pcfg.ProbeParams{}, clk.Now().Add(10*time.Second), nil)
 
 	if r.Loss != 100 || r.Received != 0 {
 		t.Fatalf("cycle = %+v, want 100%% loss", r)
@@ -108,7 +108,7 @@ func TestPingCycleResumesSpreadAfterOneLoss(t *testing.T) {
 	clk := stubCycleClock(t)
 	p := &gwTestPlatform{recv: func(seq int) bool { return seq != 1 }}
 
-	r := pingCycle(context.Background(), p, "1.1.1.1", pcfg.ProbeParams{}, clk.Now().Add(10*time.Second))
+	r := pingCycle(context.Background(), p, "1.1.1.1", pcfg.ProbeParams{}, clk.Now().Add(10*time.Second), nil)
 
 	if r.Loss != 20 || r.Received != 4 {
 		t.Fatalf("cycle = %+v, want 1 of 5 lost", r)
@@ -136,7 +136,7 @@ func TestPingCyclePacesAgainstGlobalTimeout(t *testing.T) {
 
 	// 5s global budget, 1s per echo → 4s of send window shared by 4 gaps.
 	r := pingCycle(context.Background(), p, "1.1.1.1",
-		pcfg.ProbeParams{GlobalTimeoutMs: 5_000}, start.Add(10*time.Second))
+		pcfg.ProbeParams{GlobalTimeoutMs: 5_000}, start.Add(10*time.Second), nil)
 
 	if r.Received != 5 {
 		t.Fatalf("cycle = %+v, want all 5 received inside the global budget", r)
@@ -156,7 +156,7 @@ func TestPingCycleSinglePacketNeverPaces(t *testing.T) {
 	p := &gwTestPlatform{}
 
 	r := pingCycle(context.Background(), p, "1.1.1.1",
-		pcfg.ProbeParams{PacketCount: 1}, clk.Now().Add(10*time.Second))
+		pcfg.ProbeParams{PacketCount: 1}, clk.Now().Add(10*time.Second), nil)
 
 	if r.Received != 1 {
 		t.Fatalf("cycle = %+v, want the single echo received", r)
@@ -179,7 +179,7 @@ func TestPingCycleNeverFabricatesLossOnASlowHealthyLink(t *testing.T) {
 	start := clk.Now()
 
 	r := pingCycle(context.Background(), p, "1.1.1.1",
-		pcfg.ProbeParams{GlobalTimeoutMs: 8_000}, start.Add(10*time.Second))
+		pcfg.ProbeParams{GlobalTimeoutMs: 8_000}, start.Add(10*time.Second), nil)
 
 	if r.Loss != 0 || r.Received != 5 {
 		t.Fatalf("cycle = %+v, want 0%% loss — every echo answered within its timeout", r)
@@ -198,7 +198,7 @@ func TestPingCycleStaysWithinItsDerivedDeadline(t *testing.T) {
 	start := clk.Now()
 	params := pcfg.ProbeParams{PacketCount: 20, IntervalSeconds: 25}
 
-	r := pingCycle(context.Background(), p, "1.1.1.1", params, start.Add(25*time.Second))
+	r := pingCycle(context.Background(), p, "1.1.1.1", params, start.Add(25*time.Second), nil)
 
 	if r.Received != 20 {
 		t.Fatalf("cycle = %+v, want all 20 echoes received", r)
@@ -242,7 +242,7 @@ func TestSchedStateClaimMarksFirstRun(t *testing.T) {
 	if len(first) != 1 || !first[0].First {
 		t.Fatalf("claim = %+v, want the target marked as a first run", first)
 	}
-	s.finish(first[0].Key, true)
+	s.finish(first[0], true)
 	again := s.claim(now.Add(10 * time.Second))
 	if len(again) != 1 || again[0].First {
 		t.Fatalf("claim = %+v, want the second run NOT marked first", again)
@@ -263,13 +263,13 @@ func TestSchedStateKeepsFirstRunUntilSomethingIsReported(t *testing.T) {
 	if len(empty) != 1 || !empty[0].First {
 		t.Fatalf("claim = %+v, want a first run", empty)
 	}
-	s.finish(empty[0].Key, false) // the cycle produced nothing
+	s.finish(empty[0], false) // the cycle produced nothing
 
 	retry := s.claim(now.Add(10 * time.Second))
 	if len(retry) != 1 || !retry[0].First {
 		t.Fatalf("claim = %+v, want STILL a first run after an empty cycle", retry)
 	}
-	s.finish(retry[0].Key, true)
+	s.finish(retry[0], true)
 
 	settled := s.claim(now.Add(20 * time.Second))
 	if len(settled) != 1 || settled[0].First {
@@ -297,7 +297,7 @@ func TestSchedStateClaimGuardsInFlight(t *testing.T) {
 	if again := s.claim(now.Add(time.Minute)); len(again) != 0 {
 		t.Fatalf("claimed an in-flight target: %+v", again)
 	}
-	s.finish(claimed[0].Key, true)
+	s.finish(claimed[0], true)
 	if again := s.claim(now.Add(time.Minute)); len(again) != 1 {
 		t.Fatalf("target not claimable after finish: %+v", again)
 	}
@@ -322,7 +322,7 @@ func TestSchedStateClaimNewGenerationDespiteInFlight(t *testing.T) {
 	if len(fresh) != 1 || fresh[0].Target.ConfigSerial != 2 {
 		t.Fatalf("new generation claim = %+v, want generation 2 immediately", fresh)
 	}
-	s.finish(stale[0].Key, true) // the superseded cycle finishing must be a no-op
+	s.finish(stale[0], true) // the superseded cycle finishing must be a no-op
 	if again := s.claim(now.Add(2 * time.Second)); len(again) != 0 {
 		t.Fatalf("a stale finish released the live generation: %+v", again)
 	}
@@ -336,7 +336,7 @@ func TestPingCycleStampsSamplesAtCompletion(t *testing.T) {
 	clk := stubCycleClock(t)
 	start := clk.Now()
 	p := &gwTestPlatform{}
-	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1", Params: pcfg.ProbeParams{PacketCount: 2}},
 	})
@@ -361,7 +361,7 @@ func TestPingCycleStampsSamplesAtCompletion(t *testing.T) {
 func TestPingCollectDeliversOnALaterPass(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{}
-	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1"},
 	})

@@ -44,11 +44,11 @@ func assertNoSamples(t *testing.T, res Result) {
 	}
 }
 
-// assertPingCyclesEmitNothing drives a ping collector through a full async round
-// trip and fails if either pass produced anything. The cycles run on their own
-// goroutines, so the check has to cover both the pass that starts them and the
+// assertProbesEmitNothing drives a collector through a full async round trip and
+// fails if either pass produced anything. Every probe now runs on its own
+// goroutine, so the check has to cover both the pass that starts them and the
 // pass that would have drained them.
-func assertPingCyclesEmitNothing(t *testing.T, ctx context.Context, c settledCollector) {
+func assertProbesEmitNothing(t *testing.T, ctx context.Context, c settledCollector) {
 	t.Helper()
 	started, err := c.Collect(ctx)
 	if err != nil {
@@ -72,12 +72,12 @@ func cancelledCtx() context.Context {
 func TestPublicPingCancelledRunEmitsNothing(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{}
-	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1"},
 		{MonitorID: "m2", Kind: "icmp", Target: "8.8.8.8"},
 	})
-	assertPingCyclesEmitNothing(t, cancelledCtx(), c)
+	assertProbesEmitNothing(t, cancelledCtx(), c)
 	if got := p.pingCount(); got != 0 {
 		t.Fatalf("pings=%d want 0 under a cancelled run", got)
 	}
@@ -91,22 +91,22 @@ func TestPublicPingMidCycleAbortEmitsNothing(t *testing.T) {
 	stubCycleClock(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &cancelPingPlatform{cancel: cancel, cancelAfter: 1}
-	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1", Params: pcfg.ProbeParams{PacketCount: 3}},
 		{MonitorID: "m2", Kind: "icmp", Target: "8.8.8.8", Params: pcfg.ProbeParams{PacketCount: 3}},
 	})
-	assertPingCyclesEmitNothing(t, ctx, c)
+	assertProbesEmitNothing(t, ctx, c)
 }
 
 func TestGatewayPingCancelledRunEmitsNothing(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway"},
 	})
-	assertPingCyclesEmitNothing(t, cancelledCtx(), c)
+	assertProbesEmitNothing(t, cancelledCtx(), c)
 	if got := p.pingCount(); got != 0 {
 		t.Fatalf("pings=%d want 0 under a cancelled run", got)
 	}
@@ -122,56 +122,44 @@ func TestGatewayPingMidCycleAbortEmitsNothing(t *testing.T) {
 		cancel:         cancel,
 		cancelAfter:    1,
 	}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "eth0", PacketCount: 3}},
 	})
-	assertPingCyclesEmitNothing(t, ctx, c)
+	assertProbesEmitNothing(t, ctx, c)
 }
 
 func TestDNSCancelledRunEmitsNothing(t *testing.T) {
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "d1", Kind: "dns", Target: "example.com"},
 	})
-	res, err := c.Collect(cancelledCtx())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
+	assertProbesEmitNothing(t, cancelledCtx(), c)
 }
 
 func TestHTTPCancelledRunEmitsNothing(t *testing.T) {
-	c := NewHTTPCollector(netguard.New(probepolicy.Policy{}, true), nil, true)
+	c := NewHTTPCollector(netguard.New(probepolicy.Policy{}, true), nil, true, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "h1", Kind: "http", Target: "http://192.0.2.1/"},
 	})
-	res, err := c.Collect(cancelledCtx())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
+	assertProbesEmitNothing(t, cancelledCtx(), c)
 }
 
 func TestTCPCancelledRunEmitsNothing(t *testing.T) {
-	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "t1", Kind: "tcp", Target: "192.0.2.1", Params: pcfg.ProbeParams{Port: 443}},
 	})
-	res, err := c.Collect(cancelledCtx())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
+	assertProbesEmitNothing(t, cancelledCtx(), c)
 }
 
 func TestTCPProbeAbortedResultDropped(t *testing.T) {
-	// Drive probe directly (bypassing Collect's pass guard) so the in-probe
-	// guards are exercised: a dial/resolution "failure" under a cancelled run
-	// must not become a tcp.ok=0 sample. Both the literal-IP path (dial) and the
-	// hostname path (resolution) are covered; neither touches the network under a
+	// Drive probe directly (bypassing runTarget's guards) so the in-probe guards
+	// are exercised: a dial/resolution "failure" under a cancelled run must not
+	// become a tcp.ok=0 sample. Both the literal-IP path (dial) and the hostname
+	// path (resolution) are covered; neither touches the network under a
 	// cancelled context.
-	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	ctx := cancelledCtx()
 	var res Result
 	c.probe(ctx, time.Now().UTC(), pcfg.ProbeTarget{
@@ -184,30 +172,27 @@ func TestTCPProbeAbortedResultDropped(t *testing.T) {
 }
 
 func TestNATCancelledRunEmitsNothing(t *testing.T) {
-	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "n1", Kind: "nat", Target: "stun.example"},
 	})
-	res, err := c.Collect(cancelledCtx())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
+	assertProbesEmitNothing(t, cancelledCtx(), c)
 }
 
 func TestNATEmitBindingAbortedFailureDropped(t *testing.T) {
-	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	target := pcfg.ProbeTarget{MonitorID: "n1", Kind: "nat", Target: "stun.example"}
 	base := map[string]string{"transport": "udp", "server": "stun.example:3478"}
 
 	// Cancelled run: the failed exchange is dropped, no nat.ok=0 and no event.
 	var res Result
-	c.emitBinding(cancelledCtx(), time.Now().UTC(), target, &res, base, "", 0, errTimeout)
+	var obs mappedObservation
+	c.emitBinding(cancelledCtx(), time.Now().UTC(), target, &res, &obs, base, "", 0, errTimeout)
 	assertNoSamples(t, res)
 
 	// Live run: the same failure is still recorded (no behavior regression).
 	var live Result
-	c.emitBinding(context.Background(), time.Now().UTC(), target, &live, base, "", 0, errTimeout)
+	c.emitBinding(context.Background(), time.Now().UTC(), target, &live, &obs, base, "", 0, errTimeout)
 	foundOK := false
 	for _, m := range live.Metrics {
 		if m.Kind == telemetry.NATOK && m.Value == 0 {

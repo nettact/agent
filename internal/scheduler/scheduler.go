@@ -3,8 +3,9 @@
 // mode that temporarily speeds up the base tier when a fault is detected, to
 // capture more evidence during an incident. Target-driven probes (gateway /
 // public ping / DNS / HTTP / TCP / NAT) are self-scheduled instead: polled on a
-// fine tick, each gates its own targets by their per-target interval, and their
-// 100% loss still arms burst mode via selfLoop.
+// fine tick, each gates its own targets by their per-target interval and runs
+// them on their own goroutines, and their 100% loss still arms burst mode via
+// selfLoop.
 package scheduler
 
 import (
@@ -88,12 +89,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 func (s *Scheduler) Wait() { s.wg.Wait() }
 
 // waitSelfIdle joins the work a self-scheduled collector left running past its
-// Collect. The ping collectors spread each cycle across the target's whole
-// interval and therefore run it on its own goroutine, which outlives the poll
-// loop; joining here is what keeps Wait's contract intact — once Wait returns,
-// nothing Run started is still touching the platform HAL or the proxy manager,
-// so the runtime can tear them down in its usual order. A cancelled cycle
-// unwinds within one per-echo timeout.
+// Collect. Every probe runs on its own goroutine, which outlives the poll loop;
+// joining here is what keeps Wait's contract intact — once Wait returns, nothing
+// Run started is still touching the platform HAL or the proxy manager, so the
+// runtime can tear them down in its usual order. After cancellation a run
+// unwinds within one operation timeout.
 func (s *Scheduler) waitSelfIdle() {
 	for _, c := range s.selfSched {
 		if w, ok := c.(interface{ WaitIdle() }); ok {
@@ -105,12 +105,19 @@ func (s *Scheduler) waitSelfIdle() {
 // selfLoop polls self-scheduling collectors on a fine tick; each returns only
 // the targets due by their own interval (empty Result otherwise).
 //
-// The poll must stay quick: every self-scheduled collector shares this one
-// goroutine, so a Collect that blocks stalls all of them. The ping collectors
-// hand back cycles that finished since the previous tick and start the newly
-// due ones in the background, so a spread cycle spanning its whole interval
-// still costs this loop nothing. The synchronous ones (DNS/HTTP/TCP/NAT) do run
-// their probe inline and are bounded by their own per-probe timeouts.
+// The poll must stay quick, and now that is a contract every self-scheduled
+// collector keeps rather than a hope. All of them run their probes on their own
+// goroutines (see collector.probeRunner) and use Collect only to hand back what
+// finished since the previous tick and to start what has come due — so a probe
+// that takes its whole timeout, or an ICMP cycle spread across its entire check
+// interval, costs this loop nothing.
+//
+// It used to be otherwise, and the asymmetry was the reason to change it: the
+// single-shot probes ran inline, so one unreachable HTTP target held this
+// goroutine for its full 10s timeout and a NAT discovery for 25s, delaying every
+// other probe on the agent — including the ping cycles — by exactly that. The
+// moment that hurt most was the moment a fault was unfolding, which is when the
+// probes queued behind it were the ones someone was waiting on.
 func (s *Scheduler) selfLoop(ctx context.Context) {
 	if len(s.selfSched) == 0 {
 		return

@@ -271,10 +271,17 @@ func pingReasonRank(code int) int {
 
 // pingCycleResult is one ICMP probe cycle summarized: the loss and the RTT
 // distribution over the received echoes. Emitted as several Metric rows sharing
-// one TS+Target+MonitorID (loss + samples always; avg/min/max only when any echo
-// was received; jitter only when >=2 were).
+// one TS+Target+MonitorID (loss + sent + samples always; avg/min/max only when
+// any echo was received; jitter only when >=2 were).
 type pingCycleResult struct {
-	Loss       float64 // percent over the configured packet count
+	Loss float64 // percent over the echoes actually SENT
+	// Sent is how many echoes the cycle attempted. Normally the configured
+	// packet count; less when the machine's probe budget could not admit them all
+	// inside the cycle's timing budget, and zero when it admitted none — which
+	// the caller turns into no Result at all rather than a fabricated failure.
+	// The synthetic-failure paths (an unusable proxy pin, a resolve failure, no
+	// gateway on the NIC) set it to the configured count: those are complete
+	// verdicts about the target, not truncated measurements.
 	Sent       int
 	Received   int
 	AvgMs      float64
@@ -290,10 +297,10 @@ type pingCycleResult struct {
 	Detail string
 }
 
-// appendICMPMetrics emits the shared ICMP metric set for one cycle result. loss
-// and samples are always emitted (samples=0 is an honest "0 of N received", not a
-// fake latency); avg/min/max only when at least one echo returned; jitter only
-// when the distribution has >=2 samples.
+// appendICMPMetrics emits the shared ICMP metric set for one cycle result. loss,
+// sent and samples are always emitted (samples=0 is an honest "0 of N received",
+// not a fake latency); avg/min/max only when at least one echo returned; jitter
+// only when the distribution has >=2 samples.
 func appendICMPMetrics(res *Result, now time.Time, monitorID string, configSerial int, target string, layer telemetry.HealthLayer, labels map[string]string, r pingCycleResult) {
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
 		return telemetry.Metric{TS: now, Kind: kind, Target: target, Layer: layer, Value: v, Unit: unit, Labels: labels, MonitorID: monitorID, ConfigSerial: configSerial}
@@ -308,6 +315,10 @@ func appendICMPMetrics(res *Result, now time.Time, monitorID string, configSeria
 	}
 	res.Metrics = append(res.Metrics,
 		mk(telemetry.ICMPLoss, r.Loss, telemetry.UnitPct),
+		// Sent travels with every round so the server can tell a complete round
+		// from one the agent's probe budget truncated, and refuse to move
+		// availability state on the latter.
+		mk(telemetry.ICMPSent, float64(r.Sent), telemetry.UnitCount),
 		mk(telemetry.ICMPSamples, float64(r.Received), telemetry.UnitCount),
 		ec,
 	)

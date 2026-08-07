@@ -88,15 +88,12 @@ func TestHTTPProxyMissingReportsProxyConfigWithoutDialing(t *testing.T) {
 	defer srv.Close()
 
 	mgr := proxydial.NewManager(testGuard())
-	c := NewHTTPCollector(testGuard(), mgr, true)
+	c := NewHTTPCollector(testGuard(), mgr, true, nil)
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "http", Target: srv.URL, ProxyID: "prx_absent", ConfigSerial: 1,
 	}})
 
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := collectSettled(t, context.Background(), c)
 	if hits != 0 {
 		t.Fatalf("the probe reached the target %d time(s) — a missing proxy must never fall back to a direct dial", hits)
 	}
@@ -137,15 +134,12 @@ func TestHTTPUnreachableProxyIsProxyConnectNotTimeout(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeSOCKS5, Host: host, Port: port, ConfigSerial: 1,
 	}})
-	c := NewHTTPCollector(testGuard(), mgr, true)
+	c := NewHTTPCollector(testGuard(), mgr, true, nil)
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "http", Target: srv.URL, ProxyID: "prx", ConfigSerial: 1,
 	}})
 
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := collectSettled(t, context.Background(), c)
 	ec := metricByKind(res, telemetry.HTTPErrorClass)
 	if ec == nil {
 		t.Fatal("no error class emitted")
@@ -183,16 +177,13 @@ func TestHTTPThroughProxySucceeds(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeHTTP, Host: host, Port: port, ConfigSerial: 1,
 	}})
-	c := NewHTTPCollector(testGuard(), mgr, true)
+	c := NewHTTPCollector(testGuard(), mgr, true, nil)
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "http", Target: srv.URL, ProxyID: "prx", ConfigSerial: 1,
 		Params: pcfg.ProbeParams{Keyword: "body-marker"},
 	}})
 
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := collectSettled(t, context.Background(), c)
 	if got == nil {
 		t.Fatal("the request never reached the target through the proxy")
 	}
@@ -217,7 +208,7 @@ func TestHTTPThroughProxySucceeds(t *testing.T) {
 // The client cache must be keyed on the proxy GENERATION, or a rotated credential
 // would keep being served over the connection pool built with the old one.
 func TestHTTPClientCacheIsKeyedByProxyGeneration(t *testing.T) {
-	c := NewHTTPCollector(testGuard(), proxydial.NewManager(testGuard()), true)
+	c := NewHTTPCollector(testGuard(), proxydial.NewManager(testGuard()), true, nil)
 	d1 := &proxydial.Dialer{Spec: pcfg.ProxySpec{ID: "prx", ConfigSerial: 1}}
 	d2 := &proxydial.Dialer{Spec: pcfg.ProxySpec{ID: "prx", ConfigSerial: 2}}
 
@@ -255,17 +246,14 @@ func TestTCPRemoteDNSEmitsNoDNSSegment(t *testing.T) {
 		ID: "prx", Type: pcfg.ProxyTypeHTTP, Host: phost, Port: pport,
 		DNSMode: pcfg.ProxyDNSRemote, ConfigSerial: 1,
 	}})
-	c := NewTCPCollector(testGuard(), mgr)
+	c := NewTCPCollector(testGuard(), mgr, nil)
 	// A hostname target, so a local-DNS run WOULD have produced a dns_ms sample.
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "tcp", Target: "localhost", ProxyID: "prx", ConfigSerial: 1,
 		Params: pcfg.ProbeParams{Port: port},
 	}})
 
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := collectSettled(t, context.Background(), c)
 	if metricByKind(res, telemetry.TCPDNSms) != nil {
 		t.Fatal("proxy-side DNS emitted a dns_ms segment the agent never measured")
 	}
@@ -279,15 +267,12 @@ func TestTCPRemoteDNSEmitsNoDNSSegment(t *testing.T) {
 }
 
 func TestTCPProxyMissingReportsProxyConfig(t *testing.T) {
-	c := NewTCPCollector(testGuard(), proxydial.NewManager(testGuard()))
+	c := NewTCPCollector(testGuard(), proxydial.NewManager(testGuard()), nil)
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "tcp", Target: "203.0.113.5", ProxyID: "prx_absent", ConfigSerial: 1,
 		Params: pcfg.ProbeParams{Port: 443},
 	}})
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := collectSettled(t, context.Background(), c)
 	ec := metricByKind(res, telemetry.TCPErrorClass)
 	if ec == nil || int(ec.Value) != telemetry.ProbeReasonProxyConfig {
 		t.Fatalf("error class = %+v, want ProxyConfig(%d)", ec, telemetry.ProbeReasonProxyConfig)

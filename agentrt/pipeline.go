@@ -90,6 +90,7 @@ func buildServer(
 	limits Limits,
 	drain time.Duration,
 	traceLimit traceroute.Limiter,
+	probeGate *collector.ProbeGate,
 	hostname string,
 ) *serverRuntime {
 	rt := &serverRuntime{
@@ -121,22 +122,22 @@ func buildServer(
 	// The gateway probe is the one kind that is never proxied: it targets the local
 	// first hop, where an egress proxy has no meaning.
 	if v.effective.Has(permission.NetworkGatewayProbe) {
-		addProbe(collector.NewGatewayPingCollector(p, v.guard))
+		addProbe(collector.NewGatewayPingCollector(p, v.guard, probeGate))
 	}
 	if v.effective.Has(permission.ProbeICMP) {
-		addProbe(collector.NewPublicPingCollector(p, v.guard, rt.proxies))
+		addProbe(collector.NewPublicPingCollector(p, v.guard, rt.proxies, probeGate))
 	}
 	if v.effective.Has(permission.ProbeDNS) {
-		addProbe(collector.NewDNSCollector(v.guard, rt.proxies, v.effective))
+		addProbe(collector.NewDNSCollector(v.guard, rt.proxies, v.effective, probeGate))
 	}
 	if v.effective.Has(permission.ProbeHTTP) {
-		addProbe(collector.NewHTTPCollector(v.guard, rt.proxies, v.effective.Has(permission.ProbeHTTPExtended)))
+		addProbe(collector.NewHTTPCollector(v.guard, rt.proxies, v.effective.Has(permission.ProbeHTTPExtended), probeGate))
 	}
 	if v.effective.Has(permission.ProbeTCP) {
-		addProbe(collector.NewTCPCollector(v.guard, rt.proxies))
+		addProbe(collector.NewTCPCollector(v.guard, rt.proxies, probeGate))
 	}
 	if v.effective.Has(permission.ProbeNAT) {
-		addProbe(collector.NewNATCollector(v.guard, rt.proxies))
+		addProbe(collector.NewNATCollector(v.guard, rt.proxies, probeGate))
 	}
 
 	// Tiered collectors: interface (status), ARP (neighbor), host metrics — each

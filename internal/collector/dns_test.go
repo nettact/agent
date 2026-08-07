@@ -120,7 +120,7 @@ func TestResolverLabelsNameTheDialedEndpoint(t *testing.T) {
 		{"doh url passes through", pcfg.ProbeParams{ResolverServer: "https://doh.example/q", ResolverProtocol: "doh"},
 			"https://doh.example/q", "doh"},
 	}
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil, nil)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := c.resolverLabels(pcfg.ProbeTarget{Kind: "dns", Target: "example.com", Params: tc.params}, "")
@@ -136,7 +136,7 @@ func TestResolverLabelsNameTheDialedEndpoint(t *testing.T) {
 // the one configured: diagnosing the configured host could report a healthy path
 // while the endpoint that actually failed goes unexamined.
 func TestResolverLabelsFollowDoHRedirect(t *testing.T) {
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil, nil)
 	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com",
 		Params: pcfg.ProbeParams{ResolverServer: "https://doh.example/dns-query", ResolverProtocol: "doh"}}
 
@@ -157,7 +157,7 @@ func TestResolverLabelsFollowDoHRedirect(t *testing.T) {
 // falls back to the configured redirector — a host that answered fine — sending
 // the diagnostic to the wrong place in exactly the case it is needed.
 func TestDoHFailureNamesTheAttemptedEndpoint(t *testing.T) {
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil, nil)
 
 	// A client whose transport fails, reporting the redirected URL as url.Error does.
 	failing := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -186,7 +186,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // the diagnostic at a server that answered fine.
 func TestResolverLabelsForSystemResolver(t *testing.T) {
 	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil,
-		permission.FromStrings([]string{string(permission.NetIfaceAddressRead)}))
+		permission.FromStrings([]string{string(permission.NetIfaceAddressRead)}), nil)
 	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com"}
 
 	c.sysResolvers = []string{"192.0.2.53"}
@@ -217,7 +217,7 @@ func TestResolverLabelsForSystemResolver(t *testing.T) {
 func TestSystemResolverRequiresAddressReadPermission(t *testing.T) {
 	// Probing is granted; address read is not.
 	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil,
-		permission.FromStrings([]string{string(permission.ProbeDNS)}))
+		permission.FromStrings([]string{string(permission.ProbeDNS)}), nil)
 	// Even with a discovery result already cached, the label must not appear.
 	c.sysResolvers = []string{"192.0.2.53"}
 	c.sysResolversAt = time.Now()
@@ -239,7 +239,7 @@ func TestSystemResolverRequiresAddressReadPermission(t *testing.T) {
 // returns its input UNCHANGED when the detail is empty, so a cached/shared map
 // would let one cycle's detail leak onto another cycle's labels.
 func TestResolverLabelsAreNotShared(t *testing.T) {
-	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
+	c := NewDNSCollector(netguard.New(probepolicy.Policy{}, true), nil, nil, nil)
 	target := pcfg.ProbeTarget{Kind: "dns", Target: "example.com", Params: pcfg.ProbeParams{ResolverServer: "1.1.1.1"}}
 	first := c.resolverLabels(target, "")
 	withDetail(first, "SERVFAIL") // a cycle that had a cause

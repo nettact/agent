@@ -86,14 +86,11 @@ func TestNATBindingSmoke(t *testing.T) {
 	if os.Getenv("NETTACT_STUN_IT") == "" {
 		t.Skip("set NETTACT_STUN_IT=1 to run the public-STUN integration test")
 	}
-	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil)
+	c := NewNATCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{{Kind: "nat", Target: "stun.l.google.com:19302", Params: pcfg.ProbeParams{NATTransport: "udp", TimeoutMs: 3000, GlobalTimeoutMs: 8000}}})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	res, err := c.Collect(ctx)
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	res := collectSettled(t, ctx, c)
 	var ok bool
 	for _, m := range res.Metrics {
 		if m.Kind == telemetry.NATOK {

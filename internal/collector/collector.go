@@ -62,20 +62,27 @@ type Collector interface {
 
 // schedState tracks per-target next-due times so a collector can probe each of
 // its targets on that target's own interval (falling back to a default when the
-// target sets no interval_seconds). Used by the self-scheduling collectors
-// (public ping / DNS / HTTP) which the agent drives on a fine-grained tick.
+// target sets no interval_seconds). Used by every target-driven collector, which
+// the agent drives on a fine-grained tick.
 //
-// The ping collectors additionally run each cycle asynchronously (a spread ICMP
-// cycle spans most of its interval), so schedState also tracks which probes are
-// in flight: claim marks them, finish releases them, and a claimed probe is
-// never handed out twice. The synchronous collectors use due and never mark
-// anything, since their cycle is over before Collect returns.
+// Each probe runs asynchronously (a spread ICMP cycle spans most of its
+// interval; a single-shot probe can spend its whole timeout), so schedState also
+// tracks which probes are in flight: claim marks them, finish releases them, and
+// a claimed probe is never handed out twice.
+//
+// In-flight marks carry a run token rather than a bare flag. A generation can be
+// edited away and restored (its key is the same, since the key is derived from
+// the material config), which makes the key claimable again while the first run
+// is still unwinding — and then the first run's finish would release the second
+// run's mark, letting a third start alongside it. Matching the token makes a
+// superseded run's finish a no-op even when its key has come back.
 type schedState struct {
 	mu          sync.Mutex
 	targets     []pcfg.ProbeTarget
 	nextDue     map[string]time.Time
-	inflight    map[string]bool
+	inflight    map[string]int64 // key → the run token holding it
 	reported    map[string]bool
+	nextToken   int64
 	fallback    time.Duration
 	minInterval time.Duration // per-target interval floor (stability limit); 0 = no floor
 }
@@ -83,7 +90,7 @@ type schedState struct {
 func newSchedState(fallback time.Duration) *schedState {
 	return &schedState{
 		nextDue:  map[string]time.Time{},
-		inflight: map[string]bool{},
+		inflight: map[string]int64{},
 		reported: map[string]bool{},
 		fallback: fallback,
 	}
@@ -110,14 +117,19 @@ func schedKey(t pcfg.ProbeTarget) string {
 }
 
 // set replaces the target list (from a DesiredState push) and prunes due-times
-// for probes that are no longer present. In-flight marks are pruned the same
-// way: a superseded generation must never keep its replacement from being
-// claimed, so the new generation probes on the next tick while the old one is
-// still mid-cycle. That briefly leaves two cycles running for one monitor, which
-// is harmless — the old one carries its own ConfigSerial, so its samples land in
-// the generation's own series and the monitor-status tracker ignores it — and
-// when it finishes it finds nothing to release.
-func (s *schedState) set(targets []pcfg.ProbeTarget) {
+// for probes that are no longer present. It returns the keys of the in-flight
+// runs it dropped, so the caller can cancel them: they belong to generations
+// nothing will accept samples from any more, and left alone they would go on
+// spending the machine's probe budget to answer a question already withdrawn.
+//
+// In-flight marks are pruned the same way: a superseded generation must never
+// keep its replacement from being claimed, so the new generation probes on the
+// next tick while the old one is still unwinding. That briefly leaves two runs
+// for one monitor, which is harmless — the old one carries its own ConfigSerial,
+// so its samples land in the generation's own series and the monitor-status
+// tracker ignores it — and when it finishes it finds its token gone and releases
+// nothing.
+func (s *schedState) set(targets []pcfg.ProbeTarget) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.targets = targets
@@ -130,8 +142,10 @@ func (s *schedState) set(targets []pcfg.ProbeTarget) {
 			delete(s.nextDue, k)
 		}
 	}
+	var dropped []string
 	for k := range s.inflight {
 		if !live[k] {
+			dropped = append(dropped, k)
 			delete(s.inflight, k)
 		}
 	}
@@ -140,6 +154,7 @@ func (s *schedState) set(targets []pcfg.ProbeTarget) {
 			delete(s.reported, k)
 		}
 	}
+	return dropped
 }
 
 // due returns the probes whose interval has elapsed by now, advancing each
@@ -158,7 +173,8 @@ func (s *schedState) due(now time.Time) []pcfg.ProbeTarget {
 // scheduledProbe is one probe claimed for an asynchronous run: the target, the
 // schedState key its runner releases with finish, and the instant the target is
 // next due — which a spread ping cycle paces its echoes against, so the last
-// echo lands before the next cycle starts.
+// echo lands before the next cycle starts, and which a single-shot probe uses as
+// the outer bound on how long it may wait for a concurrency slot.
 type scheduledProbe struct {
 	Target  pcfg.ProbeTarget
 	Key     string
@@ -172,48 +188,83 @@ type scheduledProbe struct {
 	// cycle against its own worst case instead, and settle into the interval
 	// from the first cycle that actually reports something.
 	First bool
+	// token identifies this run among the runs of the same key, so a superseded
+	// run releases nothing when the key has since been claimed again.
+	token int64
 }
 
 // claim is the asynchronous variant of due: it returns the due probes together
-// with their next-due instants and marks each in flight, so a cycle that spans
+// with their next-due instants and marks each in flight, so a probe that spans
 // most of its interval can never be started a second time while it is still
-// running. The caller must finish every returned Key.
+// running. The caller must finish every returned probe.
 //
 // next-due still advances from the claim instant, not from the run's end, so a
-// cycle that overruns its interval makes its target due again on the first tick
-// after it finishes — the same degenerate cadence the synchronous collectors
-// fall into, rather than an ever-growing skew.
+// run that overruns its interval makes its target due again on the first tick
+// after it finishes, rather than accumulating an ever-growing skew.
 func (s *schedState) claim(now time.Time) []scheduledProbe {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dueLocked(now, true)
 }
 
-// finish releases an in-flight claim. reported says whether the cycle actually
-// produced telemetry: a cycle that produced nothing (routes momentarily
-// unreadable, a run cancelled by shutdown) leaves the probe still marked as
-// never having reported, so its next cycle is still a First one. Without that,
-// a single empty cycle would spend the target's one fast first cycle and the
-// first REAL measurement would be spread over a whole interval — a five-minute
-// monitor blank for ten minutes instead of five.
+// finish releases an in-flight claim. reported says whether the run actually
+// produced telemetry: a run that produced nothing (routes momentarily
+// unreadable, a run cancelled by shutdown, a probe the concurrency budget could
+// not admit) leaves the probe still marked as never having reported, so its next
+// run is still a First one. Without that, a single empty run would spend the
+// target's one fast first cycle and the first REAL measurement would be spread
+// over a whole interval — a five-minute monitor blank for ten minutes instead of
+// five.
 //
-// Unknown keys (a generation superseded while its cycle ran) are a no-op.
-func (s *schedState) finish(key string, reported bool) {
+// A run whose token no longer holds the key releases nothing: its generation was
+// superseded (and possibly restored and re-claimed) while it ran.
+//
+// The reported mark is deliberately NOT token-guarded, which looks like an
+// oversight and is not. Two runs share a key only when they share a generation —
+// schedKey folds in the ConfigSerial, so a different generation is a different
+// key — which means the only way an "old" run can set this flag for a live run is
+// the edit-away-and-restore case, where both are probing the identical target
+// under the identical serial. Its samples land in that generation's own series,
+// so the monitor HAS reported and the next cycle is rightly not a First one.
+// Guarding it would instead re-arm the fast first cycle for a target that is
+// already streaming data. The flag is also only ever set once the runner has
+// accepted the Result (reported stays false on every discard path), so it never
+// claims telemetry that was thrown away.
+func (s *schedState) finish(sp scheduledProbe, reported bool) {
 	s.mu.Lock()
-	delete(s.inflight, key)
+	if s.inflight[sp.Key] == sp.token {
+		delete(s.inflight, sp.Key)
+	}
 	if reported {
-		s.reported[key] = true
+		s.reported[sp.Key] = true
 	}
 	s.mu.Unlock()
 }
 
+// holds reports whether this run still owns its claim — i.e. whether set has
+// dropped its generation since it was claimed.
+//
+// It exists because claiming and registering a run for cancellation cannot be
+// one atomic step (they are guarded by different mutexes, in the scheduler
+// goroutine and the runner respectively). A push landing in that gap prunes the
+// claim before the cancel is registrable, so it finds nothing to cancel and the
+// withdrawn run would go on probing. Re-checking after registering closes the
+// gap from the other side: whichever of the two orders happens, exactly one of
+// them sees the run and cancels it.
+func (s *schedState) holds(key string, token int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inflight[key] == token
+}
+
 // dueLocked selects the probes due at now and advances their next-due times.
-// With mark set, in-flight probes are skipped and the returned ones are marked.
+// With mark set, in-flight probes are skipped and the returned ones are marked
+// with a fresh run token.
 func (s *schedState) dueLocked(now time.Time, mark bool) []scheduledProbe {
 	var out []scheduledProbe
 	for _, t := range s.targets {
 		k := schedKey(t)
-		if mark && s.inflight[k] {
+		if mark && s.inflight[k] != 0 {
 			continue
 		}
 		nd, ok := s.nextDue[k]
@@ -229,10 +280,13 @@ func (s *schedState) dueLocked(now time.Time, mark bool) []scheduledProbe {
 		}
 		next := now.Add(iv)
 		s.nextDue[k] = next
+		var token int64
 		if mark {
-			s.inflight[k] = true
+			s.nextToken++
+			token = s.nextToken
+			s.inflight[k] = token
 		}
-		out = append(out, scheduledProbe{Target: t, Key: k, NextDue: next, First: !s.reported[k]})
+		out = append(out, scheduledProbe{Target: t, Key: k, NextDue: next, First: !s.reported[k], token: token})
 	}
 	return out
 }

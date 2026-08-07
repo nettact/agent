@@ -16,20 +16,26 @@ import (
 // PublicPingCollector pings a set of public targets pushed down from the server
 // as DesiredState (architecture §4 internet layer). Each target carries its own
 // per-protocol params (timeout, packet size, retries, interval) and is probed on
-// its own schedule via the shared pingRunner — the agent drives Collect on a
+// its own schedule via the shared probeRunner — the agent drives Collect on a
 // fine tick, and each due target's cycle runs on its own goroutine because a
-// spread cycle occupies most of its check interval (see pingRunner, pingLoop).
+// spread cycle occupies most of its check interval (see probeRunner, pingLoop).
 type PublicPingCollector struct {
 	p       platform.Platform
 	guard   *netguard.Guard
 	proxies *proxydial.Manager
-	*pingRunner
+	*probeRunner
 }
 
-func NewPublicPingCollector(p platform.Platform, guard *netguard.Guard, proxies *proxydial.Manager) *PublicPingCollector {
+// NewPublicPingCollector builds the collector. gate is the machine-wide probe
+// budget — pass the same one to every collector of every server; nil means
+// unlimited.
+func NewPublicPingCollector(p platform.Platform, guard *netguard.Guard, proxies *proxydial.Manager, gate *ProbeGate) *PublicPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &PublicPingCollector{p: p, guard: guard, proxies: proxies, pingRunner: newPingRunner(pcfg.DefaultICMPInterval)}
+	return &PublicPingCollector{
+		p: p, guard: guard, proxies: proxies,
+		probeRunner: newProbeRunner(pcfg.DefaultICMPInterval, gate),
+	}
 }
 
 // SetTargets replaces the ICMP target list from a DesiredState update.
@@ -40,7 +46,7 @@ func (c *PublicPingCollector) SetTargets(targets []pcfg.ProbeTarget) {
 			icmp = append(icmp, t)
 		}
 	}
-	c.sched.set(icmp)
+	c.setTargets(icmp)
 }
 
 func (c *PublicPingCollector) Name() string { return "public_ping" }
@@ -49,7 +55,7 @@ func (c *PublicPingCollector) Tier() Tier { return TierBase }
 
 // Collect hands back the cycles that finished since the last pass and starts the
 // targets that have come due. A target's samples therefore surface on a later
-// tick than the Collect that started it — see pingRunner for why the cycles no
+// tick than the Collect that started it — see probeRunner for why the cycles no
 // longer run inline.
 func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 	return c.collect(ctx, c.runTarget), nil
@@ -59,7 +65,7 @@ func (c *PublicPingCollector) Collect(ctx context.Context) (Result, error) {
 // cycle produced. It runs on its own goroutine, so it touches nothing shared
 // beyond the platform HAL, the guard and the proxy manager (all safe for
 // concurrent use) — the Result travels back through the runner's buffer.
-func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) Result {
+func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
 	t := sp.Target
 	// A cycle aborted by run cancellation (agent shutdown) must not fabricate
 	// loss: under a cancelled context resolution and every remaining echo fail
@@ -67,7 +73,7 @@ func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) 
 	// outage — it would sit in the WAL and raise a false alert on the next
 	// start. Drop the whole cycle instead.
 	if ctx.Err() != nil {
-		return Result{}
+		return Result{}, nil
 	}
 	var res Result
 	labels := map[string]string{"ip": t.Target}
@@ -81,7 +87,7 @@ func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) 
 		reason, _, _ := proxydial.ProxyReason(prerr)
 		appendICMPMetrics(&res, cycleNow().UTC(), t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels,
 			pingCycleResult{Loss: 100, Sent: pcfg.PingCount(t.Params), Reason: reason, Detail: errText(prerr)})
-		return res
+		return res, nil
 	}
 	// Vet the destination before dialing: a literal IP is checked directly; a
 	// hostname is resolved once through the guard and the vetted IP is pinned to
@@ -91,7 +97,7 @@ func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) 
 		blocked.MonitorID = t.MonitorID
 		blocked.ConfigSerial = t.ConfigSerial
 		res.Blocked = append(res.Blocked, *blocked)
-		return res
+		return res, nil
 	}
 	if resolveErr != nil {
 		// Resolution failed AFTER policy vetting. Record a probe failure (100%
@@ -100,7 +106,7 @@ func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) 
 		// DNS-rebinding / policy-bypass hole (e.g. a dual-stack name whose AAAA
 		// fails but A resolves to a denied address).
 		if ctx.Err() != nil {
-			return Result{} // resolution failed because the run was cancelled, not the network
+			return Result{}, nil // resolution failed because the run was cancelled, not the network
 		}
 		// The failing phase IS resolution, so an error the classifier cannot place
 		// still lands in the DNS family rather than a meaningless "other".
@@ -109,25 +115,33 @@ func (c *PublicPingCollector) runTarget(ctx context.Context, sp scheduledProbe) 
 			reason = telemetry.ProbeReasonDNS
 		}
 		appendICMPMetrics(&res, cycleNow().UTC(), t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels,
-			pingCycleResult{Loss: 100, Reason: reason, Detail: errText(resolveErr)})
-		return res
+			pingCycleResult{Loss: 100, Sent: pcfg.PingCount(t.Params), Reason: reason, Detail: errText(resolveErr)})
+		return res, nil
 	}
 	// A tunnelled target builds its own echoes on the tunnel's ICMP socket; the
 	// platform pinger sends from the HOST stack and could not reach a tunnel-only
 	// destination at all.
 	var r pingCycleResult
 	if proxy != nil {
-		r = tunnelPingCycle(ctx, proxy, pingTarget, t.Params, pacingDeadline(sp))
+		r = tunnelPingCycle(ctx, proxy, pingTarget, t.Params, pacingDeadline(sp), c.gate)
 	} else {
-		r = pingCycle(ctx, c.p, pingTarget, t.Params, pacingDeadline(sp))
+		r = pingCycle(ctx, c.p, pingTarget, t.Params, pacingDeadline(sp), c.gate)
 	}
 	if ctx.Err() != nil {
-		return Result{} // cycle aborted mid-flight: unsent echoes are not lost echoes
+		return Result{}, nil // cycle aborted mid-flight: unsent echoes are not lost echoes
+	}
+	if r.Sent == 0 {
+		// The concurrency budget admitted no echo inside this cycle's own timing
+		// budget. There is nothing measured to report, and 100% loss over zero
+		// packets would be the agent's own busyness dressed up as an outage. The
+		// gap speaks for itself: the server's staleness window catches it, and
+		// the heartbeat's overload event says why.
+		return Result{}, nil
 	}
 	// Stamped at completion, not at the start of the pass: a spread cycle spans
 	// most of its interval, and the sample summarizes the window that just ended.
 	appendICMPMetrics(&res, cycleNow().UTC(), t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerInternet, labels, r)
-	return res
+	return res, nil
 }
 
 // vet resolves and policy-checks an ICMP target, returning the literal IP to
@@ -176,11 +190,12 @@ func pickPingAddr(vetted []netip.Addr) netip.Addr {
 
 // pingCycle runs one ICMP probe cycle against target on the host's stack, paced
 // to land its last echo before nextDue. The cycle contract — packet count,
-// spread pacing, fail-fast on loss, per-echo timeout, global deadline, and the
-// rule that a lost echo contributes to loss and never to the latency
-// distribution — lives in pingLoop, which the in-tunnel path shares.
-func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams, nextDue time.Time) pingCycleResult {
-	return pingLoop(ctx, params, nextDue, func(ectx context.Context, _ int, timeout time.Duration) (time.Duration, int, string, bool) {
+// spread pacing, fail-fast on loss, per-echo timeout, global deadline, the
+// machine-wide concurrency budget, and the rule that a lost echo contributes to
+// loss and never to the latency distribution — lives in pingLoop, which the
+// in-tunnel path shares.
+func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams, nextDue time.Time, gate *ProbeGate) pingCycleResult {
+	return pingLoop(ctx, params, nextDue, gate, func(ectx context.Context, _ int, timeout time.Duration) (time.Duration, int, string, bool) {
 		pr, err := p.Ping(ectx, target, platform.PingOptions{Timeout: timeout, PayloadSize: params.PacketSize})
 		if err != nil {
 			// The pinger could not run this echo at all. It still counts as lost,

@@ -39,7 +39,7 @@ var icmpEchoPayload = []byte("nettact-probe")
 // paced to land its last echo before nextDue. target must already be a vetted
 // literal IP — same contract as the platform path, where handing over a raw
 // hostname would let it be re-resolved outside the guard.
-func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, params pcfg.ProbeParams, nextDue time.Time) pingCycleResult {
+func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, params pcfg.ProbeParams, nextDue time.Time, gate *ProbeGate) pingCycleResult {
 	addr, err := netip.ParseAddr(target)
 	if err != nil {
 		return pingCycleResult{
@@ -59,7 +59,7 @@ func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, pa
 		payload = append(append([]byte(nil), payload...), make([]byte, params.PacketSize-len(payload))...)
 	}
 
-	return pingLoop(ctx, params, nextDue, func(ectx context.Context, seq int, timeout time.Duration) (time.Duration, int, string, bool) {
+	return pingLoop(ctx, params, nextDue, gate, func(ectx context.Context, seq int, timeout time.Duration) (time.Duration, int, string, bool) {
 		rtt, reason, detail := tunnelPingOnce(ectx, d, network, proto, echoType, addr.String(), seq, payload, timeout)
 		return rtt, reason, detail, reason == telemetry.ProbeReasonNone
 	})

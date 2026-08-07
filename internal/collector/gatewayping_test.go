@@ -27,7 +27,7 @@ import (
 // would.
 //
 // The counters are mutex-guarded because cycles now run on their own goroutines
-// (see pingRunner), so several targets can be pinging this fake at once.
+// (see probeRunner), so several targets can be pinging this fake at once.
 type gwTestPlatform struct {
 	ifaces   []platform.IfaceInfo
 	ifaceErr error
@@ -114,7 +114,7 @@ func lossPct(res Result) float64 {
 func TestGatewayCollectorNamedInterface(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "wlan0"}},
 	})
@@ -151,7 +151,7 @@ func TestGatewayCollectorSkipsUnreadableRoutes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			stubCycleClock(t)
 			p := &gwTestPlatform{ifaces: gwTestIfaces(), ifaceErr: tc.err}
-			c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+			c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 			c.SetTargets([]pcfg.ProbeTarget{{MonitorID: "gw1", Kind: "gateway", Target: "gateway"}})
 			res := collectSettled(t, context.Background(), c)
 			if len(res.Metrics) != 0 || len(res.Events) != 0 {
@@ -169,7 +169,7 @@ func TestGatewayCollectorSkipsUnreadableRoutes(t *testing.T) {
 func TestGatewayCollectorReportsGenuinelyMissingGateway(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: []platform.IfaceInfo{{ID: "eth-id", Name: "eth0", Up: true}}}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{{MonitorID: "gw1", Kind: "gateway", Target: "gateway"}})
 	res := collectSettled(t, context.Background(), c)
 	if got := lossPct(res); got != 100 {
@@ -183,7 +183,7 @@ func TestGatewayCollectorReportsGenuinelyMissingGateway(t *testing.T) {
 func TestGatewayCollectorDefaultInterface(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway"},
 	})
@@ -197,7 +197,7 @@ func TestGatewayCollectorDefaultInterface(t *testing.T) {
 func TestGatewayCollectorUnknownInterface(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "does-not-exist"}},
 	})
@@ -218,7 +218,7 @@ func TestGatewayCollectorDefaultPacketCount(t *testing.T) {
 	// echoes (not a single one), so the RTT distribution + jitter are produced.
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "eth0"}},
 	})
@@ -244,7 +244,7 @@ func TestGatewayCollectorHonorsPacketCount(t *testing.T) {
 	// 4 echoes, every other one lost → 2/4 received → 50% loss.
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces(), recv: func(seq int) bool { return seq%2 == 0 }}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "eth0", PacketCount: 4}},
 	})
@@ -260,7 +260,7 @@ func TestGatewayCollectorHonorsPacketCount(t *testing.T) {
 func TestGatewayCollectorIgnoresNonGatewayKinds(t *testing.T) {
 	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
-	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
+	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "p1", Kind: "icmp", Target: "1.1.1.1"},
 	})

@@ -254,14 +254,12 @@ func TestHTTPProxiedRequestVetsHostLocally(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeSOCKS5, Host: phost, Port: pport, ConfigSerial: 1,
 	}})
-	c := NewHTTPCollector(testGuard(), mgr, true)
+	c := NewHTTPCollector(testGuard(), mgr, true, nil)
 	// A hostname URL: under local DNS the agent must resolve it and ask for the IP.
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "http", Target: "http://localhost:" + portStr, ProxyID: "prx", ConfigSerial: 1,
 	}})
-	if _, err := c.Collect(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	collectSettled(t, context.Background(), c)
 
 	got := srv.seen()
 	if len(got) == 0 {
@@ -280,15 +278,12 @@ func TestDNSProxiedWithoutResolverFailsClosed(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeSOCKS5, Host: "127.0.0.1", Port: 1, ConfigSerial: 1,
 	}})
-	c := NewDNSCollector(testGuard(), mgr, nil)
+	c := NewDNSCollector(testGuard(), mgr, nil, nil)
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "dns", Target: "example.test", ProxyID: "prx", ConfigSerial: 1,
 	}})
 
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := collectSettled(t, context.Background(), c)
 	ok := metricByKind(res, telemetry.DNSOK)
 	if ok == nil || ok.Value != 0 {
 		t.Fatalf("dns ok = %+v, want a 0 sample rather than a host-resolved success", ok)
@@ -313,7 +308,7 @@ func TestClassifyRedirectRequiresNameAuthorizationUnderRemoteDNS(t *testing.T) {
 		Mode:  probepolicy.ModeAllowlist,
 		Allow: []probepolicy.Selector{{Kind: probepolicy.KindHost, Host: "allowed.example.test"}},
 	}
-	c := NewHTTPCollector(netguard.New(policy, false), nil, true)
+	c := NewHTTPCollector(netguard.New(policy, false), nil, true, nil)
 	// Only Spec is read by classifyRedirect, so a bare Dialer carries enough.
 	remote := &proxydial.Dialer{Spec: pcfg.ProxySpec{
 		ID: "p", Type: pcfg.ProxyTypeSOCKS5, DNSMode: pcfg.ProxyDNSRemote,
@@ -404,16 +399,14 @@ func TestDoHProxiedRequestVetsResolverLocally(t *testing.T) {
 	mgr.Apply([]pcfg.ProxySpec{{
 		ID: "prx", Type: pcfg.ProxyTypeSOCKS5, Host: phost, Port: pport, ConfigSerial: 1,
 	}})
-	c := NewDNSCollector(testGuard(), mgr, nil)
+	c := NewDNSCollector(testGuard(), mgr, nil, nil)
 	// A hostname DoH endpoint: under local DNS the agent must resolve it and ask the
 	// proxy for the literal.
 	c.SetTargets([]pcfg.ProbeTarget{{
 		MonitorID: "m1", Kind: "dns", Target: "example.test", ProxyID: "prx", ConfigSerial: 1,
 		Params: pcfg.ProbeParams{ResolverProtocol: "doh", ResolverServer: "https://localhost/dns-query"},
 	}})
-	if _, err := c.Collect(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	collectSettled(t, context.Background(), c)
 
 	got := srv.seen()
 	if len(got) == 0 {
@@ -428,7 +421,7 @@ func TestDoHProxiedRequestVetsResolverLocally(t *testing.T) {
 // transports hold authenticated tunnels, so accumulating them leaks connections and file
 // descriptors for as long as the agent runs.
 func TestDoHClientsEvictSupersededGenerations(t *testing.T) {
-	c := NewDNSCollector(testGuard(), proxydial.NewManager(testGuard()), nil)
+	c := NewDNSCollector(testGuard(), proxydial.NewManager(testGuard()), nil, nil)
 	gen := func(serial int) *proxydial.Dialer {
 		return &proxydial.Dialer{Spec: pcfg.ProxySpec{ID: "prx", ConfigSerial: serial}}
 	}
@@ -460,7 +453,7 @@ func TestDoHClientsEvictSupersededGenerations(t *testing.T) {
 // Same contract for the HTTP collector's client cache: it is keyed by generation, so the
 // superseded entries have to go rather than sit on pooled connections to the old egress.
 func TestHTTPClientsEvictSupersededGenerations(t *testing.T) {
-	c := NewHTTPCollector(testGuard(), proxydial.NewManager(testGuard()), true)
+	c := NewHTTPCollector(testGuard(), proxydial.NewManager(testGuard()), true, nil)
 	gen := func(serial int) *proxydial.Dialer {
 		return &proxydial.Dialer{Spec: pcfg.ProxySpec{ID: "prx", ConfigSerial: serial}}
 	}

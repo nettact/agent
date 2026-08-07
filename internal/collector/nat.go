@@ -34,18 +34,31 @@ import (
 // address): mapping and filtering are only well-defined and reliably measurable
 // over UDP, so they are not emitted for the connection/session transports.
 type NATCollector struct {
-	sched   *schedState
 	guard   *netguard.Guard
 	proxies *proxydial.Manager
+	*probeRunner
 
 	mu         sync.Mutex
-	lastMapped map[string]string // target -> last reflexive addr, so we only event on change
+	lastMapped map[string]mappedAddr // target -> last reflexive addr, so we only event on change
 }
 
-func NewNATCollector(guard *netguard.Guard, proxies *proxydial.Manager) *NATCollector {
+// mappedAddr is the last reflexive address published for a monitor, tagged with
+// the run token that observed it so a slower earlier run cannot overwrite it.
+type mappedAddr struct {
+	token int64
+	addr  string
+}
+
+// NewNATCollector builds the collector. gate is the machine-wide probe budget —
+// pass the same one to every collector of every server; nil means unlimited.
+func NewNATCollector(guard *netguard.Guard, proxies *proxydial.Manager, gate *ProbeGate) *NATCollector {
 	// 30-min fallback: NAT type changes rarely and a full run is multi-RTT, so we
 	// avoid probing every self-tick when a target sets no interval_seconds.
-	return &NATCollector{guard: guard, proxies: proxies, sched: newSchedState(pcfg.DefaultNATInterval), lastMapped: map[string]string{}}
+	return &NATCollector{
+		guard: guard, proxies: proxies,
+		probeRunner: newProbeRunner(pcfg.DefaultNATInterval, gate),
+		lastMapped:  map[string]mappedAddr{},
+	}
 }
 
 // SetTargets replaces the NAT target list from a DesiredState update.
@@ -56,30 +69,85 @@ func (c *NATCollector) SetTargets(targets []pcfg.ProbeTarget) {
 			nat = append(nat, t)
 		}
 	}
-	c.sched.set(nat)
+	c.setTargets(nat)
 }
 
 func (c *NATCollector) Name() string { return "nat" }
 
 func (c *NATCollector) Tier() Tier { return TierRegular }
 
+// Collect hands back the discoveries that finished since the last pass and
+// starts the targets that have come due — see probeRunner for why they no longer
+// run inline.
+//
+// A NAT discovery is by far the longest single-shot probe here (a 25s default
+// whole-cycle deadline), which is exactly why it must not run on the shared poll
+// loop: inline, one unreachable STUN server delayed every other probe on the
+// agent by the whole of it.
 func (c *NATCollector) Collect(ctx context.Context) (Result, error) {
-	targets := c.sched.due(time.Now())
-	if len(targets) == 0 {
+	return c.collect(ctx, c.runTarget), nil
+}
+
+// runTarget runs one discovery on its own goroutine, under a slot from the
+// machine-wide budget.
+//
+// It holds that slot for the whole round — up to the 25s cycle deadline — unlike
+// a ping cycle, which gives its slot back between echoes. That is honest rather
+// than unfortunate: a discovery keeps its primary UDP socket bound the entire
+// time (RFC 5780 requires every test to come from the same local port) and opens
+// a second one for the filtering tests, so it really is occupying the machine
+// throughout. At a 30-minute default interval and a handful of targets it costs
+// the budget almost nothing.
+func (c *NATCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
+	t := sp.Target
+	if c.gate.Acquire(ctx, gateWaitDeadline(sp.NextDue, natCycleDeadline(t.Params))) != AdmittedOK {
+		// Cancelled (shutdown or a superseded generation) or shut out by the
+		// budget. Nothing was probed, so nothing is reported: a fabricated binding
+		// failure would replay from the WAL as a false WAN outage.
 		return Result{}, nil
 	}
-	now := time.Now().UTC()
-	var res Result
-	for _, t := range targets {
-		// A pass aborted by run cancellation (agent shutdown) must not fabricate
-		// binding failures — they would replay from the WAL as a false WAN outage
-		// on the next start (probeNAT drops its own aborted results too).
-		if ctx.Err() != nil {
-			break
-		}
-		c.probeNAT(ctx, now, t, &res)
+	defer c.gate.Release()
+	// A run aborted by cancellation (agent shutdown) must not fabricate binding
+	// failures — they would replay from the WAL as a false WAN outage on the next
+	// start (probeNAT drops its own aborted results too).
+	if ctx.Err() != nil {
+		return Result{}, nil
 	}
-	return res, nil
+	// Stamped where the measurement happens: after the wait for a slot, not when
+	// the pass that scheduled it began.
+	var res Result
+	var obs mappedObservation
+	c.probeNAT(ctx, time.Now().UTC(), t, &res, &obs)
+	if !obs.seen {
+		return res, nil
+	}
+	// The change gate advances in the runner's commit hook, not here. It answers
+	// "is this address different from the last one we TOLD ANYONE about", so it
+	// has to move exactly when the round is published — and only the runner knows
+	// that. Committing here and checking cancellation first would merely narrow
+	// the window: a cancel landing between the check and the runner's own would
+	// still leave the gate advanced past an event that was discarded, and the
+	// next round, seeing no difference, would never report the change at all.
+	return res, func(out *Result) {
+		if !c.commitMapped(t.MonitorID, t.Target, sp.token, obs) {
+			return
+		}
+		out.Events = append(out.Events, telemetry.Event{
+			ID: newID(), TS: obs.ts, Type: telemetry.EventWANIPChanged, Layer: telemetry.LayerWAN,
+			Severity: telemetry.SeverityInfo,
+			Message:  "NAT mapped address " + obs.addr + " (" + obs.transport + ")",
+			Attrs:    obs.labels,
+		})
+	}
+}
+
+// natCycleDeadline is the whole-round budget: the configured GlobalTimeoutMs,
+// else the default. It is what pcfg.CycleDeadline derives for a nat target.
+func natCycleDeadline(p pcfg.ProbeParams) time.Duration {
+	if p.GlobalTimeoutMs > 0 {
+		return time.Duration(p.GlobalTimeoutMs) * time.Millisecond
+	}
+	return pcfg.DefaultNATCycleDeadline
 }
 
 // Behavior codes (mirrored into telemetry so a higher code is a "worse" NAT and a
@@ -116,8 +184,11 @@ func stunDefaultPort(transport string) int {
 
 var errTimeout = errors.New("stun: no response")
 
-// probeNAT runs one target and appends its metrics/events to res.
-func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result) {
+// probeNAT runs one target and appends its metrics/events to res. The reflexive
+// address it observed is recorded in obs rather than committed to the change
+// gate, so the caller can drop a round it is not going to publish without
+// advancing the gate past an event nobody received.
+func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result, obs *mappedObservation) {
 	transport := t.Params.NATTransport
 	if transport == "" {
 		transport = "udp"
@@ -146,14 +217,14 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	// probe-failed event, with the proxy cause in the message.
 	proxy, prerr := resolveProxy(ctx, c.proxies, t)
 	if prerr != nil {
-		c.emitBinding(ctx, now, t, res, base, "", 0, prerr)
+		c.emitBinding(ctx, now, t, res, obs, base, "", 0, prerr)
 		return
 	}
 
 	if transport != "udp" {
 		// tcp/tls/dtls: binding test only.
 		reflexive, rtt, err := streamBinding(rctx, c.guard, proxy, transport, server, t.Params.IgnoreTLS, perReq)
-		c.emitBinding(ctx, now, t, res, base, reflexive, rtt, err)
+		c.emitBinding(ctx, now, t, res, obs, base, reflexive, rtt, err)
 		return
 	}
 
@@ -169,7 +240,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		rt, err = newUDPRoundTripper(c.guard)
 	}
 	if err != nil {
-		c.emitBinding(ctx, now, t, res, base, "", 0, err)
+		c.emitBinding(ctx, now, t, res, obs, base, "", 0, err)
 		return
 	}
 	defer rt.close()
@@ -179,14 +250,14 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 	resp, _, err := rt.do(rctx, server, perReq, 0)
 	if err != nil {
 		// emitBinding routes a *netguard.BlockedError to res.Blocked (no metric).
-		c.emitBinding(ctx, now, t, res, base, "", 0, err)
+		c.emitBinding(ctx, now, t, res, obs, base, "", 0, err)
 		return
 	}
 	rtt := float64(time.Since(t0).Microseconds()) / 1000.0
 
 	var xor stun.XORMappedAddress
 	if xor.GetFrom(resp) != nil {
-		c.emitBinding(ctx, now, t, res, base, "", rtt, errors.New("no XOR-MAPPED-ADDRESS in response"))
+		c.emitBinding(ctx, now, t, res, obs, base, "", rtt, errors.New("no XOR-MAPPED-ADDRESS in response"))
 		return
 	}
 	reflexive := net.JoinHostPort(xor.IP.String(), strconv.Itoa(xor.Port))
@@ -209,7 +280,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		if ctx.Err() != nil {
 			return // discovery aborted by the cancelled run: not an "unknown" verdict
 		}
-		c.emitBinding(ctx, now, t, res, base, reflexive, rtt, nil)
+		c.emitBinding(ctx, now, t, res, obs, base, reflexive, rtt, nil)
 		res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 			map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 		res.Events = append(res.Events, telemetry.Event{
@@ -257,7 +328,7 @@ func (c *NATCollector) probeNAT(ctx context.Context, now time.Time, t pcfg.Probe
 		return // discovery aborted by the cancelled run: not an "unknown" verdict
 	}
 	// No block anywhere in the discovery: emit the binding + behavior metrics.
-	c.emitBinding(ctx, now, t, res, base, reflexive, rtt, nil)
+	c.emitBinding(ctx, now, t, res, obs, base, reflexive, rtt, nil)
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATMapping, mapping,
 		map[string]string{"transport": transport, "behavior": mappingLabel(mapping)}))
 	res.Metrics = append(res.Metrics, natMetric(now, t, telemetry.NATFiltering, filtering,
@@ -285,7 +356,7 @@ func asBlockedProbe(t pcfg.ProbeTarget, err error) *BlockedProbe {
 // address differs from the last one seen for this target — the metrics store does
 // not persist sample labels, so this event is how the mapped address surfaces, and
 // gating on change keeps it from spamming the timeline every run.
-func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result, base map[string]string, reflexive string, rtt float64, err error) {
+func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result, obs *mappedObservation, base map[string]string, reflexive string, rtt float64, err error) {
 	if err != nil {
 		// A policy block on the STUN server is a target-policy block, not a binding
 		// failure: emit no metric/event, route it to the monitor-status tracker.
@@ -323,21 +394,68 @@ func (c *NATCollector) emitBinding(ctx context.Context, now time.Time, t pcfg.Pr
 				Value: rtt, Unit: telemetry.UnitMs, Labels: base, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial})
 	}
 
-	// The change-gate is per monitor: two monitors probing the same server must
-	// each track their own last mapped address.
-	key := t.MonitorID + "|" + base[telemetry.NATTransportLabel] + "|" + t.Target
-	c.mu.Lock()
-	changed := c.lastMapped[key] != reflexive
-	c.lastMapped[key] = reflexive
-	c.mu.Unlock()
-	if changed && reflexive != "" {
-		res.Events = append(res.Events, telemetry.Event{
-			ID: newID(), TS: now, Type: telemetry.EventWANIPChanged, Layer: telemetry.LayerWAN,
-			Severity: telemetry.SeverityInfo,
-			Message:  "NAT mapped address " + reflexive + " (" + base[telemetry.NATTransportLabel] + ")",
-			Attrs:    okLabels,
-		})
+	if reflexive != "" {
+		// Recorded, not committed. The change gate must only advance for a round
+		// whose result actually ships: the runner discards a Result whose run was
+		// cancelled, and committing here would advance the gate for an event that
+		// went in the bin — so the NEXT round would see no change and the real WAN
+		// IP change would never be reported at all. runTarget commits once it
+		// knows the round is being kept.
+		*obs = mappedObservation{
+			seen:      true,
+			transport: base[telemetry.NATTransportLabel],
+			addr:      reflexive,
+			ts:        now,
+			labels:    okLabels,
+		}
 	}
+}
+
+// mappedObservation is one completed discovery's reflexive address, held until
+// the runner has committed to keeping the round's Result.
+type mappedObservation struct {
+	seen      bool
+	transport string
+	addr      string
+	ts        time.Time
+	labels    map[string]string
+}
+
+// commitMapped records an observed reflexive address and reports whether it
+// differs from the last one recorded — the gate that keeps a stable public
+// address from emitting an event every round. The caller emits the event.
+//
+// The gate is per monitor: two monitors probing the same server must each track
+// their own address. It is NOT keyed by generation — keyed by it, every config
+// edit would be a first sighting, and a first sighting emits, so an edit would
+// announce a WAN IP change that never happened.
+//
+// Ordering is by RUN TOKEN, not by config generation. Two rounds for one monitor
+// overlap whenever a target leaves and re-enters the runnable set, and a NAT
+// round is long enough (a 25s deadline) that the earlier one can finish last;
+// letting it write would rewind the gate and make the next round report a change
+// that never happened. Config generation cannot order them, because the case
+// that produces the overlap is precisely the one where both rounds carry the
+// SAME generation — schedKey includes the serial, so a differing serial is a
+// different key. Tokens come from schedState's monotonic counter, so a higher
+// one always started later.
+func (c *NATCollector) commitMapped(monitorID, target string, token int64, obs mappedObservation) bool {
+	key := monitorID + "|" + obs.transport + "|" + target
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, seen := c.lastMapped[key]
+	if seen && token < prev.token {
+		return false
+	}
+	c.lastMapped[key] = mappedAddr{token: token, addr: obs.addr}
+	if !seen {
+		// First sighting since this agent started. It reports a change on purpose:
+		// after a restart nobody has been told what this monitor's public address
+		// is, and silence would leave the console showing the last address from
+		// before the restart until it happens to change.
+		return obs.addr != ""
+	}
+	return prev.addr != obs.addr && obs.addr != ""
 }
 
 func natMetric(now time.Time, t pcfg.ProbeTarget, kind telemetry.MetricKind, code int, labels map[string]string) telemetry.Metric {
@@ -863,6 +981,3 @@ func natTypeLabel(code int) string {
 		return "unknown"
 	}
 }
-
-// SetMinInterval applies the local per-target probe-interval floor (stability limit).
-func (c *NATCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

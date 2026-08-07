@@ -15,13 +15,9 @@ import (
 // httpCollect runs one HTTP probe cycle for a single target.
 func httpCollect(t *testing.T, target pcfg.ProbeTarget) Result {
 	t.Helper()
-	c := NewHTTPCollector(netguard.New(probepolicy.Policy{}, true), nil, true)
+	c := NewHTTPCollector(netguard.New(probepolicy.Policy{}, true), nil, true, nil)
 	c.SetTargets([]pcfg.ProbeTarget{target})
-	res, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	return res
+	return collectSettled(t, context.Background(), c)
 }
 
 func TestHTTPErrorClassDetail(t *testing.T) {

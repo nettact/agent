@@ -18,7 +18,7 @@ import (
 // Unlike the old always-on probe, gateways are now user-configured monitors
 // (kind="gateway") pushed down as DesiredState, self-scheduled per target like
 // the public-ping collector — each due target's cycle runs on its own goroutine
-// (see pingRunner). Each target may name a NIC in Params.Interface (matched
+// (see probeRunner). Each target may name a NIC in Params.Interface (matched
 // against IfaceInfo.ID or Name); an empty value resolves the default gateway
 // (first IPv4 gateway on an up, non-loopback interface). Target string is the
 // server-normalized "gateway" (stable across gateway IP changes); the resolved IP
@@ -26,13 +26,19 @@ import (
 type GatewayPingCollector struct {
 	p     platform.Platform
 	guard *netguard.Guard
-	*pingRunner
+	*probeRunner
 }
 
-func NewGatewayPingCollector(p platform.Platform, guard *netguard.Guard) *GatewayPingCollector {
+// NewGatewayPingCollector builds the collector. gate is the machine-wide probe
+// budget — pass the same one to every collector of every server; nil means
+// unlimited.
+func NewGatewayPingCollector(p platform.Platform, guard *netguard.Guard, gate *ProbeGate) *GatewayPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &GatewayPingCollector{p: p, guard: guard, pingRunner: newPingRunner(pcfg.DefaultGatewayInterval)}
+	return &GatewayPingCollector{
+		p: p, guard: guard,
+		probeRunner: newProbeRunner(pcfg.DefaultGatewayInterval, gate),
+	}
 }
 
 // SetTargets replaces the gateway target list from a DesiredState update.
@@ -43,7 +49,7 @@ func (c *GatewayPingCollector) SetTargets(targets []pcfg.ProbeTarget) {
 			gw = append(gw, t)
 		}
 	}
-	c.sched.set(gw)
+	c.setTargets(gw)
 }
 
 func (c *GatewayPingCollector) Name() string { return "gateway_ping" }
@@ -52,7 +58,7 @@ func (c *GatewayPingCollector) Tier() Tier { return TierBase }
 
 // Collect hands back the cycles that finished since the last pass and starts the
 // targets that have come due. A target's samples therefore surface on a later
-// tick than the Collect that started it — see pingRunner for why the cycles no
+// tick than the Collect that started it — see probeRunner for why the cycles no
 // longer run inline.
 func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 	return c.collect(ctx, c.runTarget), nil
@@ -60,13 +66,13 @@ func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
 
 // runTarget resolves and probes one gateway target, returning everything that
 // one cycle produced. It runs on its own goroutine.
-func (c *GatewayPingCollector) runTarget(ctx context.Context, sp scheduledProbe) Result {
+func (c *GatewayPingCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
 	t := sp.Target
 	// A cycle aborted by run cancellation (agent shutdown) must not fabricate
 	// loss samples or unreachable events — they would replay from the WAL as a
 	// false LAN outage on the next start.
 	if ctx.Err() != nil {
-		return Result{}
+		return Result{}, nil
 	}
 	var res Result
 	gw, known := c.gatewayFor(t.Params.Interface)
@@ -75,13 +81,14 @@ func (c *GatewayPingCollector) runTarget(ctx context.Context, sp scheduledProbe)
 		// is UNKNOWN. Skipping leaves an honest gap in the series; the branch
 		// below would instead publish 100% loss and a LAN-outage event for a
 		// restriction on the agent itself.
-		return Result{}
+		return Result{}, nil
 	}
 	if gw == "" {
 		// No gateway found on the selected/default NIC: report LAN-layer down.
 		now := cycleNow().UTC()
 		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN,
-			gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100, Reason: telemetry.ProbeReasonUnreachable,
+			gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100, Sent: pcfg.PingCount(t.Params),
+				Reason: telemetry.ProbeReasonUnreachable,
 				Detail: "no IPv4 gateway on the selected interface"})
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
@@ -89,7 +96,7 @@ func (c *GatewayPingCollector) runTarget(ctx context.Context, sp scheduledProbe)
 			Message: "no gateway detected on the selected interface",
 			Attrs:   gatewayLabels("", t.Params.Interface),
 		})
-		return res
+		return res, nil
 	}
 
 	// The gateway must be an address the OS currently reports as a gateway, and
@@ -99,27 +106,37 @@ func (c *GatewayPingCollector) runTarget(ctx context.Context, sp scheduledProbe)
 	if a, perr := netip.ParseAddr(gw); perr == nil {
 		if dec := c.guard.CheckGateway(a.Unmap(), c.osGateways()); !dec.Allowed {
 			res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: dec.Matched, Reason: "literal_denied"})
-			return res
+			return res, nil
 		}
 	}
 
-	r := pingCycle(ctx, c.p, gw, t.Params, pacingDeadline(sp))
+	r := pingCycle(ctx, c.p, gw, t.Params, pacingDeadline(sp), c.gate)
 	if ctx.Err() != nil {
-		return Result{} // cycle aborted mid-flight: unsent echoes are not lost echoes
+		return Result{}, nil // cycle aborted mid-flight: unsent echoes are not lost echoes
+	}
+	if r.Sent == 0 {
+		// The concurrency budget admitted no echo at all: nothing was measured,
+		// so there is nothing to say about the gateway. See the same branch in
+		// the public-ping collector.
+		return Result{}, nil
 	}
 	// Stamped at completion, not at the start of the pass: a spread cycle spans
 	// most of its interval, and the sample summarizes the window that just ended.
 	now := cycleNow().UTC()
 	labels := gatewayLabels(gw, t.Params.Interface)
 	appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN, labels, r)
-	if r.Received == 0 {
+	// A truncated round is not evidence of an unreachable gateway: it says the
+	// agent ran out of probe budget, not that the first hop stopped answering.
+	// Only a round that sent everything it was configured to send may raise the
+	// LAN-outage event.
+	if r.Received == 0 && r.Sent >= pcfg.PingCount(t.Params) {
 		res.Events = append(res.Events, telemetry.Event{
 			ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
 			Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
 			Message: "gateway " + gw + " did not answer ICMP", Attrs: labels,
 		})
 	}
-	return res
+	return res, nil
 }
 
 // osGateways returns every gateway address the OS currently reports across all

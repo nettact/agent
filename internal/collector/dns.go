@@ -28,9 +28,9 @@ import (
 // DNSCollector resolves a server-configured set of names and reports resolve
 // latency + success (architecture §4 DNS layer). Each name carries its own
 // per-target params (timeout, interval, record type, resolver protocol) and is
-// probed on its own schedule via schedState. Supported resolver protocols:
-// plain UDP/TCP (custom nameserver or system), DoT (DNS over TLS), and DoH
-// (DNS over HTTPS).
+// probed on its own schedule and its own goroutine via probeRunner. Supported
+// resolver protocols: plain UDP/TCP (custom nameserver or system), DoT (DNS over
+// TLS), and DoH (DNS over HTTPS).
 //
 // The target-access policy governs the CUSTOM resolver/DoT/DoH endpoint that the
 // probe actually dials (never the queried name, which the DNS probe does not
@@ -39,9 +39,9 @@ import (
 type DNSCollector struct {
 	resolver   *net.Resolver
 	httpClient *http.Client // used for DoH queries on a direct (unproxied) target
-	sched      *schedState
 	guard      *netguard.Guard
 	proxies    *proxydial.Manager
+	*probeRunner
 	// effective gates naming the SYSTEM resolver. Discovering it means reading the
 	// host's configured DNS servers — the very data network.interface.address.read
 	// governs — so an operator who granted DNS probing while withholding that
@@ -69,18 +69,18 @@ type DNSCollector struct {
 // cycle would otherwise re-read the OS.
 const sysResolverTTL = time.Minute
 
-func NewDNSCollector(guard *netguard.Guard, proxies *proxydial.Manager, effective permission.Set) *DNSCollector {
+func NewDNSCollector(guard *netguard.Guard, proxies *proxydial.Manager, effective permission.Set, gate *ProbeGate) *DNSCollector {
 	// DoH transport: environment proxy disabled, dials routed through the guard so
 	// the resolver endpoint (and any redirect) is policy-checked and IP-pinned.
 	doh := &http.Transport{Proxy: nil, DialContext: guard.DialContext, ForceAttemptHTTP2: true}
 	return &DNSCollector{
-		resolver:   net.DefaultResolver,
-		httpClient: &http.Client{Transport: doh},
-		sched:      newSchedState(pcfg.DefaultDNSInterval),
-		guard:      guard,
-		proxies:    proxies,
-		effective:  effective,
-		dohClients: map[string]*http.Client{},
+		resolver:    net.DefaultResolver,
+		httpClient:  &http.Client{Transport: doh},
+		probeRunner: newProbeRunner(pcfg.DefaultDNSInterval, gate),
+		guard:       guard,
+		proxies:     proxies,
+		effective:   effective,
+		dohClients:  map[string]*http.Client{},
 	}
 }
 
@@ -249,33 +249,52 @@ func (c *DNSCollector) SetTargets(targets []pcfg.ProbeTarget) {
 			names = append(names, t)
 		}
 	}
-	c.sched.set(names)
+	c.setTargets(names)
 }
 
 func (c *DNSCollector) Name() string { return "dns" }
 
 func (c *DNSCollector) Tier() Tier { return TierRegular }
 
+// Collect hands back the queries that finished since the last pass and starts
+// the targets that have come due — see probeRunner for why they no longer run
+// inline.
 func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
-	targets := c.sched.due(time.Now())
-	if len(targets) == 0 {
+	return c.collect(ctx, c.runTarget), nil
+}
+
+// dnsTimeout is the per-query budget: the configured TimeoutMs, else the
+// default. It is what pcfg.CycleDeadline derives for a dns target.
+func dnsTimeout(p pcfg.ProbeParams) time.Duration {
+	if p.TimeoutMs > 0 {
+		return time.Duration(p.TimeoutMs) * time.Millisecond
+	}
+	return pcfg.DefaultDNSTimeout
+}
+
+// runTarget queries one name on its own goroutine, under a slot from the
+// machine-wide budget.
+func (c *DNSCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
+	t := sp.Target
+	timeout := dnsTimeout(t.Params)
+	if c.gate.Acquire(ctx, gateWaitDeadline(sp.NextDue, timeout)) != AdmittedOK {
+		// Cancelled (shutdown or a superseded generation) or shut out by the
+		// budget. Nothing was asked, so nothing is reported: a fabricated resolve
+		// failure would replay from the WAL as a false DNS outage.
 		return Result{}, nil
 	}
-
+	defer c.gate.Release()
+	// A run aborted by cancellation (agent shutdown) must not fabricate resolve
+	// failures — they would replay from the WAL as a false DNS outage on the
+	// next start.
+	if ctx.Err() != nil {
+		return Result{}, nil
+	}
+	// Stamped where the measurement happens: after the wait for a slot, not when
+	// the pass that scheduled it began.
 	now := time.Now().UTC()
 	var res Result
-	for _, t := range targets {
-		// A pass aborted by run cancellation (agent shutdown) must not fabricate
-		// resolve failures — they would replay from the WAL as a false DNS outage
-		// on the next start.
-		if ctx.Err() != nil {
-			break
-		}
-		timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
-		if timeout <= 0 {
-			timeout = pcfg.DefaultDNSTimeout
-		}
-
+	{
 		// Resolve the pinned egress proxy. A pin that cannot be honored means the query
 		// is not sent at all (fail-closed): resolving through the default path instead
 		// would answer from a resolver the operator deliberately routed away from.
@@ -283,7 +302,7 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		if prerr != nil {
 			res.Metrics = append(res.Metrics, proxyFailureMetrics(now, t, telemetry.DNSOK, telemetry.DNSErrorClass, c.resolverLabels(t, ""), prerr)...)
 			res.Events = append(res.Events, proxyFailureEvent(now, t, "DNS query not attempted"))
-			continue
+			return res, nil
 		}
 		// A pinned monitor with no resolver endpoint has nothing a proxy could relay to:
 		// the system resolver is OS-owned ambient config, and the branches below would
@@ -301,7 +320,7 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 				fmt.Errorf("%w: a proxied DNS monitor needs an explicit resolver server (the system resolver cannot be relayed)",
 					proxydial.ErrProxyKindUnsupported))...)
 			res.Events = append(res.Events, proxyFailureEvent(now, t, "DNS query not attempted"))
-			continue
+			return res, nil
 		}
 		dial := c.dialFor(proxy)
 
@@ -361,10 +380,10 @@ func (c *DNSCollector) Collect(ctx context.Context) (Result, error) {
 		var be *netguard.BlockedError
 		if errors.As(derr, &be) {
 			res.Blocked = append(res.Blocked, blockedFromErr(t, be))
-			continue
+			return res, nil
 		}
 		if !ok && ctx.Err() != nil {
-			break // the lookup was aborted by the cancelled run, not by the resolver
+			return Result{}, nil // the lookup was aborted by the cancelled run, not by the resolver
 		}
 
 		okv := 0.0
@@ -749,6 +768,3 @@ func lookupRecord(ctx context.Context, r *net.Resolver, recordType, name string)
 		return dnsRecordResult(len(addrs) > 0, err, recordType)
 	}
 }
-
-// SetMinInterval applies the local per-target probe-interval floor (stability limit).
-func (c *DNSCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

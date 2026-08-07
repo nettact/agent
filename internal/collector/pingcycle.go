@@ -122,7 +122,28 @@ type echoFunc func(ctx context.Context, seq int, timeout time.Duration) (rtt tim
 // echo's own timeout to the time remaining — context cancellation alone cannot
 // interrupt a synchronous platform ping (Windows IcmpSendEcho honors only
 // PingOptions.Timeout).
-func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, echo echoFunc) pingCycleResult {
+//
+// # The concurrency budget, and why loss is a ratio over what was sent
+//
+// Every echo takes a slot from the machine-wide gate for the length of that echo
+// and gives it back while the cycle sleeps — a cycle holds nothing between
+// echoes, so charging it a slot for its whole span would starve the other
+// targets for no resource (see ProbeGate). An echo may wait for a slot until one
+// per-echo timeout before the cycle's bound, which is the last instant at which
+// starting still leaves it its whole timeout: waiting cannot turn a healthy
+// target into a lost one, and the cycle still finishes inside
+// pcfg.CycleDeadline.
+//
+// Past that instant the echo is not sent late; it is not sent. Loss is therefore
+// a ratio over the echoes actually SENT, and Sent is reported
+// (telemetry.ICMPSent) so a truncated round is visible as such. Counting an
+// unsent echo as lost would be the agent reporting its own busyness as the
+// network's failure — and would do it in the worst possible way, since the count
+// it would inflate is the one the availability detector reads. A cycle that sent
+// nothing at all reports Sent 0 and its caller drops the whole Result: no sample
+// beats a fabricated one, and the server's own staleness window is what surfaces
+// the silence.
+func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, gate *ProbeGate, echo echoFunc) pingCycleResult {
 	count := pcfg.PingCount(params)
 	timeout := pcfg.PingEchoTimeout(params)
 
@@ -145,11 +166,13 @@ func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, e
 	if !deadline.IsZero() && (boundary.IsZero() || deadline.Before(boundary)) {
 		boundary = deadline
 	}
+	gateBound := gateBoundary(boundary, deadline, cycleNow(), count, timeout)
 
 	rtts := make([]time.Duration, 0, count)
 	reasons := make([]int, 0, count)    // per-echo failure reasons (lost echoes only)
 	details := make([]string, 0, count) // parallel raw causes behind those reasons
 	received := true                    // previous echo's outcome; the first send is never paced
+	sent := 0                           // echoes actually attempted (see the doc above)
 	for i := 0; i < count; i++ {
 		if pctx.Err() != nil {
 			break
@@ -159,20 +182,27 @@ func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, e
 				break
 			}
 		}
-		callTimeout := timeout
-		if !deadline.IsZero() {
-			remaining := deadline.Sub(cycleNow())
-			if remaining <= 0 {
-				break
-			}
-			if remaining < callTimeout {
-				callTimeout = remaining
-			}
+		// A slot first, then the clock: every timeout this echo runs under is
+		// started after the wait, so queueing never eats the measurement's own
+		// budget. Only THIS echo's timeout is reserved. Reserving the echoes after
+		// it as well would be strictly worse: it cannot protect them (each
+		// re-checks at its own acquire, and the round truncates honestly if the
+		// room is gone), and on a target whose worst case already fills its
+		// interval it computes a wait budget of zero for every echo.
+		//
+		// The bound is the CYCLE's, not this echo's, so the wait budget shrinks as
+		// the cycle spends it. Once it is gone a free slot is still taken (Acquire's
+		// fast path ignores the clock) but nothing waits, so the round truncates
+		// rather than running past the deadline the server derives for it.
+		if gate.Acquire(pctx, gateWaitDeadline(gateBound, timeout)) != AdmittedOK {
+			break
 		}
-		var rtt time.Duration
-		var reason int
-		var detail string
-		rtt, reason, detail, received = echo(pctx, i, callTimeout)
+		rtt, reason, detail, ok, ran := oneEcho(pctx, gate, deadline, timeout, i, echo)
+		if !ran {
+			break
+		}
+		sent++
+		received = ok
 		if received {
 			rtts = append(rtts, rtt)
 			continue
@@ -182,12 +212,54 @@ func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, e
 	}
 
 	got := len(rtts)
-	r := pingCycleResult{
-		Loss:     float64(count-got) / float64(count) * 100.0,
-		Sent:     count,
-		Received: got,
+	r := pingCycleResult{Sent: sent, Received: got}
+	if sent > 0 {
+		r.Loss = float64(sent-got) / float64(sent) * 100.0
 	}
 	r.Reason, r.Detail = cycleReason(got, reasons, details)
 	r.AvgMs, r.MinMs, r.MaxMs, r.JitterMs, r.HaveJitter = pingStats(rtts)
 	return r
+}
+
+// gateBoundary is the instant the cycle must be finished by for the whole-cycle
+// deadline the SERVER derives (pcfg.CycleDeadline) to hold. It is what bounds how
+// long an echo may wait for a concurrency slot.
+//
+// It is the pacing boundary, except when the echoes could not fit inside it even
+// back-to-back. pcfg.CycleDeadline allows such a target max(interval,
+// count×perEcho) rather than its interval, and the budget has to agree: bounded
+// by the interval alone, a target whose worst case exceeds it (a 1s interval with
+// 5 packets) could never wait for a slot at all and would go permanently silent
+// on a busy agent — the one outcome worse than a late sample.
+//
+// A GlobalTimeoutMs is the exception that stays hard. The server derives exactly
+// that when it is set, so the bound is never extended past it.
+func gateBoundary(boundary, deadline, now time.Time, count int, timeout time.Duration) time.Time {
+	out := boundary
+	if worst := now.Add(time.Duration(count) * timeout); out.Before(worst) {
+		out = worst
+	}
+	if !deadline.IsZero() && out.After(deadline) {
+		out = deadline
+	}
+	return out
+}
+
+// oneEcho sends a single echo while holding a gate slot, releasing it whatever
+// the outcome. ran is false when the global deadline left no time to run it at
+// all, which ends the cycle without counting an attempt.
+func oneEcho(ctx context.Context, gate *ProbeGate, deadline time.Time, timeout time.Duration, seq int, echo echoFunc) (rtt time.Duration, reason int, detail string, received, ran bool) {
+	defer gate.Release()
+	callTimeout := timeout
+	if !deadline.IsZero() {
+		remaining := deadline.Sub(cycleNow())
+		if remaining <= 0 {
+			return 0, 0, "", false, false
+		}
+		if remaining < callTimeout {
+			callTimeout = remaining
+		}
+	}
+	rtt, reason, detail, received = echo(ctx, seq, callTimeout)
+	return rtt, reason, detail, received, true
 }

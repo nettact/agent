@@ -18,15 +18,20 @@ import (
 // TCPCollector performs a TCP connect (optionally followed by a TLS handshake)
 // against a server-configured host:port set (a TCP port monitor).
 // Each target carries its own per-protocol params (port, tls, timeout, interval)
-// and is probed on its own schedule via schedState.
+// and is probed on its own schedule and its own goroutine via probeRunner.
 type TCPCollector struct {
-	sched   *schedState
 	guard   *netguard.Guard
 	proxies *proxydial.Manager
+	*probeRunner
 }
 
-func NewTCPCollector(guard *netguard.Guard, proxies *proxydial.Manager) *TCPCollector {
-	return &TCPCollector{sched: newSchedState(pcfg.DefaultTCPInterval), guard: guard, proxies: proxies}
+// NewTCPCollector builds the collector. gate is the machine-wide probe budget —
+// pass the same one to every collector of every server; nil means unlimited.
+func NewTCPCollector(guard *netguard.Guard, proxies *proxydial.Manager, gate *ProbeGate) *TCPCollector {
+	return &TCPCollector{
+		guard: guard, proxies: proxies,
+		probeRunner: newProbeRunner(pcfg.DefaultTCPInterval, gate),
+	}
 }
 
 func (c *TCPCollector) SetTargets(targets []pcfg.ProbeTarget) {
@@ -36,31 +41,52 @@ func (c *TCPCollector) SetTargets(targets []pcfg.ProbeTarget) {
 			tcp = append(tcp, t)
 		}
 	}
-	c.sched.set(tcp)
+	c.setTargets(tcp)
 }
 
 func (c *TCPCollector) Name() string { return "tcp" }
 
 func (c *TCPCollector) Tier() Tier { return TierRegular }
 
+// Collect hands back the probes that finished since the last pass and starts the
+// targets that have come due — see probeRunner for why they no longer run inline.
 func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
-	targets := c.sched.due(time.Now())
-	if len(targets) == 0 {
+	return c.collect(ctx, c.runTarget), nil
+}
+
+// runTarget probes one target on its own goroutine, under a slot from the
+// machine-wide budget.
+func (c *TCPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
+	t := sp.Target
+	timeout := tcpTimeout(t.Params)
+	if gate := c.gate; gate.Acquire(ctx, gateWaitDeadline(sp.NextDue, timeout)) != AdmittedOK {
+		// Cancelled (shutdown or a superseded generation) or shut out by the
+		// budget. Either way nothing was measured, and a fabricated connect
+		// failure would replay from the WAL as a false service outage.
 		return Result{}, nil
 	}
-
-	now := time.Now().UTC()
-	var res Result
-	for _, t := range targets {
-		// A pass aborted by run cancellation (agent shutdown) must not fabricate
-		// connect failures — they would replay from the WAL as a false service
-		// outage on the next start (probe drops its own aborted result too).
-		if ctx.Err() != nil {
-			break
-		}
-		c.probe(ctx, now, t, &res)
+	defer c.gate.Release()
+	// A pass aborted by run cancellation (agent shutdown) must not fabricate
+	// connect failures — they would replay from the WAL as a false service
+	// outage on the next start (probe drops its own aborted result too).
+	if ctx.Err() != nil {
+		return Result{}, nil
 	}
+	// Stamped where the measurement happens: after the wait for a slot, not when
+	// the pass that scheduled it began.
+	var res Result
+	c.probe(ctx, time.Now().UTC(), t, &res)
 	return res, nil
+}
+
+// tcpTimeout is the per-probe budget: the configured TimeoutMs, else the default.
+// It bounds the whole probe (resolve + connect + TLS), which is what
+// pcfg.CycleDeadline derives for a tcp target.
+func tcpTimeout(p pcfg.ProbeParams) time.Duration {
+	if p.TimeoutMs > 0 {
+		return time.Duration(p.TimeoutMs) * time.Millisecond
+	}
+	return pcfg.DefaultTCPTimeout
 }
 
 // probe runs one TCP cycle: it times DNS resolution, the pure TCP connect, and
@@ -70,10 +96,7 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 // never recorded as a zero-latency sample; probe.tcp.error_class carries the
 // reason and probe.tcp.ok the overall outcome (both every cycle).
 func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result) {
-	timeout := time.Duration(t.Params.TimeoutMs) * time.Millisecond
-	if timeout <= 0 {
-		timeout = pcfg.DefaultTCPTimeout
-	}
+	timeout := tcpTimeout(t.Params)
 	port := strconv.Itoa(t.Params.Port)
 	labels := map[string]string{"port": port}
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
@@ -266,6 +289,3 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		})
 	}
 }
-
-// SetMinInterval applies the local per-target probe-interval floor (stability limit).
-func (c *TCPCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }
