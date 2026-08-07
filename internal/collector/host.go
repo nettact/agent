@@ -95,10 +95,12 @@ func (c *HostMetricsCollector) Collect(ctx context.Context) (Result, error) {
 		}
 	}
 
-	// Disk: one series per physical mount (Target = mountpoint).
+	// Disk: one series per physical mount (Target = mountpoint). selectDiskMounts
+	// drops read-only images and bind duplicates — see hostdisk.go for why each
+	// of those is worth removing rather than reporting.
 	if c.disk {
 		if parts, err := disk.Partitions(false); err == nil {
-			for _, pt := range parts {
+			for _, pt := range selectDiskMounts(parts) {
 				us, err := disk.Usage(pt.Mountpoint)
 				if err != nil || us.Total == 0 {
 					continue
