@@ -29,7 +29,7 @@ type cancelPingPlatform struct {
 
 func (p *cancelPingPlatform) Ping(ctx context.Context, target string, opts platform.PingOptions) (platform.PingResult, error) {
 	r, err := p.gwTestPlatform.Ping(ctx, target, opts)
-	if p.pings >= p.cancelAfter {
+	if p.pingCount() >= p.cancelAfter {
 		p.cancel()
 	}
 	return r, err
@@ -44,6 +44,25 @@ func assertNoSamples(t *testing.T, res Result) {
 	}
 }
 
+// assertPingCyclesEmitNothing drives a ping collector through a full async round
+// trip and fails if either pass produced anything. The cycles run on their own
+// goroutines, so the check has to cover both the pass that starts them and the
+// pass that would have drained them.
+func assertPingCyclesEmitNothing(t *testing.T, ctx context.Context, c settledCollector) {
+	t.Helper()
+	started, err := c.Collect(ctx)
+	if err != nil {
+		t.Fatalf("Collect (start): %v", err)
+	}
+	assertNoSamples(t, started)
+	c.WaitIdle()
+	drained, err := c.Collect(ctx)
+	if err != nil {
+		t.Fatalf("Collect (drain): %v", err)
+	}
+	assertNoSamples(t, drained)
+}
+
 func cancelledCtx() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -51,25 +70,25 @@ func cancelledCtx() context.Context {
 }
 
 func TestPublicPingCancelledRunEmitsNothing(t *testing.T) {
+	stubCycleClock(t)
 	p := &gwTestPlatform{}
 	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1"},
 		{MonitorID: "m2", Kind: "icmp", Target: "8.8.8.8"},
 	})
-	res, err := c.Collect(cancelledCtx())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
-	if p.pings != 0 {
-		t.Fatalf("pings=%d want 0 under a cancelled run", p.pings)
+	assertPingCyclesEmitNothing(t, cancelledCtx(), c)
+	if got := p.pingCount(); got != 0 {
+		t.Fatalf("pings=%d want 0 under a cancelled run", got)
 	}
 }
 
 func TestPublicPingMidCycleAbortEmitsNothing(t *testing.T) {
-	// Cancel fires after the first echo of the first target: without the guard the
-	// cut cycle would read as 2/3 lost (66%) and the second target as 100% loss.
+	// Cancel fires after the first echo lands: without the guard the cut cycle
+	// would read as 2/3 lost (66%) and any target that never started as 100%
+	// loss. Both targets' cycles run concurrently, so which one sent that echo is
+	// not fixed — only the "no samples at all" outcome is.
+	stubCycleClock(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &cancelPingPlatform{cancel: cancel, cancelAfter: 1}
 	c := NewPublicPingCollector(p, netguard.New(probepolicy.Policy{}, true), nil)
@@ -77,32 +96,26 @@ func TestPublicPingMidCycleAbortEmitsNothing(t *testing.T) {
 		{MonitorID: "m1", Kind: "icmp", Target: "1.1.1.1", Params: pcfg.ProbeParams{PacketCount: 3}},
 		{MonitorID: "m2", Kind: "icmp", Target: "8.8.8.8", Params: pcfg.ProbeParams{PacketCount: 3}},
 	})
-	res, err := c.Collect(ctx)
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
+	assertPingCyclesEmitNothing(t, ctx, c)
 }
 
 func TestGatewayPingCancelledRunEmitsNothing(t *testing.T) {
+	stubCycleClock(t)
 	p := &gwTestPlatform{ifaces: gwTestIfaces()}
 	c := NewGatewayPingCollector(p, netguard.New(probepolicy.Policy{}, true))
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway"},
 	})
-	res, err := c.Collect(cancelledCtx())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
-	if p.pings != 0 {
-		t.Fatalf("pings=%d want 0 under a cancelled run", p.pings)
+	assertPingCyclesEmitNothing(t, cancelledCtx(), c)
+	if got := p.pingCount(); got != 0 {
+		t.Fatalf("pings=%d want 0 under a cancelled run", got)
 	}
 }
 
 func TestGatewayPingMidCycleAbortEmitsNothing(t *testing.T) {
 	// Every echo is lost AND the run is cancelled after the first: without the
 	// guard this would emit loss=100 plus a gateway-unreachable event.
+	stubCycleClock(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &cancelPingPlatform{
 		gwTestPlatform: gwTestPlatform{ifaces: gwTestIfaces(), recv: func(int) bool { return false }},
@@ -113,11 +126,7 @@ func TestGatewayPingMidCycleAbortEmitsNothing(t *testing.T) {
 	c.SetTargets([]pcfg.ProbeTarget{
 		{MonitorID: "gw1", Kind: "gateway", Target: "gateway", Params: pcfg.ProbeParams{Interface: "eth0", PacketCount: 3}},
 	})
-	res, err := c.Collect(ctx)
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	assertNoSamples(t, res)
+	assertPingCyclesEmitNothing(t, ctx, c)
 }
 
 func TestDNSCancelledRunEmitsNothing(t *testing.T) {

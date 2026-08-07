@@ -80,15 +80,37 @@ func (s *Scheduler) Run(ctx context.Context) {
 	s.wg.Add(3)
 	go func() { defer s.wg.Done(); s.tierLoop(ctx, s.base, true) }()
 	go func() { defer s.wg.Done(); s.tierLoop(ctx, s.regular, false) }()
-	go func() { defer s.wg.Done(); s.selfLoop(ctx) }()
+	go func() { defer s.wg.Done(); s.selfLoop(ctx); s.waitSelfIdle() }()
 }
 
 // Wait blocks until every loop started by Run has returned. It only returns once
 // the Run ctx is cancelled and all in-flight collects/sinks have drained.
 func (s *Scheduler) Wait() { s.wg.Wait() }
 
+// waitSelfIdle joins the work a self-scheduled collector left running past its
+// Collect. The ping collectors spread each cycle across the target's whole
+// interval and therefore run it on its own goroutine, which outlives the poll
+// loop; joining here is what keeps Wait's contract intact — once Wait returns,
+// nothing Run started is still touching the platform HAL or the proxy manager,
+// so the runtime can tear them down in its usual order. A cancelled cycle
+// unwinds within one per-echo timeout.
+func (s *Scheduler) waitSelfIdle() {
+	for _, c := range s.selfSched {
+		if w, ok := c.(interface{ WaitIdle() }); ok {
+			w.WaitIdle()
+		}
+	}
+}
+
 // selfLoop polls self-scheduling collectors on a fine tick; each returns only
 // the targets due by their own interval (empty Result otherwise).
+//
+// The poll must stay quick: every self-scheduled collector shares this one
+// goroutine, so a Collect that blocks stalls all of them. The ping collectors
+// hand back cycles that finished since the previous tick and start the newly
+// due ones in the background, so a spread cycle spanning its whole interval
+// still costs this loop nothing. The synchronous ones (DNS/HTTP/TCP/NAT) do run
+// their probe inline and are bounded by their own per-probe timeouts.
 func (s *Scheduler) selfLoop(ctx context.Context) {
 	if len(s.selfSched) == 0 {
 		return
@@ -106,7 +128,8 @@ func (s *Scheduler) selfLoop(ctx context.Context) {
 			}
 			// A self-scheduled probe reporting 100% loss is still a burst signal
 			// (public-ping moved off the base tier, so this is now the only place
-			// its faults would trigger burst diagnostics).
+			// its faults would trigger burst diagnostics). For a ping target that
+			// is the tick after its cycle ended, not the tick that started it.
 			if faultDetected(res) {
 				s.mu.Lock()
 				s.burstUntil = time.Now().Add(s.burstWindow)

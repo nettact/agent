@@ -19,7 +19,7 @@ func msSince(t0 time.Time) float64 {
 }
 
 // sleepCtx sleeps for d unless ctx is cancelled first. It returns true if the
-// full duration elapsed, false if the context ended early — used to space ICMP
+// full duration elapsed, false if the context ended early — used to pace ICMP
 // echoes within a cycle without ignoring a shutdown/deadline.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)

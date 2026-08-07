@@ -502,6 +502,10 @@ func Run(ctx context.Context, cfg Config) error {
 	// schedulers and heartbeat stop; join the sessions first because they are the
 	// only things that claim from the WAL; then the schedulers and the sensor,
 	// which are the only things that append to it; and only then close it.
+	//
+	// sched.Wait also joins the ping cycles still spread across their intervals
+	// on their own goroutines — which is what makes closing the proxy managers
+	// after it safe for an in-tunnel ping.
 	var hbWG, runnersWG sync.WaitGroup
 	defer func() {
 		cancel()

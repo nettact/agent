@@ -22,21 +22,24 @@ import (
 // silently measure the wrong path. A tunnelled monitor therefore builds its own
 // echoes and writes them to the netstack "ping4"/"ping6" socket the tunnel exposes.
 //
-// The cycle semantics deliberately mirror pingCycle exactly — same packet count,
-// spacing, per-echo timeout and global deadline, and the same rule that a lost echo
-// contributes to loss and NEVER to the latency distribution — so a target's numbers
-// mean the same thing whether or not it is proxied. Anything else would make the
-// availability history of a monitor change meaning the moment a proxy is attached.
+// Only the sending of one echo differs from the host path: the cycle itself —
+// packet count, spread pacing and its fail-fast, per-echo timeout, global
+// deadline, and the rule that a lost echo contributes to loss and NEVER to the
+// latency distribution — is pingLoop, shared with pingCycle. That sharing is the
+// point: a target's numbers must mean the same thing whether or not it is
+// proxied, or the availability history of a monitor would change meaning the
+// moment a proxy is attached.
 
 // icmpEchoPayload is the fixed echo payload. It is matched on the reply (together
 // with the sequence number) because a netstack ping socket assigns the ICMP id
 // itself, so the payload is the only other thing we control.
 var icmpEchoPayload = []byte("nettact-probe")
 
-// tunnelPingCycle runs one ICMP cycle against target through a tunnel dialer.
-// target must already be a vetted literal IP — same contract as the platform path,
-// where handing over a raw hostname would let it be re-resolved outside the guard.
-func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, params pcfg.ProbeParams) pingCycleResult {
+// tunnelPingCycle runs one ICMP cycle against target through a tunnel dialer,
+// paced to land its last echo before nextDue. target must already be a vetted
+// literal IP — same contract as the platform path, where handing over a raw
+// hostname would let it be re-resolved outside the guard.
+func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, params pcfg.ProbeParams, nextDue time.Time) pingCycleResult {
 	addr, err := netip.ParseAddr(target)
 	if err != nil {
 		return pingCycleResult{
@@ -49,8 +52,6 @@ func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, pa
 		network, proto, echoType = "ping6", ipv6.ICMPTypeEchoRequest.Protocol(), icmp.Type(ipv6.ICMPTypeEchoRequest)
 	}
 
-	count := pcfg.PingCount(params)
-	timeout := pcfg.PingEchoTimeout(params)
 	payload := icmpEchoPayload
 	if params.PacketSize > len(payload) {
 		// Pad to the requested payload size so a size-sensitive path (MTU, fragmentation)
@@ -58,56 +59,10 @@ func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, pa
 		payload = append(append([]byte(nil), payload...), make([]byte, params.PacketSize-len(payload))...)
 	}
 
-	pctx := ctx
-	var cancel context.CancelFunc
-	var deadline time.Time
-	if params.GlobalTimeoutMs > 0 {
-		dur := time.Duration(params.GlobalTimeoutMs) * time.Millisecond
-		deadline = time.Now().Add(dur)
-		pctx, cancel = context.WithTimeout(ctx, dur)
-	}
-	if cancel != nil {
-		defer cancel()
-	}
-
-	rtts := make([]time.Duration, 0, count)
-	reasons := make([]int, 0, count)
-	details := make([]string, 0, count)
-	for i := 0; i < count; i++ {
-		if pctx.Err() != nil {
-			break
-		}
-		if i > 0 && !sleepCtx(pctx, pingSpacing) {
-			break
-		}
-		echoTimeout := timeout
-		if !deadline.IsZero() {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				break
-			}
-			if remaining < echoTimeout {
-				echoTimeout = remaining
-			}
-		}
-		rtt, reason, detail := tunnelPingOnce(pctx, d, network, proto, echoType, addr.String(), i, payload, echoTimeout)
-		if reason == telemetry.ProbeReasonNone {
-			rtts = append(rtts, rtt)
-			continue
-		}
-		reasons = append(reasons, reason)
-		details = append(details, detail)
-	}
-
-	received := len(rtts)
-	r := pingCycleResult{
-		Loss:     float64(count-received) / float64(count) * 100.0,
-		Sent:     count,
-		Received: received,
-	}
-	r.Reason, r.Detail = cycleReason(received, reasons, details)
-	r.AvgMs, r.MinMs, r.MaxMs, r.JitterMs, r.HaveJitter = pingStats(rtts)
-	return r
+	return pingLoop(ctx, params, nextDue, func(ectx context.Context, seq int, timeout time.Duration) (time.Duration, int, string, bool) {
+		rtt, reason, detail := tunnelPingOnce(ectx, d, network, proto, echoType, addr.String(), seq, payload, timeout)
+		return rtt, reason, detail, reason == telemetry.ProbeReasonNone
+	})
 }
 
 // tunnelPingOnce sends one echo and waits for its reply. A fresh socket per echo

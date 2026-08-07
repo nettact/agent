@@ -132,6 +132,15 @@ func (t *Tracker) ApplyDesired(configVersion int, targets []config.ProbeTarget) 
 // per-target schedule (interval floored by the agent-local MinProbeInterval,
 // whole-cycle deadline) from the applied ProbeTarget. Stamped on every entry —
 // active or blocked — so the server reads a consistent generation/freshness echo.
+//
+// CycleDeadline is deliberately computed from the UNFLOORED interval even though
+// the reported interval is floored. For a spread ICMP cycle the two disagree
+// when a raised MinProbeInterval stretches the real cadence, but every consumer
+// feeds this into config.StaleAfter, whose base is max(3×interval, interval +
+// 2×cycle) — and for any cycle ≤ interval that collapses to 3×interval. So
+// threading the floor through here would change no window anywhere, while the
+// unfloored figure still bounds the two cases that do not track the interval at
+// all (a fail-fast count×perEcho cycle, and an explicit GlobalTimeoutMs).
 func (t *Tracker) stampSchedule(entry *wire.MonitorStatusEntry, tgt config.ProbeTarget) {
 	entry.TargetConfigSerial = tgt.ConfigSerial
 	iv := config.EffectiveInterval(tgt.Kind, tgt.Params)

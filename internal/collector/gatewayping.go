@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/netip"
-	"time"
 
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
@@ -18,21 +17,22 @@ import (
 //
 // Unlike the old always-on probe, gateways are now user-configured monitors
 // (kind="gateway") pushed down as DesiredState, self-scheduled per target like
-// the public-ping collector. Each target may name a NIC in Params.Interface
-// (matched against IfaceInfo.ID or Name); an empty value resolves the default
-// gateway (first IPv4 gateway on an up, non-loopback interface). Target string
-// is the server-normalized "gateway" (stable across gateway IP changes); the
-// resolved IP and chosen interface travel in labels.
+// the public-ping collector — each due target's cycle runs on its own goroutine
+// (see pingRunner). Each target may name a NIC in Params.Interface (matched
+// against IfaceInfo.ID or Name); an empty value resolves the default gateway
+// (first IPv4 gateway on an up, non-loopback interface). Target string is the
+// server-normalized "gateway" (stable across gateway IP changes); the resolved IP
+// and chosen interface travel in labels.
 type GatewayPingCollector struct {
 	p     platform.Platform
 	guard *netguard.Guard
-	sched *schedState
+	*pingRunner
 }
 
 func NewGatewayPingCollector(p platform.Platform, guard *netguard.Guard) *GatewayPingCollector {
 	// 10s fallback matches the old base-tier cadence, so targets that don't set
 	// interval_seconds keep probing at the previous rate rather than every tick.
-	return &GatewayPingCollector{p: p, guard: guard, sched: newSchedState(pcfg.DefaultGatewayInterval)}
+	return &GatewayPingCollector{p: p, guard: guard, pingRunner: newPingRunner(pcfg.DefaultGatewayInterval)}
 }
 
 // SetTargets replaces the gateway target list from a DesiredState update.
@@ -50,69 +50,76 @@ func (c *GatewayPingCollector) Name() string { return "gateway_ping" }
 
 func (c *GatewayPingCollector) Tier() Tier { return TierBase }
 
+// Collect hands back the cycles that finished since the last pass and starts the
+// targets that have come due. A target's samples therefore surface on a later
+// tick than the Collect that started it — see pingRunner for why the cycles no
+// longer run inline.
 func (c *GatewayPingCollector) Collect(ctx context.Context) (Result, error) {
-	targets := c.sched.due(time.Now())
-	if len(targets) == 0 {
-		return Result{}, nil
-	}
+	return c.collect(ctx, c.runTarget), nil
+}
 
+// runTarget resolves and probes one gateway target, returning everything that
+// one cycle produced. It runs on its own goroutine.
+func (c *GatewayPingCollector) runTarget(ctx context.Context, sp scheduledProbe) Result {
+	t := sp.Target
+	// A cycle aborted by run cancellation (agent shutdown) must not fabricate
+	// loss samples or unreachable events — they would replay from the WAL as a
+	// false LAN outage on the next start.
+	if ctx.Err() != nil {
+		return Result{}
+	}
 	var res Result
-	for _, t := range targets {
-		// A pass aborted by run cancellation (agent shutdown) must not fabricate
-		// loss samples or unreachable events — they would replay from the WAL as a
-		// false LAN outage on the next start.
-		if ctx.Err() != nil {
-			break
-		}
-		now := time.Now().UTC()
-		gw, known := c.gatewayFor(t.Params.Interface)
-		if !known {
-			// The agent could not read the routes, so whether this host has a gateway
-			// is UNKNOWN. Skipping leaves an honest gap in the series; the branch
-			// below would instead publish 100% loss and a LAN-outage event for a
-			// restriction on the agent itself.
-			continue
-		}
-		if gw == "" {
-			// No gateway found on the selected/default NIC: report LAN-layer down.
-			appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN,
-				gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100, Reason: telemetry.ProbeReasonUnreachable,
-					Detail: "no IPv4 gateway on the selected interface"})
-			res.Events = append(res.Events, telemetry.Event{
-				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
-				Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
-				Message: "no gateway detected on the selected interface",
-				Attrs:   gatewayLabels("", t.Params.Interface),
-			})
-			continue
-		}
+	gw, known := c.gatewayFor(t.Params.Interface)
+	if !known {
+		// The agent could not read the routes, so whether this host has a gateway
+		// is UNKNOWN. Skipping leaves an honest gap in the series; the branch
+		// below would instead publish 100% loss and a LAN-outage event for a
+		// restriction on the agent itself.
+		return Result{}
+	}
+	if gw == "" {
+		// No gateway found on the selected/default NIC: report LAN-layer down.
+		now := cycleNow().UTC()
+		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN,
+			gatewayLabels("", t.Params.Interface), pingCycleResult{Loss: 100, Reason: telemetry.ProbeReasonUnreachable,
+				Detail: "no IPv4 gateway on the selected interface"})
+		res.Events = append(res.Events, telemetry.Event{
+			ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
+			Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
+			Message: "no gateway detected on the selected interface",
+			Attrs:   gatewayLabels("", t.Params.Interface),
+		})
+		return res
+	}
 
-		// The gateway must be an address the OS currently reports as a gateway, and
-		// must survive an explicit ip:/cidr: deny. The OS-supplied gateway otherwise
-		// bypasses scope denies (so a default scope:link-local deny does not break an
-		// fe80:: gateway). A block here is a target-policy block, not a ping failure.
-		if a, perr := netip.ParseAddr(gw); perr == nil {
-			if dec := c.guard.CheckGateway(a.Unmap(), c.osGateways()); !dec.Allowed {
-				res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: dec.Matched, Reason: "literal_denied"})
-				continue
-			}
-		}
-
-		r := pingCycle(ctx, c.p, gw, t.Params)
-		if ctx.Err() != nil {
-			break // cycle aborted mid-flight: unsent echoes are not lost echoes
-		}
-		labels := gatewayLabels(gw, t.Params.Interface)
-		appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN, labels, r)
-		if r.Received == 0 {
-			res.Events = append(res.Events, telemetry.Event{
-				ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
-				Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
-				Message: "gateway " + gw + " did not answer ICMP", Attrs: labels,
-			})
+	// The gateway must be an address the OS currently reports as a gateway, and
+	// must survive an explicit ip:/cidr: deny. The OS-supplied gateway otherwise
+	// bypasses scope denies (so a default scope:link-local deny does not break an
+	// fe80:: gateway). A block here is a target-policy block, not a ping failure.
+	if a, perr := netip.ParseAddr(gw); perr == nil {
+		if dec := c.guard.CheckGateway(a.Unmap(), c.osGateways()); !dec.Allowed {
+			res.Blocked = append(res.Blocked, BlockedProbe{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: dec.Matched, Reason: "literal_denied"})
+			return res
 		}
 	}
-	return res, nil
+
+	r := pingCycle(ctx, c.p, gw, t.Params, pacingDeadline(sp))
+	if ctx.Err() != nil {
+		return Result{} // cycle aborted mid-flight: unsent echoes are not lost echoes
+	}
+	// Stamped at completion, not at the start of the pass: a spread cycle spans
+	// most of its interval, and the sample summarizes the window that just ended.
+	now := cycleNow().UTC()
+	labels := gatewayLabels(gw, t.Params.Interface)
+	appendICMPMetrics(&res, now, t.MonitorID, t.ConfigSerial, t.Target, telemetry.LayerLAN, labels, r)
+	if r.Received == 0 {
+		res.Events = append(res.Events, telemetry.Event{
+			ID: newID(), TS: now, Type: telemetry.EventGatewayUnreachable,
+			Layer: telemetry.LayerLAN, Severity: telemetry.SeverityWarn,
+			Message: "gateway " + gw + " did not answer ICMP", Attrs: labels,
+		})
+	}
+	return res
 }
 
 // osGateways returns every gateway address the OS currently reports across all
@@ -168,6 +175,3 @@ func (c *GatewayPingCollector) gatewayFor(iface string) (string, bool) {
 	gateway, _ := platform.ResolveIPv4Gateway(ifaces, iface)
 	return gateway, true
 }
-
-// SetMinInterval applies the local per-target probe-interval floor (stability limit).
-func (c *GatewayPingCollector) SetMinInterval(d time.Duration) { c.sched.SetMinInterval(d) }

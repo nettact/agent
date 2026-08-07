@@ -144,3 +144,64 @@ func TestSelfScheduledBlockedOnlyResultReachesSink(t *testing.T) {
 	cancel()
 	s.Wait()
 }
+
+// backgroundCollector is a self-scheduled collector whose real work outlives
+// Collect — the shape of the ping collectors, which spread a cycle across the
+// target's whole interval on their own goroutine.
+type backgroundCollector struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	wg      sync.WaitGroup
+}
+
+func (c *backgroundCollector) Name() string         { return "background" }
+func (c *backgroundCollector) Tier() collector.Tier { return collector.TierBase }
+func (c *backgroundCollector) Collect(context.Context) (collector.Result, error) {
+	c.once.Do(func() {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			close(c.started)
+			<-c.release
+		}()
+	})
+	return collector.Result{}, nil
+}
+func (c *backgroundCollector) WaitIdle() { c.wg.Wait() }
+
+// Wait must join the work a self-scheduled collector left running past its
+// Collect, not just the poll loop. Otherwise the runtime would close the WAL and
+// the proxy managers while a spread ping cycle was still mid-flight.
+func TestWaitJoinsBackgroundSelfScheduledWork(t *testing.T) {
+	c := &backgroundCollector{started: make(chan struct{}), release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(nil, []collector.Collector{c}, func(collector.Result) {})
+	s.Run(ctx)
+
+	select {
+	case <-c.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background work did not start")
+	}
+
+	cancel()
+	waited := make(chan struct{})
+	go func() {
+		s.Wait()
+		close(waited)
+	}()
+
+	select {
+	case <-waited:
+		t.Fatal("Wait returned while a background cycle was still in flight")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(c.release)
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after the background cycle finished")
+	}
+}
