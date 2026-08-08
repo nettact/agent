@@ -27,6 +27,15 @@ import (
 type HostMetricsCollector struct {
 	cpu, mem, disk, load, uptime, netio, temp bool
 
+	// cores reports the machine's logical core count, read on every Collect rather
+	// than once at construction. It is the denominator the server divides a load
+	// average by, and a machine that offlines or hot-adds CPUs — a VM being
+	// resized, a laptop parking cores — would otherwise be judged against a count
+	// it no longer has: too few, and real overload goes unreported; too many, and
+	// an idle machine looks pegged. 0 means gopsutil could not answer, and nothing
+	// is reported, because a fabricated count silently rescales the judgement.
+	coresOn bool
+
 	lastNetRx uint64
 	lastNetTx uint64
 	lastNetAt time.Time
@@ -40,6 +49,10 @@ func NewHostMetricsCollector(cpuOn, memOn, diskOn, loadOn, uptimeOn, netioOn, te
 		cpu: cpuOn, mem: memOn, disk: diskOn,
 		load: loadOn, uptime: uptimeOn, netio: netioOn, temp: tempOn,
 	}
+	// The core count is reported under EITHER grant: it is what makes a load
+	// average mean anything, and a load-only agent that withheld it would leave
+	// the server unable to judge load at all.
+	c.coresOn = cpuOn || loadOn
 	// Prime CPU baselines so the first real Collect reports a delta, not a
 	// since-boot average. Errors here are non-fatal.
 	if cpuOn {
@@ -56,6 +69,11 @@ func NewHostMetricsCollector(cpuOn, memOn, diskOn, loadOn, uptimeOn, netioOn, te
 	return c
 }
 
+// logicalCores is a variable so a test can hand back a changing count: the whole
+// point of reading it per cycle is to follow a machine whose CPU topology moves,
+// and that is not reproducible against the real host.
+var logicalCores = func() (int, error) { return cpu.Counts(true) }
+
 func (c *HostMetricsCollector) Name() string { return "host" }
 
 func (c *HostMetricsCollector) Tier() Tier { return TierRegular }
@@ -71,6 +89,15 @@ func (c *HostMetricsCollector) Collect(ctx context.Context) (Result, error) {
 			TS: now, Kind: kind, Target: target, Layer: telemetry.LayerLocal,
 			Value: value, Unit: unit,
 		})
+	}
+
+	// Logical core count: inventory, not a measurement, and the denominator the
+	// server needs to read the load average per core. Re-read every cycle so a
+	// resized VM is judged against the CPUs it has now.
+	if c.coresOn {
+		if n, err := logicalCores(); err == nil && n > 0 {
+			add(telemetry.HostCPUCores, "host", float64(n), telemetry.UnitCount)
+		}
 	}
 
 	// CPU: overall (target "host") + per-core (target "core0", "core1", …).
