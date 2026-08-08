@@ -3,6 +3,7 @@
 package wal
 
 import (
+	"bytes"
 	"math"
 	"os"
 	"path/filepath"
@@ -844,5 +845,139 @@ func TestLiteRetentionDropsAncientBacklog(t *testing.T) {
 	}
 	if got := segmentCount(t, path); got != 0 {
 		t.Fatalf("segments = %d, want the expired one collected", got)
+	}
+}
+
+// truncateLastRecord drops a segment's final line, which is what a power cut
+// during a write leaves behind: complete records followed by nothing.
+func truncateLastRecord(t *testing.T, path string, seg uint64) {
+	t.Helper()
+	b, err := os.ReadFile(segPath(path, seg))
+	if err != nil {
+		t.Fatalf("read segment %d: %v", seg, err)
+	}
+	cut := bytes.LastIndexByte(b[:len(b)-1], '\n') + 1
+	if cut <= 0 {
+		t.Fatalf("segment %d holds a single record; nothing to tear", seg)
+	}
+	if err := os.WriteFile(segPath(path, seg), b[:cut], 0o600); err != nil {
+		t.Fatalf("truncate segment %d: %v", seg, err)
+	}
+}
+
+// A claim can come back from a crash INCOMPLETE — a torn segment tail, or groups
+// that crossed the retention cutoff while the agent was off. The survivors stay
+// under the original sequence and are re-sent as that packet.
+//
+// Freeing them into the ordinary pool instead would send them under a NEW
+// sequence, and if the original packet had reached the server and only its ack
+// was lost to the crash, that sequence carries the same samples straight past
+// (agent_id, sequence) dedup and the server ingests them twice.
+func TestLitePartialClaimReplaysUnderItsOwnSequence(t *testing.T) {
+	dir := tempWALDir(t)
+	path := filepath.Join(dir, "wal")
+	s := openPersist(t, path, []string{srvA}, nil)
+	ck := newClock().install(s)
+
+	s.SetServerOnline(srvA, true)
+	s.SetServerOnline(srvA, false)
+	for i := 0; i < 3; i++ {
+		if _, err := s.Append(one(float64(i)), srvA); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	ck.add(persistInterval)
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := segmentCount(t, path); got != 1 {
+		t.Fatalf("segments = %d, want the three groups in one", got)
+	}
+
+	inflight, ok, err := s.NextBatch(srvA, 100)
+	if err != nil || !ok {
+		t.Fatalf("NextBatch = (%v, %v)", ok, err)
+	}
+	if len(inflight.Metrics) != 3 {
+		t.Fatalf("claimed %d metrics, want all 3", len(inflight.Metrics))
+	}
+	// The power cut: the ack never arrived and the segment's last record never
+	// finished landing. No Close.
+	truncateLastRecord(t, path, 1)
+
+	again := openPersist(t, path, []string{srvA}, nil)
+	defer again.Close()
+	if got := again.Pending(srvA); got != 2 {
+		t.Fatalf("Pending after restart = %d, want the 2 surviving samples", got)
+	}
+
+	resumed, ok, err := again.NextBatch(srvA, 100)
+	if err != nil || !ok {
+		t.Fatalf("NextBatch after restart = (%v, %v)", ok, err)
+	}
+	if resumed.Sequence != inflight.Sequence {
+		t.Fatalf("survivors re-sent under sequence %d, want the original %d — a new one bypasses the server's dedup",
+			resumed.Sequence, inflight.Sequence)
+	}
+	if len(resumed.Metrics) != 2 {
+		t.Fatalf("re-served %d metrics, want the 2 that survived", len(resumed.Metrics))
+	}
+	for i, m := range resumed.Metrics {
+		if m.Value != float64(i) {
+			t.Fatalf("re-served %v, want the surviving prefix of the original packet", resumed.Metrics)
+		}
+	}
+
+	// Acking it retires the whole claim, torn tail included: those groups no
+	// longer exist to be sent.
+	if err := again.Ack(srvA, resumed.Sequence); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if got := again.Pending(srvA); got != 0 {
+		t.Fatalf("Pending after the ack = %d, want 0", got)
+	}
+	if got := segmentCount(t, path); got != 0 {
+		t.Fatalf("segments after the ack = %d, want 0", got)
+	}
+}
+
+// A claim that lost EVERYTHING is a different case: there is nothing left to
+// send under it, so the sequence is burned rather than re-used. The server takes
+// MAX for its watermark and never requires contiguity, so a gap costs nothing.
+func TestLiteEmptyClaimBurnsItsSequence(t *testing.T) {
+	dir := tempWALDir(t)
+	path := filepath.Join(dir, "wal")
+	s := openPersist(t, path, []string{srvA}, nil)
+	ck := newClock().install(s)
+
+	s.SetServerOnline(srvA, true)
+	s.SetServerOnline(srvA, false)
+	if _, err := s.Append(one(1), srvA); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	ck.add(persistInterval)
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	inflight, ok, err := s.NextBatch(srvA, 100)
+	if err != nil || !ok {
+		t.Fatalf("NextBatch = (%v, %v)", ok, err)
+	}
+	// The whole segment never became readable, which is what a crash between the
+	// state write and the rename leaves.
+	if err := os.WriteFile(segPath(path, 1), nil, 0o600); err != nil {
+		t.Fatalf("empty the segment: %v", err)
+	}
+
+	again := openPersist(t, path, []string{srvA}, nil)
+	defer again.Close()
+	if got := again.Pending(srvA); got != 0 {
+		t.Fatalf("Pending after restart = %d, want 0 — nothing survived", got)
+	}
+	if _, ok, err := again.NextBatch(srvA, 100); err != nil || ok {
+		t.Fatalf("NextBatch = (%v, %v), want nothing to send", ok, err)
+	}
+	if again.seqNext <= inflight.Sequence {
+		t.Fatalf("seqNext = %d, want it past the burned %d", again.seqNext, inflight.Sequence)
 	}
 }

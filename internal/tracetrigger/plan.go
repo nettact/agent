@@ -77,8 +77,17 @@ type plan struct {
 // them would silently drop the second diagnosis. The subject is deliberately
 // NOT part of the key: a resolver fault and a target fault that point the same
 // probe down the same path would produce two copies of one answer.
+//
+// The egress pin contributes its GENERATION as well as its id, because that is
+// what pinning means everywhere else in this agent: a re-keyed proxy is a new
+// dialer, not the old one reconfigured, and the trace it carries is pinned to
+// the exact generation the failing round ran under. A fault after a re-pin is
+// therefore a new path question — suppressing it under the previous
+// generation's cooldown would withhold the diagnosis of the edit's own
+// consequences, which is exactly when someone is looking.
 func (p plan) cohortKey() string {
-	return p.destKey + "|" + p.mode + "|" + strconv.Itoa(p.port) + "|" + p.pathScope + "|" + p.egressID
+	return p.destKey + "|" + p.mode + "|" + strconv.Itoa(p.port) + "|" + p.pathScope + "|" +
+		p.egressID + "|" + strconv.Itoa(p.egressConfigSerial)
 }
 
 // Stable denial reason codes, shared with the server's vocabulary so an

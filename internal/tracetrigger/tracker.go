@@ -136,6 +136,10 @@ type ProxyLookup func() map[string]pcfg.ProxySpec
 
 // streak is one monitor's consecutive-failure state.
 //
+// firstFailedAt and lastRoundAt are MEASUREMENT timestamps — when the rounds
+// were taken, not when this tracker got to look at them. See observeRound for
+// why the two clocks are kept apart.
+//
 // firedAt is not here on purpose: the cooldown is keyed by the planned trace's
 // cohort (destination, mode, port, path — see plan.cohortKey), not by monitor.
 // Two monitors on one host share a path, and tracing it twice because two
@@ -249,10 +253,26 @@ func (t *Tracker) SetTargets(targets []pcfg.ProbeTarget) {
 
 // ApplyDiagPolicy installs the pushed path-diagnostic policy. Satisfied through
 // conn.DiagApplier; applying the same policy twice is harmless.
+//
+// A policy that disables the diagnostic ZEROES every streak rather than freezing
+// it. While the feature is off, Observe returns before any streak is touched —
+// the world simply stops being observed — so counters kept across the gap would
+// resume as if the unobserved rounds had agreed with them. Two failures, a
+// disable, a healthy round nobody recorded, a re-enable inside the staleness
+// window and one more failure would otherwise reach a threshold of three that no
+// three consecutive OBSERVED rounds ever supported; symmetrically, a preserved
+// fired bit would suppress the first trace of a genuinely fresh outage. A
+// disabled interval has no failure count to carry, so it carries none.
+//
+// The cooldowns deliberately survive: they bound what this machine spends on
+// tracing a path, which an operator toggling a policy has not undone.
 func (t *Tracker) ApplyDiagPolicy(p *pcfg.DiagPolicy) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.policy = ResolvePolicy(p)
+	if !t.policy.Enabled {
+		t.streaks = map[string]*streak{}
+	}
 }
 
 // Observe folds one collector round's metrics into the per-target streaks and
@@ -273,6 +293,18 @@ func (t *Tracker) Observe(ms []telemetry.Metric) {
 
 // observeRound advances one monitor's streak and returns having fired at most
 // one trace.
+//
+// Two clocks meet here and they are not interchangeable. Everything about the
+// STREAK — whether two rounds are adjacent, when it began, whether the round
+// that confirmed it still describes the present — reads the rounds' own
+// measurement timestamps, because a batch of results can reach this sink long
+// after it was taken (a suspended machine, a stalled scheduler, a pipeline
+// backed up behind a slow sink) and judging every one of them against a single
+// drain-time clock would call rounds minutes apart adjacent and rounds seconds
+// apart stale. Everything about SPENDING — the per-cohort in-flight slot, the
+// cooldown, the report's own start/finish times — reads now, because those bound
+// what this machine is about to do, which happens at the wall clock whatever the
+// samples say about when they were measured.
 func (t *Tracker) observeRound(r round, now time.Time) {
 	t.mu.Lock()
 	pol := t.policy
@@ -292,12 +324,15 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 	// asserts a continuity nobody observed. The tolerance is the target's own
 	// staleness window, which is derived from its own interval — probe intervals
 	// span three orders of magnitude, so no flat number works for all of them.
+	// The distance is measured between the two rounds' own timestamps and taken as
+	// a magnitude: a round that arrives out of order is no more adjacent to its
+	// predecessor than a late one is.
 	if st.fails > 0 && !st.lastRoundAt.IsZero() {
-		if now.Sub(st.lastRoundAt) > staleAfter(tg) {
+		if absDuration(r.ts.Sub(st.lastRoundAt)) > staleAfter(tg) {
 			*st = streak{configSerial: tg.ConfigSerial}
 		}
 	}
-	st.lastRoundAt = now
+	st.lastRoundAt = r.ts
 
 	if !r.failed {
 		// Recovery wipes the streak, so the next outage starts counting from one
@@ -310,9 +345,19 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 
 	st.fails++
 	if st.fails == 1 {
-		st.firstFailedAt = now
+		st.firstFailedAt = r.ts
 	}
 	if st.fired || st.fails < pol.ConsecutiveFailures {
+		t.mu.Unlock()
+		return
+	}
+	// The confirming round must still describe the present. A backlog drained after
+	// a suspend can cross the threshold here long after the path came back, and
+	// tracing then measures a working path and files it as evidence for a fault
+	// that is over. The streak is deliberately NOT burned: the rest of the backlog
+	// still counts, so an outage that really is ongoing fires as soon as one of its
+	// rounds is current enough to speak for the present.
+	if now.Sub(r.ts) > staleAfter(tg) {
 		t.mu.Unlock()
 		return
 	}
@@ -428,10 +473,24 @@ func staleAfter(tg pcfg.ProbeTarget) time.Duration {
 	)
 }
 
+// absDuration is |d|, so a comparison against a window is about distance rather
+// than direction.
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
 // round is one probe cycle's availability verdict for one monitor, plus the
 // endpoint facts plan derivation needs.
+//
+// ts is when the cycle was MEASURED, taken from the metrics themselves. It is
+// what every streak decision reads, because the moment this tracker gets to look
+// at a round says nothing about when the round happened — see observeRound.
 type round struct {
 	monitorID string
+	ts        time.Time
 	failed    bool
 
 	reasonCode       int
@@ -477,6 +536,16 @@ func (t *Tracker) buildRounds(ms []telemetry.Metric) []round {
 		if !ok || !TraceEligibleKind(tg.Kind) {
 			continue
 		}
+		// The sample must belong to the generation currently installed. A v1
+		// collector result can still be queued when SetTargets installs v2, and the
+		// monitor id alone cannot tell them apart: counting it would let the OLD
+		// endpoint's failure advance the new one's streak and traceroute the address
+		// the edit just moved away from. Series identity includes the serial
+		// everywhere else in this system — the server rejects a mismatched sample
+		// outright — so the trigger reads it the same way.
+		if m.ConfigSerial != tg.ConfigSerial {
+			continue
+		}
 		primary := successMetricKind(tg.Kind)
 		if primary == "" {
 			continue
@@ -494,6 +563,7 @@ func (t *Tracker) buildRounds(ms []telemetry.Metric) []round {
 		if a == nil {
 			a = &acc{}
 			a.monitorID = m.MonitorID
+			a.ts = m.TS
 			accs[k] = a
 			order = append(order, k)
 		}

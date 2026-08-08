@@ -325,21 +325,40 @@ func (s *Store) recover(now time.Time) error {
 		}
 	}
 
-	// A claim that does not resolve to the number of groups it was taken over
+	// A claim that no longer resolves to the number of groups it was taken over
 	// lost some of them: the spill that was supposed to make them durable never
-	// landed, or part of the claim was still in memory when the power went. A
-	// short packet under a sequence the server may already associate with more
-	// content is worse than no packet, so the sequence is simply burned — which
-	// the server tolerates, since it takes MAX and never requires contiguity.
+	// landed, a segment's tail was torn by the power cut, or part of it fell past
+	// the retention cutoff while the agent was off.
+	//
+	// The survivors stay under the ORIGINAL sequence, exactly as expireLocked
+	// treats the same loss at runtime, and are re-served by NextBatch as that
+	// packet. Freeing them into the ordinary pool instead — which is what dropping
+	// the claim outright would do — would send them under a NEW sequence, and that
+	// is unsafe in the case this store exists for: if the original packet reached
+	// the server and only its ack was lost to the crash, a fresh sequence carries
+	// the same samples past (agent_id, sequence) dedup and they are ingested twice.
+	// Replaying under the original sequence is correct either way — the server
+	// swallows it as a duplicate if the packet landed, and ingests the short
+	// version if it did not. Only a claim that lost EVERYTHING is dropped: there is
+	// nothing left to send under it, so the sequence is simply burned, which the
+	// server tolerates since it takes MAX and never requires contiguity.
 	for name, c := range s.cursors {
 		if c.claim == nil {
 			continue
 		}
-		if got := countClaimed(name, c.claim, s.disk, nil); got != c.claim.n {
-			log.Printf("wal: claim %d for %q covers %d groups but %d survived; dropping the claim",
-				c.claim.seq, name, c.claim.n, got)
-			c.claim = nil
+		got := countClaimed(name, c.claim, s.disk, nil)
+		if got == c.claim.n {
+			continue
 		}
+		if got == 0 {
+			log.Printf("wal: claim %d for %q covers %d groups but none survived; burning the sequence",
+				c.claim.seq, name, c.claim.n)
+			c.claim = nil
+			continue
+		}
+		log.Printf("wal: claim %d for %q covers %d groups but %d survived; re-sending those under the same sequence",
+			c.claim.seq, name, c.claim.n, got)
+		c.claim.n = got
 	}
 	return nil
 }
@@ -515,10 +534,11 @@ func (s *Store) Append(r Records, server string) (dropped int, err error) {
 //
 // Ordering: the state file is published BEFORE the segment is renamed into
 // place, so a crash in between leaves a claim describing groups that never
-// became visible — which recover clamps away, a bounded loss. The reverse order
-// would leave claimed groups on disk with no claim, so they would be re-issued
-// under a NEW sequence and the server, unable to recognise them as the packet it
-// may already hold, would ingest them twice.
+// became visible — which recover shrinks to the survivors (or burns outright if
+// none are left), a bounded loss. The reverse order would leave claimed groups
+// on disk with no claim, so they would be re-issued under a NEW sequence and the
+// server, unable to recognise them as the packet it may already hold, would
+// ingest them twice.
 //
 // No rollback is needed if the rename fails, unlike the default build's spill:
 // nothing here adjusts a cursor or a claim, so the state just written stays
