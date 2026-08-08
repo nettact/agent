@@ -1,5 +1,3 @@
-//go:build !lite
-
 package wal
 
 import (
@@ -16,8 +14,16 @@ import (
 	"time"
 )
 
-// On-disk mechanics for the durable tier. The store is a directory of
-// append-never segment files plus one small state file:
+// On-disk mechanics for the durable tier, shared by BOTH builds. It carries no
+// build tag on purpose: the default build spills continuously and the lite build
+// only while a server is disconnected, but a router that spilled under one and a
+// desktop that reads the directory under the other must agree on every byte —
+// and two copies of a format are two formats the moment one of them is edited.
+// Policy (when to spill, what to keep, how long) is what differs, so that lives
+// in wal.go and wal_lite.go and nothing here decides it.
+//
+// The store is a directory of append-never segment files plus one small state
+// file:
 //
 //	000000000000000001.seg   one spill's worth of groups, one JSON line each
 //	000000000000000002.seg
@@ -331,9 +337,18 @@ func readState(dir string) (walState, bool, error) {
 // listSegments returns the segment counters present in dir, ascending. Files
 // that are not segments — a leftover database from an older build, anything a
 // user dropped in — are ignored rather than tripping the store.
+//
+// A directory that does not exist is an empty store rather than an error. The
+// default build creates it at Open, so this only matters to the lite build,
+// which does not create the directory until it actually has something to spill:
+// a store that has never been disconnected must leave no trace on the flash at
+// all, not even an empty directory.
 func listSegments(dir string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	var out []uint64

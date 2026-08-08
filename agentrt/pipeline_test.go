@@ -47,7 +47,7 @@ type budgeted interface{ Budget() *collector.ProbeGate }
 // probes at once — the knob would read as enforced while enforcing nothing,
 // which is worse than the unwired knob this replaced.
 func TestEveryProbeCollectorSharesOneBudget(t *testing.T) {
-	outbox, err := wal.Open(t.TempDir(), []string{"alpha", "beta"})
+	outbox, err := wal.Open(t.TempDir(), []string{"alpha", "beta"}, wal.Options{})
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}

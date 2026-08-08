@@ -87,6 +87,18 @@ msgstr "Protobuf（默认）"
 msgid "JSON"
 msgstr "JSON"
 
+msgid "Keep unsent data across a reboot"
+msgstr "断连数据保留到重启之后"
+
+msgid "While a server is reachable this router's flash is never written to. Once a server goes unreachable the agent starts saving that server's unsent telemetry, so rebooting the router to fix the internet no longer throws away the record of how the fault began. Turn this off to spend no flash writes at all, at the cost of losing an outage whenever the router restarts."
+msgstr "服务器可达期间，本路由器的闪存完全不会被写入。一旦某个服务器断连，Agent 就开始把它那份尚未上报的遥测数据落盘保存；这样为了修网络而重启路由器，就不会连故障是怎么开始的记录一起丢掉。关掉它可以完全不写闪存，代价是每次重启都会丢失这段断连数据。"
+
+msgid "Keep unsent data for"
+msgstr "断连数据保留时长"
+
+msgid "How long after losing a server to keep saving, e.g. 30m or 2h. The window restarts every time the connection comes back, so it covers the beginning of a fault without letting a long outage write to flash for days."
+msgstr "从失去某个服务器起继续保存多久，例如 30m 或 2h。每次重新连上都会重新计时，因此它覆盖的是故障刚发生的那一段，而不会让一次长时间断网连着几天往闪存里写。"
+
 # --- 数据采集 ---------------------------------------------------------------
 
 msgid "Data collection"

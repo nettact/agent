@@ -367,6 +367,26 @@ gen limits-bad 'nettact.main.server_url=https://a.example.com
 nettact.main.max_probe_concurrency=lots'
 has "limits.bad int stays quoted" "max_probe_concurrency: 'lots'"
 
+# Backlog persistence. This is the one boolean whose agent-side default is TRUE,
+# so its rendering is inverted: an unset or enabled flag must emit nothing, and
+# only an explicit off may be written. Emitting `persist: true` would be noise;
+# failing to emit `persist: false` would silently turn back on a setting the
+# router's owner switched off to spare their flash.
+gen persist-default 'nettact.main.server_url=https://a.example.com'
+hasnt "persist.unset omits key" "persist:"
+
+gen persist-on 'nettact.main.server_url=https://a.example.com
+nettact.main.persist_enable=1'
+hasnt "persist.on omits key" "persist:"
+
+gen persist-off 'nettact.main.server_url=https://a.example.com
+nettact.main.persist_enable=0'
+has "persist.off is rendered" "persist: false"
+
+gen persist-window 'nettact.main.server_url=https://a.example.com
+nettact.main.persist_window=10m'
+has "persist.window" "persist_window: '10m'"
+
 # Multi-server. The single-server keys must be entirely absent: the agent treats
 # a config carrying both as an error, not a merge.
 gen multi 'nettact.main.server_mode=multi

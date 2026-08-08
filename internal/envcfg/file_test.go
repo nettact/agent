@@ -322,6 +322,61 @@ func TestFileMaxTraceConcurrency(t *testing.T) {
 	}
 }
 
+// TestPersistSettings covers the outbox durability pair on both layers. Persist
+// defaults ON so the router builds keep an outage's telemetry across the reboot
+// that usually follows one; every other build reads it and ignores it.
+func TestPersistSettings(t *testing.T) {
+	cfg, err := loadLayered(t, "server_url: https://server.example\n", nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Persist {
+		t.Fatal("Persist defaults to false, want true")
+	}
+	if cfg.PersistWindow != 30*time.Minute {
+		t.Fatalf("PersistWindow = %s, want the 30m default", cfg.PersistWindow)
+	}
+
+	// From the file.
+	cfg, err = loadLayered(t, "server_url: https://server.example\npersist: false\npersist_window: 10m\n", nil)
+	if err != nil {
+		t.Fatalf("Load(file): %v", err)
+	}
+	if cfg.Persist {
+		t.Fatal("Persist(file) = true, want the configured false")
+	}
+	if cfg.PersistWindow != 10*time.Minute {
+		t.Fatalf("PersistWindow(file) = %s, want 10m", cfg.PersistWindow)
+	}
+
+	// From the environment alone.
+	cfg, err = Load(mapLookup(map[string]string{
+		"NETTACT_AGENT_SERVER_URL":     "https://server.example",
+		"NETTACT_AGENT_PERSIST":        "0",
+		"NETTACT_AGENT_PERSIST_WINDOW": "2h",
+	}), File{})
+	if err != nil {
+		t.Fatalf("Load(env): %v", err)
+	}
+	if cfg.Persist {
+		t.Fatal("Persist(env) = true, want the configured false")
+	}
+	if cfg.PersistWindow != 2*time.Hour {
+		t.Fatalf("PersistWindow(env) = %s, want 2h", cfg.PersistWindow)
+	}
+
+	// A window under one spill interval would write once and never again, which
+	// reads like a setting and behaves like a switch; `persist: false` is the
+	// switch.
+	if _, err := loadLayered(t, "server_url: https://server.example\npersist_window: 10s\n", nil); err == nil ||
+		!strings.Contains(err.Error(), "NETTACT_AGENT_PERSIST_WINDOW must be in [1m0s, 24h0m0s]") {
+		t.Fatalf("out-of-range persist window error = %v, want range rejection", err)
+	}
+	if _, err := loadLayered(t, "server_url: https://server.example\npersist: sometimes\n", nil); err == nil {
+		t.Fatal("a non-boolean persist was accepted")
+	}
+}
+
 // TestExampleConfigParses guards the shipped template against drift: it must
 // stay valid under the strict decoder (so no unknown key or YAML slips in) and
 // carry the one required, uncommented setting.

@@ -229,7 +229,7 @@ func TestEnrollFailureKeepsItsCause(t *testing.T) {
 func TestStatusWriterCoalescesWithoutTearing(t *testing.T) {
 	dir := agentDataDir(t)
 	path := filepath.Join(dir, "nested", "status.json") // also proves the parent is created
-	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"a", "b"})
+	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"a", "b"}, wal.Options{})
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestStatusWriterIsDisabledByAnEmptyPath(t *testing.T) {
 func TestStatusFileSurvivesATerminalOutcome(t *testing.T) {
 	dir := agentDataDir(t)
 	path := filepath.Join(dir, "status.json")
-	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"default"})
+	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"default"}, wal.Options{})
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestStatusFileSurvivesATerminalOutcome(t *testing.T) {
 func TestStatusFileIsRemovedOnAnOrdinaryShutdown(t *testing.T) {
 	dir := agentDataDir(t)
 	path := filepath.Join(dir, "status.json")
-	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"default"})
+	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"default"}, wal.Options{})
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}

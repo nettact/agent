@@ -281,6 +281,25 @@ type Config struct {
 	UploadInterval time.Duration // WAL drain cadence; 0 → pcfg.DefaultUploadInterval (30s)
 	WireFormat     string        // "protobuf" (default when empty) or "json"
 
+	// Persist and PersistWindow tune the outbox's durable tier, and are read by
+	// the lite (OpenWrt router) build ONLY.
+	//
+	// That build's outbox is a memory buffer that writes nothing to the router's
+	// flash while a server's session is up, and spills that server's unsent
+	// backlog once the session drops — for PersistWindow (0 → 30 minutes) after
+	// the disconnect, which is the interval containing the fault's onset and the
+	// one a reboot would destroy. Persist false is the older memory-only
+	// behaviour: nothing is ever written and a reboot during an outage loses
+	// everything buffered.
+	//
+	// Every other build ignores both. Its outbox is already durable and spills on
+	// buffer depth and age regardless of any session, so "persist while
+	// disconnected" is what it does unconditionally and a window bounding flash
+	// wear has nothing to bound. They are kept on Config rather than hidden
+	// behind a build tag so one configuration schema describes every build.
+	Persist       bool
+	PersistWindow time.Duration
+
 	// Policy is the agent's default permission grant (spec §3), used for every
 	// server entry that does not carry one of its own. The standalone binary
 	// builds it from NETTACT_AGENT_PERMISSIONS (or the frozen default); the
@@ -465,7 +484,10 @@ func Run(ctx context.Context, cfg Config) error {
 	for i, sc := range cfg.Servers {
 		names[i] = sc.Name
 	}
-	outbox, err := wal.Open(filepath.Join(cfg.DataDir, "wal"), names)
+	outbox, err := wal.Open(filepath.Join(cfg.DataDir, "wal"), names, wal.Options{
+		Persist:       cfg.Persist,
+		PersistWindow: cfg.PersistWindow,
+	})
 	if err != nil {
 		cancel()
 		return fmt.Errorf("open wal: %w", err)
@@ -841,6 +863,14 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				Permissions:   rt.report,
 			},
 			OnSession: func(up bool) {
+				// The outbox learns the edge before anything else does. On the
+				// router builds this is what decides whether telemetry reaches
+				// flash at all: a session that just ended means the samples now
+				// buffered have nowhere to go, and the likeliest next event is
+				// somebody power-cycling the box to fix the internet. On every
+				// other build it is a no-op.
+				rt.outbox.SetServerOnline(rt.cfg.Name, up)
+
 				kind := EventDisconnected
 				if up {
 					kind = EventConnected

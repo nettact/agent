@@ -19,7 +19,7 @@ import (
 // state.json, so it is worth pinning directly.
 func TestDiskClaimSurvivesRestart(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestDiskClaimSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir, []string{srvA})
+	again, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestDiskClaimSurvivesRestart(t *testing.T) {
 // or discarding the whole segment, would turn a torn tail into a total loss.
 func TestTornSegmentTailKeepsEarlierGroups(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestTornSegmentTailKeepsEarlierGroups(t *testing.T) {
 	}
 	f.Close()
 
-	again, err := Open(dir, []string{srvA})
+	again, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatalf("a torn tail must not stop the store opening: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestForeignFilesAreIgnored(t *testing.T) {
 		}
 	}
 
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestStaleTempFilesAreRemovedOnOpen(t *testing.T) {
 	if err := os.WriteFile(stale, []byte("half a spill"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestStaleTempFilesAreRemovedOnOpen(t *testing.T) {
 // claim is discarded and the sequence burned.
 func TestOversizedClaimIsDropped(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestOversizedClaimIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir, []string{srvA})
+	again, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestOversizedClaimIsDropped(t *testing.T) {
 // would keep every spill's file forever.
 func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestUnackedClaimDoesNotLeakSegments(t *testing.T) {
 // under sequences the server cannot recognise as duplicates.
 func TestCorruptStateStartsOver(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA})
+	s, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestCorruptStateStartsOver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir, []string{srvA})
+	again, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatalf("a corrupt state file must not stop the store opening: %v", err)
 	}

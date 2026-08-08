@@ -92,6 +92,34 @@ server_url: http://host:12450
 # Telemetry wire format: protobuf (default) or json.
 #wire_format: protobuf
 
+# --- Keeping an unsent backlog across a reboot -------------------------------
+#
+# These two apply to the ROUTER (OpenWrt/lite) build only. Every other build's
+# outbox is already durable — it spills to disk on buffer depth and age whatever
+# the connection is doing — so both keys are read and ignored there.
+#
+# The router build writes nothing to flash while a server's session is up: erase
+# cycles are what wears that hardware out, and a healthy agent's telemetry is
+# seconds away from being uploaded and forgotten. When a session drops, the
+# samples now piling up have nowhere to go and the likeliest next event is
+# somebody power-cycling the router to fix the internet — so from that moment the
+# agent starts writing that server's backlog to <data_dir>/wal, and it survives
+# the reboot and uploads once the server is reachable again.
+#
+# persist false is the older behaviour: memory only, and a reboot during an
+# outage loses everything buffered. Set it if you would rather spend no erase
+# cycles at all. Default true.
+#persist: true
+
+# How long after a disconnect to keep writing that server's backlog. Default
+# 30m. Range [1m, 24h]. The window starts when the session drops and resets when
+# it comes back, so it covers the onset of the fault — the part diagnosis needs
+# and a reboot destroys — without letting a week-long outage write for a week.
+# Past it the agent keeps buffering in memory exactly as before. Each server has
+# its own window: one being unreachable never makes another's telemetry touch
+# the flash.
+#persist_window: 30m
+
 # --- Enrollment token (first run only; the two keys are mutually exclusive) --
 # After first run the saved credential in data_dir is reused and neither is read.
 

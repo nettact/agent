@@ -80,7 +80,13 @@ type Store struct {
 // owed, which is what stops a server the user removed from the config from
 // pinning its backlog until the retention window expires. Renaming a server
 // entry therefore discards its backlog, the same as removing it.
-func Open(dir string, servers []string) (*Store, error) {
+//
+// Options is accepted and ignored. Everything in it tunes the lite build's
+// conditional durable tier, and this store's tier is unconditional: it always
+// spills, so "persist while disconnected" is already what it does and a window
+// bounding flash wear has nothing to bound. Taking the argument anyway keeps one
+// call site in agentrt for both builds.
+func Open(dir string, servers []string, _ Options) (*Store, error) {
 	if len(servers) == 0 {
 		return nil, errors.New("wal: Open needs at least one server name")
 	}
@@ -198,23 +204,6 @@ func (s *Store) liveLocked(gid uint64, owner string) bool {
 	return ok && gid > c.acked
 }
 
-// countClaimed returns how many of a server's claimed groups are present in the
-// given tiers.
-func countClaimed(owner string, cl *claim, disk []diskGroup, mem []memGroup) int {
-	n := 0
-	for _, g := range disk {
-		if g.owner == owner && cl.covers(g.gid) {
-			n++
-		}
-	}
-	for _, g := range mem {
-		if g.owner == owner && cl.covers(g.gid) {
-			n++
-		}
-	}
-	return n
-}
-
 // discardSegments deletes every segment, used when the bookkeeping that
 // describes them cannot be trusted.
 func (s *Store) discardSegments() error {
@@ -231,6 +220,16 @@ func (s *Store) discardSegments() error {
 	}
 	return nil
 }
+
+// SetServerOnline is a no-op here, and exists so the session runner can report
+// the same connection edges to either build without a build-tagged call site.
+//
+// Nothing in this store's policy depends on whether a server is reachable: it
+// spills on buffer depth and age alone, so a link that just dropped changes
+// nothing about when the backlog reaches disk. The lite build is where the
+// answer matters, because there the edge is the only thing that turns writing on
+// at all.
+func (s *Store) SetServerOnline(string, bool) {}
 
 // Close flushes the memory tier to disk. Flushing here is what makes an ordinary
 // shutdown lossless: the caller already stops every producer and every session

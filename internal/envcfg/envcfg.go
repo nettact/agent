@@ -79,6 +79,28 @@ func Load(lookup Lookup, file File) (agentrt.Config, error) {
 		}
 	}
 
+	// PERSIST / PERSIST_WINDOW — the outbox's durable tier, read by the lite
+	// (router) build only; see agentrt.Config.
+	//
+	// The default is ON, and it is on for every build rather than only where it
+	// takes effect. This parser has no build tag and produces one Config, so a
+	// build-conditional default would mean the same file describing two different
+	// agents — and the builds that ignore the field ignore it because their
+	// outbox already persists unconditionally, which is exactly what true says.
+	cfg.Persist = true
+	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_PERSIST", &errs); ok {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			add(fmt.Errorf("NETTACT_AGENT_PERSIST must be a boolean, got %q", v))
+		} else {
+			cfg.Persist = b
+		}
+	}
+	// The lower bound is a minute rather than zero: a window under one spill
+	// interval would write once at the disconnect and never again, which reads
+	// like a setting and behaves like a switch. Turn it off with PERSIST instead.
+	cfg.PersistWindow = durVar(lookup, "NETTACT_AGENT_PERSIST_WINDOW", 30*time.Minute, time.Minute, 24*time.Hour, &errs)
+
 	// PERMISSIONS — the agent-wide default grant, inherited by any server entry
 	// that does not name its own.
 	cfg.Policy = loadPolicy(lookup, &errs)

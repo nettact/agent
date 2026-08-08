@@ -287,6 +287,19 @@ return view.extend({
 		o.value('json', _('JSON'));
 		o.default = 'protobuf';
 
+		o = s.option(form.Flag, 'persist_enable', _('Keep unsent data across a reboot'),
+			_('While a server is reachable this router\'s flash is never written to. Once a server goes unreachable the agent starts saving that server\'s unsent telemetry, so rebooting the router to fix the internet no longer throws away the record of how the fault began. Turn this off to spend no flash writes at all, at the cost of losing an outage whenever the router restarts.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'persist_window', _('Keep unsent data for'),
+			_('How long after losing a server to keep saving, e.g. 30m or 2h. The window restarts every time the connection comes back, so it covers the beginning of a fault without letting a long outage write to flash for days.'));
+		o.depends('persist_enable', '1');
+		o.placeholder = '30m';
+		o.optional = true;
+		o.rmempty = true;
+		o.validate = durationValidator(60000, 24 * 3600 * 1000, '1m', '24h');
+
 		// --- Permissions and target access -----------------------------------
 
 		s = m.section(form.NamedSection, 'main', 'nettact', _('Data collection'),

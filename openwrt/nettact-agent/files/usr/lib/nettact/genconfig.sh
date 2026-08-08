@@ -83,6 +83,17 @@ put_bool() { # put_bool <indent> <key> <uci-value>
 	esac
 }
 
+# put_bool_on is the mirror, for the one setting whose agent-side default is
+# TRUE. Only an explicit off is rendered: emitting `true` would be noise, and
+# omitting a `false` would silently turn the setting back on. An unset UCI option
+# is an empty string and matches neither case, which is what "leave the agent's
+# default alone" has to render as.
+put_bool_on() { # put_bool_on <indent> <key> <uci-value>
+	case "$3" in
+		0|false|no|off) emit "$1$2: false" ;;
+	esac
+}
+
 # put_int emits an UNQUOTED scalar, for the two settings the agent decodes as a
 # number rather than a string. A quoted `'8'` is a YAML string and fails to
 # unmarshal, so quoting these silently breaks every config that sets them.
@@ -278,6 +289,13 @@ fi
 
 put "" upload_interval "$(nettact_cfg upload_interval)"
 put "" wire_format "$(nettact_cfg wire_format)"
+
+# Whether an unsent backlog is written to flash while a server is unreachable,
+# and for how long after the disconnect. The UCI flag is persist_enable rather
+# than persist because it is the one boolean here whose agent default is true, so
+# the two spellings do NOT mean the same thing in the same way as elsewhere.
+put_bool_on "" persist "$(nettact_cfg persist_enable)"
+put "" persist_window "$(nettact_cfg persist_window)"
 
 # The machine-wide grant. A server entry that names its own replaces this one.
 emit_permissions "" "$(nettact_cfg permission_mode)" "$(nettact_cfg permissions)"

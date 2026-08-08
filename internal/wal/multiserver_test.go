@@ -17,7 +17,7 @@ import (
 func openTempFor(t *testing.T, servers ...string) (*Store, string) {
 	t.Helper()
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, servers)
+	s, err := Open(dir, servers, Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestCapShedsTheLaggardNotTheHealthyServer(t *testing.T) {
 // going out twice under different sequences, which the server cannot dedup.
 func TestMemoryClaimKeepsItsSequenceAcrossRestart(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA, srvB})
+	s, err := Open(dir, []string{srvA, srvB}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestMemoryClaimKeepsItsSequenceAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir, []string{srvA, srvB})
+	again, err := Open(dir, []string{srvA, srvB}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +299,7 @@ func TestMemoryClaimKeepsItsSequenceAcrossRestart(t *testing.T) {
 // already acknowledged.
 func TestCursorsAreRestoredPerServer(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA, srvB})
+	s, err := Open(dir, []string{srvA, srvB}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestCursorsAreRestoredPerServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := Open(dir, []string{srvA, srvB})
+	again, err := Open(dir, []string{srvA, srvB}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestCursorsAreRestoredPerServer(t *testing.T) {
 // is no longer theirs.
 func TestUnconfiguredServerReleasesItsBacklog(t *testing.T) {
 	dir := filepath.Join(tempWALDir(t), "wal")
-	s, err := Open(dir, []string{srvA, srvB})
+	s, err := Open(dir, []string{srvA, srvB}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestUnconfiguredServerReleasesItsBacklog(t *testing.T) {
 	}
 
 	// Reopen with B gone from the configuration.
-	again, err := Open(dir, []string{srvA})
+	again, err := Open(dir, []string{srvA}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

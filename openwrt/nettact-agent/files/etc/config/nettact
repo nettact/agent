@@ -60,6 +60,31 @@ config nettact 'main'
 	# Telemetry wire format: protobuf (default) or json.
 	#option wire_format 'protobuf'
 
+	# --- Keeping an unsent backlog across a reboot ---------------------------
+
+	# While the agent is connected it writes NOTHING to this router's flash:
+	# telemetry is buffered in RAM and uploaded seconds later, and spending erase
+	# cycles on it would wear the flash out for no gain.
+	#
+	# When the connection to a server drops, that changes. The samples piling up
+	# have nowhere to go, and the usual next step — power-cycling the router to
+	# fix the internet — would take them with it, losing exactly the record of
+	# how the fault started. So from the moment a session ends the agent writes
+	# that server's backlog to /etc/nettact/data/wal, and after the reboot it
+	# uploads once the server is reachable again.
+	#
+	# Set this to 0 to keep the old behaviour: memory only, nothing ever written,
+	# and an outage lost if the router restarts. Each server is handled
+	# separately — one being unreachable never makes another's telemetry touch
+	# the flash.
+	option persist_enable '1'
+
+	# How long after a disconnect to keep doing it. Default 30m. [1m, 24h]
+	# The window starts when the session drops and resets when it comes back, so
+	# it covers the onset of the fault without letting a week-long outage write
+	# for a week. Past it the agent keeps buffering in RAM exactly as before.
+	#option persist_window '30m'
+
 	# --- Permissions ---------------------------------------------------------
 
 	# What this router is allowed to collect and report. The presets are the

@@ -44,6 +44,8 @@ Settings (environment variable — YAML key):
   NETTACT_AGENT_TLS_INSECURE        skip TLS verification (default false)                — tls_insecure
   NETTACT_AGENT_UPLOAD_INTERVAL     WAL drain cadence (default 30s)                      — upload_interval
   NETTACT_AGENT_WIRE_FORMAT         protobuf (default) | json                            — wire_format
+  NETTACT_AGENT_PERSIST             keep an unsent backlog across a reboot (default true; router builds only) — persist
+  NETTACT_AGENT_PERSIST_WINDOW      how long after a disconnect to keep doing so (default 30m) [1m,24h] — persist_window
   NETTACT_AGENT_PERMISSIONS         complete replacement permission list, or 'none'      — permissions (list or "none")
   NETTACT_AGENT_PROBE_ACCESS_MODE   allowlist | denylist                                 — probe_access.mode
   NETTACT_AGENT_PROBE_ALLOWLIST     selector CSV (scope:/cidr:/ip:/host:)                — probe_access.allowlist (list)

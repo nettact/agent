@@ -35,7 +35,7 @@ func TestTraceResultSurvivesSpillAndRestart(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := Open(dir, []string{"alpha"})
+	reopened, err := Open(dir, []string{"alpha"}, Options{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

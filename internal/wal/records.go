@@ -32,15 +32,19 @@
 // contiguity, so one counter with gaps is cheaper than one counter per server.
 //
 // There are two implementations of Store, selected by build tag, sharing the
-// types in this file and the ordering rules the uploader depends on:
+// types in this file, the on-disk format in segment.go, and the ordering rules
+// the uploader depends on:
 //
 //   - wal.go (default) buffers in memory in front of a spill to plain segment
 //     files, so a healthy agent writes nothing to disk but a disconnected one
-//     keeps its backlog across a restart. See segment.go for the format.
-//   - wal_lite.go (-tags lite, the OpenWrt router builds) is memory-only: on a
-//     device whose only writable storage is the flash it boots from, and whose
-//     binary may be running from a tmpfs a reboot clears anyway, a durable
-//     backlog costs write cycles for very little.
+//     keeps its backlog across a restart.
+//   - wal_lite.go (-tags lite, the OpenWrt router builds) buffers in memory and
+//     spills the SAME format, but only for a server it knows to be disconnected
+//     and only for a bounded window after that server dropped. On a device whose
+//     only writable storage is the flash it boots from, a backlog that is being
+//     uploaded every 30 seconds is not worth an erase cycle; one that cannot be
+//     uploaded, on a router its owner is about to power-cycle to "fix" the
+//     internet, is the only copy that exists. See Store there for the window.
 //
 // Both honour the same contract for everything above them: FIFO delivery per
 // server, whole Records groups claimed indivisibly, and an in-flight packet
@@ -53,6 +57,27 @@ import (
 	"github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/telemetry"
 )
+
+// Options are the store's tunables at Open. They exist in both builds so a
+// caller needs no build-specific branch, and the default build ignores every
+// field: its durable tier is unconditional and its retention is fixed, so a
+// "should this persist" question has no meaning there.
+type Options struct {
+	// Persist enables the lite build's durable tier. False is the historical
+	// lite behaviour — memory only, everything lost on reboot.
+	//
+	// It is a switch rather than a constant because the flash it writes to is
+	// the one part of a router that wears out, and an owner who would rather
+	// lose an outage's telemetry than spend erase cycles on it is making a
+	// legitimate choice about their own hardware. Ignored by the default build.
+	Persist bool
+
+	// PersistWindow is how long after a server disconnects the lite build keeps
+	// writing that server's backlog to flash. Zero selects 30 minutes. Ignored
+	// by the default build. See Store in wal_lite.go for why the window is
+	// anchored at the disconnect rather than being a size or a rate.
+	PersistWindow time.Duration
+}
 
 // Records is one Append's worth of telemetry. A struct rather than a parameter
 // per payload kind because the kinds are added to over time and every caller
@@ -138,6 +163,27 @@ type claim struct {
 // covers reports whether a group belongs to this claim.
 func (c *claim) covers(gid uint64) bool {
 	return c != nil && gid >= c.from && gid <= c.to
+}
+
+// countClaimed returns how many of a server's claimed groups are present in the
+// given tiers. It lives beside claim rather than in either build's store because
+// both ask the same question of the same two tiers — "did all the groups this
+// sequence went out over survive?" — and an answer that differed between the
+// builds would mean a packet re-served short under a sequence the server already
+// associates with more content.
+func countClaimed(owner string, cl *claim, disk []diskGroup, mem []memGroup) int {
+	n := 0
+	for _, g := range disk {
+		if g.owner == owner && cl.covers(g.gid) {
+			n++
+		}
+	}
+	for _, g := range mem {
+		if g.owner == owner && cl.covers(g.gid) {
+			n++
+		}
+	}
+	return n
 }
 
 // cursor is one server's position in the shared log: every group of its own with

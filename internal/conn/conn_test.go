@@ -125,7 +125,7 @@ func newTestDeps(t *testing.T) (Deps, *wal.Store, *fakeConfigurable, *fakeSchedu
 	if err != nil {
 		t.Fatalf("make temp dir: %v", err)
 	}
-	outbox, err := wal.Open(filepath.Join(dataDir, "wal"), []string{testServer})
+	outbox, err := wal.Open(filepath.Join(dataDir, "wal"), []string{testServer}, wal.Options{})
 	if err != nil {
 		_ = os.RemoveAll(dataDir)
 		t.Fatalf("open wal: %v", err)

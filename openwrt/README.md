@@ -56,6 +56,27 @@ router has no server to fetch one from — in
 `permcatalog_test.go` holds it to `protocol/permission`, so editing one without
 the other fails `go test ./...` in the agent module.
 
+## What touches the flash
+
+While a server's session is up, nothing does. The lite agent buffers telemetry
+in RAM and uploads it seconds later; writing it to the overlay first would spend
+erase cycles on data whose whole purpose is to be deleted again.
+
+When a session drops, that stops being true. The samples piling up have nowhere
+to go, and the next thing that usually happens is somebody power-cycling the
+router to fix the internet — taking the record of how the fault started with it.
+So from the moment a session ends the agent spills that server's unsent backlog
+to `/etc/nettact/data/wal`, in the same segment format the full agent uses, and
+uploads it after the reboot. `persist_enable` (default on) turns this off
+entirely; `persist_window` (default `30m`) bounds how long after a disconnect it
+keeps writing, so a week-long outage does not write for a week. Each server has
+its own window — one being unreachable never makes another's telemetry touch the
+flash — and once a backlog is acknowledged its segments are deleted, so a router
+that has caught up occupies nothing again.
+
+`install.sh --reinstall` removes that directory along with the credential, which
+is the same thing it always did: the path did not change.
+
 ## Building
 
 ```sh

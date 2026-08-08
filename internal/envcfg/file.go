@@ -65,6 +65,8 @@ type fileConfig struct {
 	TLSInsecure         *bool             `yaml:"tls_insecure"`
 	UploadInterval      *string           `yaml:"upload_interval"`
 	WireFormat          *string           `yaml:"wire_format"`
+	Persist             *bool             `yaml:"persist"`
+	PersistWindow       *string           `yaml:"persist_window"`
 	Permissions         *scalarOrList     `yaml:"permissions"`
 	ProbeAccess         *probeAccessFile  `yaml:"probe_access"`
 	MinProbeInterval    *string           `yaml:"min_probe_interval"`
@@ -163,6 +165,10 @@ func (fc *fileConfig) flatten() map[string]string {
 	}
 	put("NETTACT_AGENT_UPLOAD_INTERVAL", fc.UploadInterval)
 	put("NETTACT_AGENT_WIRE_FORMAT", fc.WireFormat)
+	if fc.Persist != nil {
+		m["NETTACT_AGENT_PERSIST"] = strconv.FormatBool(*fc.Persist)
+	}
+	put("NETTACT_AGENT_PERSIST_WINDOW", fc.PersistWindow)
 	if fc.Permissions != nil {
 		m["NETTACT_AGENT_PERMISSIONS"] = fc.Permissions.csv()
 	}
