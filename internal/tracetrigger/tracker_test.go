@@ -225,6 +225,45 @@ func TestCooldownIsPerDestination(t *testing.T) {
 	}
 }
 
+// Two probes of one host that walk different paths are different questions: an
+// ICMP monitor and a TCP:443 monitor failing together must each get their own
+// trace. Only the cohort — destination, mode, port, path — dedupes, never the
+// bare destination, or the second fault's diagnosis would be silently dropped.
+func TestDistinctProbesOfOneHostEachTrace(t *testing.T) {
+	h := newHarness(t, []pcfg.ProbeTarget{
+		icmpTarget("m1", "1.1.1.1"),
+		{
+			MonitorID: "m2", Kind: "tcp", Target: "1.1.1.1",
+			Params: pcfg.ProbeParams{Port: 443, IntervalSeconds: 20},
+		},
+	})
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		h.trk.Observe(icmpRound("m1", ts, 100))
+		h.settle()
+		h.trk.Observe([]telemetry.Metric{
+			{TS: ts, Kind: telemetry.TCPOK, Value: 0, MonitorID: "m2"},
+			{TS: ts, Kind: telemetry.TCPErrorClass, Value: telemetry.ProbeReasonRefused, MonitorID: "m2"},
+		})
+		h.settle()
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("traced %d times, want 2 (one per probe mode)", len(reqs))
+	}
+	modes := map[string]int{}
+	for _, r := range reqs {
+		if r.DestKey != "ip:1.1.1.1" {
+			t.Fatalf("dest key = %s, want ip:1.1.1.1", r.DestKey)
+		}
+		modes[r.Mode]++
+	}
+	if modes[pcfg.TraceModeICMP] != 1 || modes[pcfg.TraceModeTCP] != 1 {
+		t.Fatalf("modes = %v, want one icmp and one tcp", modes)
+	}
+}
+
 // An edited target's counters were accumulated against a different endpoint, so
 // a generation change drops the streak instead of letting the new address
 // inherit the old one's failures.

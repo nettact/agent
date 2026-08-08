@@ -136,9 +136,10 @@ type ProxyLookup func() map[string]pcfg.ProxySpec
 
 // streak is one monitor's consecutive-failure state.
 //
-// firedAt is not here on purpose: the cooldown is keyed by DESTINATION, not by
-// monitor. Two monitors on one host share a path, and tracing it twice because
-// two monitors noticed the same outage answers the same question twice.
+// firedAt is not here on purpose: the cooldown is keyed by the planned trace's
+// cohort (destination, mode, port, path — see plan.cohortKey), not by monitor.
+// Two monitors on one host share a path, and tracing it twice because two
+// monitors noticed the same outage answers the same question twice.
 type streak struct {
 	fails         int
 	firstFailedAt time.Time
@@ -171,8 +172,8 @@ type Tracker struct {
 	policy   Policy
 	targets  map[string]pcfg.ProbeTarget // monitor id → the pushed target
 	streaks  map[string]*streak          // monitor id → its failure state
-	cooldown map[string]time.Time        // dest key → when a trace last finished
-	inflight map[string]struct{}         // dest key → a trace is running now
+	cooldown map[string]time.Time        // plan cohort key → when a trace last finished
+	inflight map[string]struct{}         // plan cohort key → a trace is running now
 
 	ctx  context.Context
 	wg   sync.WaitGroup
@@ -324,15 +325,18 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 		return
 	}
 
-	// Destination-level dedupe and cooldown. Both are keyed by the plan's
-	// destination rather than by the monitor, because what is being spared is the
-	// path: three monitors on one host going down together describe one outage,
-	// and three traces of one path are three copies of one answer.
-	if _, running := t.inflight[p.destKey]; running {
+	// Path-level dedupe and cooldown. Both are keyed by the plan's cohort — the
+	// probe, destination and path — rather than by the monitor, because what is
+	// being spared is the path: three monitors on one host going down together
+	// describe one outage, and three traces of one path are three copies of one
+	// answer. A different mode, port or egress leg is a different question and
+	// gets its own slot (see plan.cohortKey).
+	cohort := p.cohortKey()
+	if _, running := t.inflight[cohort]; running {
 		t.mu.Unlock()
 		return
 	}
-	if last, seen := t.cooldown[p.destKey]; seen && now.Sub(last) < pol.Cooldown {
+	if last, seen := t.cooldown[cohort]; seen && now.Sub(last) < pol.Cooldown {
 		t.mu.Unlock()
 		return
 	}
@@ -350,7 +354,7 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 		t.mu.Unlock()
 		return
 	}
-	t.inflight[p.destKey] = struct{}{}
+	t.inflight[cohort] = struct{}{}
 	ctx := t.ctx
 	t.mu.Unlock()
 
@@ -362,8 +366,8 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 		defer t.wg.Done()
 		res := t.runner(ctx, req, now)
 		t.mu.Lock()
-		delete(t.inflight, p.destKey)
-		t.cooldown[p.destKey] = time.Now()
+		delete(t.inflight, cohort)
+		t.cooldown[cohort] = time.Now()
 		t.mu.Unlock()
 		t.sink(res)
 	}()

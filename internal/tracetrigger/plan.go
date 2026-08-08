@@ -69,6 +69,18 @@ type plan struct {
 	reason   string
 }
 
+// cohortKey identifies the physical question a trace answers: the probe mode,
+// the destination (and port) it walks toward, and the path it takes to get
+// there. Dedupe and cooldown key on it rather than on destKey alone — an ICMP
+// walk and a TCP:443 walk to one host are different probes, and a direct path
+// and a WireGuard-inner path to one address are different paths, so collapsing
+// them would silently drop the second diagnosis. The subject is deliberately
+// NOT part of the key: a resolver fault and a target fault that point the same
+// probe down the same path would produce two copies of one answer.
+func (p plan) cohortKey() string {
+	return p.destKey + "|" + p.mode + "|" + strconv.Itoa(p.port) + "|" + p.pathScope + "|" + p.egressID
+}
+
 // Stable denial reason codes, shared with the server's vocabulary so an
 // agent-reported outcome and a server-side read speak one language.
 const (
