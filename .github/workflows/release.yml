@@ -17,7 +17,8 @@
 # protocol_ref dispatch input below.
 #
 # Required secret: CI_SUBMODULE_SSH_KEY (org-level recommended) — read access to
-# nettact/protocol. GHCR auth uses GITHUB_TOKEN; cosign is keyless OIDC.
+# nettact/protocol and nettact/docs. GHCR auth uses GITHUB_TOKEN; cosign is
+# keyless OIDC.
 
 # Public downloads are served by the d.nettact.org Cloudflare Worker directly
 # from this private GitHub Release. No release asset is copied to R2.
@@ -136,6 +137,20 @@ jobs:
             echo
             echo "- protocol: \`$protocol_sha\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Not a build dependency and deliberately not recorded as one — the gate
+      # below runs openwrt/reasoncatalog_test.go, which reads
+      # ../../docs/{en,zh}/agent-config.md to hold the failure-reason tables to
+      # the Go constants that produce them. Without this checkout the test does
+      # not skip, it fails on os.ReadFile, so the release gate is red on a
+      # checkout that merely lacks a sibling repo (which is exactly how v0.4.0
+      # failed). CI does the same; this keeps the two gates identical.
+      - name: Checkout docs
+        uses: actions/checkout@v4
+        with:
+          repository: nettact/docs
+          path: docs
+          ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
 
       - uses: actions/setup-go@v5
         with:
