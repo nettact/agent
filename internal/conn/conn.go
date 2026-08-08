@@ -339,7 +339,16 @@ type runner struct {
 	// separately: a profile edit leaves ConfigVersion untouched, and a monitor
 	// edit leaves this untouched (see applyPush).
 	appliedGameVersion int
-	lastSnapshotAt     time.Time
+	// appliedDiagSerial is the diagnostic-policy generation installed, guarded
+	// by haveDiagSerial because the serial is unsigned and cannot start behind
+	// zero the way the two ints above start at -1. Its own axis for the same
+	// reason as theirs: only diag_* edits move it, and DesiredState builds can
+	// be delivered out of build order — unguarded, a stale enabled=true
+	// arriving last would keep the tracer running after the operator switched
+	// diagnostics off.
+	appliedDiagSerial uint64
+	haveDiagSerial    bool
+	lastSnapshotAt    time.Time
 }
 
 // logf writes a session log line tagged with the server it belongs to. Every
@@ -697,11 +706,19 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		// cannot fail: putting it after the probe half would let a MonitorStatus
 		// write failure (which ends the session) swallow a configuration the agent
 		// has already been handed. The diagnostic policy rides with it for the same
-		// reason, and is applied unconditionally: it governs a trigger that must
-		// keep working while the session it arrived on is down.
+		// reason, on its own serial axis (see the runner fields): it governs a
+		// trigger that must keep working while the session it arrived on is down,
+		// so a fresh policy applies even on a frame both other halves call stale.
 		r.applyGameConfig(ds.Game)
-		if r.deps.Diag != nil {
-			r.deps.Diag.ApplyDiagPolicy(ds.Diag)
+		if r.deps.Diag != nil && ds.Diag != nil {
+			switch {
+			case !r.haveDiagSerial || ds.Diag.Serial > r.appliedDiagSerial:
+				r.deps.Diag.ApplyDiagPolicy(ds.Diag)
+				r.appliedDiagSerial, r.haveDiagSerial = ds.Diag.Serial, true
+			case ds.Diag.Serial < r.appliedDiagSerial:
+				r.logf("ignoring stale diag policy serial %d (serial %d already applied)",
+					ds.Diag.Serial, r.appliedDiagSerial)
+			}
 		}
 		if err := r.applyProbeConfig(sessionCtx, c, ds); err != nil {
 			return err
