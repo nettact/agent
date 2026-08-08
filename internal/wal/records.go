@@ -70,6 +70,20 @@ type Records struct {
 	GameBuckets     []gamesense.Bucket
 	GameGaps        []gamesense.Gap
 	GameHostSeconds []gamesense.HostSecond
+	// TraceResults are the traceroutes this agent decided to run on its own.
+	//
+	// They are in the outbox rather than answered live on the socket for the
+	// reason the whole feature exists: the fault a trace diagnoses is the most
+	// likely cause of the socket being unusable, so a result written straight to
+	// the connection is lost precisely in the outage it was collected to explain.
+	// Here it inherits everything the outbox already guarantees — survives a
+	// restart, replays under its original sequence, dedups server-side — at the
+	// cost of arriving one drain later than a live write would have.
+	//
+	// A trace belongs to the server whose pipeline triggered it, like every other
+	// group: it was planned against that server's targets, permissions and proxy
+	// generation, and means nothing to a second server that never pushed them.
+	TraceResults []telemetry.TraceResult
 }
 
 // Batch is a packet to upload.
@@ -83,6 +97,7 @@ type Batch struct {
 	GameBuckets     []gamesense.Bucket
 	GameGaps        []gamesense.Gap
 	GameHostSeconds []gamesense.HostSecond
+	TraceResults    []telemetry.TraceResult
 }
 
 // memGroup is one Append held in memory: an indivisible Records, the server it
@@ -152,6 +167,7 @@ func flatten(seq uint64, recs []Records) Batch {
 		b.GameBuckets = append(b.GameBuckets, r.GameBuckets...)
 		b.GameGaps = append(b.GameGaps, r.GameGaps...)
 		b.GameHostSeconds = append(b.GameHostSeconds, r.GameHostSeconds...)
+		b.TraceResults = append(b.TraceResults, r.TraceResults...)
 	}
 	return b
 }
@@ -159,5 +175,6 @@ func flatten(seq uint64, recs []Records) Batch {
 // rowsOf counts the sample rows one Records would occupy.
 func rowsOf(r Records) int {
 	return len(r.Metrics) + len(r.Events) + len(r.Inventory) + len(r.Snapshots) +
-		len(r.GameRuns) + len(r.GameBuckets) + len(r.GameGaps) + len(r.GameHostSeconds)
+		len(r.GameRuns) + len(r.GameBuckets) + len(r.GameGaps) + len(r.GameHostSeconds) +
+		len(r.TraceResults)
 }

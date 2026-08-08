@@ -16,6 +16,7 @@ import (
 	"github.com/nettact/agent/internal/scheduler"
 	"github.com/nettact/agent/internal/traceegress"
 	"github.com/nettact/agent/internal/traceroute"
+	"github.com/nettact/agent/internal/tracetrigger"
 	"github.com/nettact/agent/internal/wal"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
@@ -66,7 +67,12 @@ type serverRuntime struct {
 	sched         *scheduler.Scheduler
 	configurables []conn.Configurable
 	trace         *traceroute.Engine
-	scene         incidentscene.Deps
+	// trigger owns the decision to traceroute. It is per server because every
+	// input to that decision is: this server's targets produce the rounds, this
+	// server's permissions gate the mode, this server's proxy generation pins the
+	// egress, and the report belongs in this server's slice of the outbox.
+	trigger *tracetrigger.Tracker
+	scene   incidentscene.Deps
 
 	// game is nil for every server but the owner (see gameOwner). A nil applier
 	// makes the session ignore a pushed GameConfig outright, which is exactly the
@@ -197,7 +203,32 @@ func buildServer(
 	// server asked.
 	rt.trace = traceroute.New(v.guard, v.effective, v.granted, v.supported, traceLimit,
 		traceegress.Resolver(rt.proxies))
+	// The trigger is what turns a run of failing rounds into a trace. It is given
+	// this server's permission views (the engine re-checks them, but the planner
+	// needs them to choose the mode and record a downgrade), this server's proxy
+	// specs (so a pinned target's fault is diagnosed on the leg that carried it),
+	// and a sink that files the report in this server's outbox slice — the same
+	// path the metrics that triggered it took, which is what makes the report
+	// survive the outage it describes.
+	rt.trigger = tracetrigger.New(sc.Name, v.effective, v.granted, v.supported,
+		rt.proxies.Specs, rt.trace.Run, rt.appendTrace)
+	rt.configurables = append(rt.configurables, rt.trigger)
 	return rt
+}
+
+// appendTrace files one finished traceroute report in this server's slice of the
+// outbox. It is a group of its own rather than being folded into the next
+// collector round: a report is complete on its own and there is nothing it has
+// to arrive alongside.
+func (rt *serverRuntime) appendTrace(res telemetry.TraceResult) {
+	dropped, err := rt.outbox.Append(wal.Records{TraceResults: []telemetry.TraceResult{res}}, rt.cfg.Name)
+	if err != nil {
+		log.Printf("[%s] wal append trace %s: %v", rt.cfg.Name, res.ReportID, err)
+		return
+	}
+	if dropped > 0 {
+		log.Printf("[%s] WAL over capacity: dropped %d oldest samples (data gap)", rt.cfg.Name, dropped)
+	}
 }
 
 // sink routes one collector result: policy blocks and clean metrics to this
@@ -215,6 +246,10 @@ func (rt *serverRuntime) sink(res collector.Result) {
 			rt.tracker.RuntimeOK(m.MonitorID, m.ConfigSerial)
 		}
 	}
+	// The trigger sees the round before it is queued, not after it is delivered:
+	// the whole point of the local trigger is that it keeps working while the
+	// outbox is backing up behind an unreachable server.
+	rt.trigger.Observe(res.Metrics)
 	var snaps []telemetry.InterfaceSnapshot
 	if res.InterfaceSnapshot != nil {
 		snaps = []telemetry.InterfaceSnapshot{*res.InterfaceSnapshot}
@@ -249,6 +284,7 @@ func (rt *serverRuntime) connDeps(agentID string) conn.Deps {
 		Tracker:             rt.tracker,
 		Proxies:             rt.proxies,
 		Game:                rt.game,
+		Diag:                rt.trigger,
 		Effective:           rt.views.effective,
 		Granted:             rt.views.granted,
 		Supported:           rt.views.supported,
@@ -256,9 +292,6 @@ func (rt *serverRuntime) connDeps(agentID string) conn.Deps {
 		SnapshotTimeout:     rt.limits.SnapshotTimeout,
 		CollectIncidentSnapshot: func(ctx context.Context, req pcfg.IncidentSnapshotRequest) telemetry.IncidentSnapshot {
 			return incidentscene.Collect(ctx, req, scene)
-		},
-		RunTrace: func(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult {
-			return rt.trace.Run(ctx, req, receivedAt)
 		},
 	}
 }

@@ -65,7 +65,12 @@ func TestEveryProbeCollectorSharesOneBudget(t *testing.T) {
 		for _, c := range rt.configurables {
 			b, ok := c.(budgeted)
 			if !ok {
-				t.Fatalf("[%s] a probe collector lost its Budget accessor: %T", name, c)
+				// Not every configurable is a probe collector. The traceroute trigger
+				// is handed the same pushed targets — it plans a diagnostic from the
+				// target that failed — but it runs no probes, so its concurrency is
+				// the traceroute limiter's business and not this gate's. The count
+				// assertion below is what still catches a probe kind going missing.
+				continue
 			}
 			probes = append(probes, b)
 		}

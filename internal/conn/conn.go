@@ -152,6 +152,18 @@ type IntervalSetter interface {
 	SetIntervals(base, regular time.Duration)
 }
 
+// DiagApplier receives the site's path-diagnostic policy from DesiredState
+// pushes. It governs the agent's OWN traceroute trigger — the server states the
+// policy but no longer issues the command — so it is applied like any other half
+// of a push and never answered on the socket.
+//
+// The pointer is passed through rather than dereferenced here because "the
+// server said nothing" and "the server stated an all-zero policy" are different
+// instructions, and only the applier knows what its defaults are.
+type DiagApplier interface {
+	ApplyDiagPolicy(p *pcfg.DiagPolicy)
+}
+
 // GameApplier receives the site's game-capture configuration from DesiredState
 // pushes. It is a second, independent configuration axis: game profiles and
 // probe targets change at unrelated times and carry their own version numbers,
@@ -188,6 +200,10 @@ type Deps struct {
 	// ship one — in which case the game half of a push is simply not acted on.
 	Game GameApplier
 
+	// Diag applies the pushed path-diagnostic policy to this server's traceroute
+	// trigger. Nil in tests and in builds with no trigger wired.
+	Diag DiagApplier
+
 	// Effective/Granted/Supported are the agent's permission views, used to
 	// classify each requested snapshot scope (collected/denied/unsupported).
 	Effective permission.Set
@@ -210,14 +226,6 @@ type Deps struct {
 	// back by the single session writer. Nil disables the feature: the request is
 	// acknowledged as handled and dropped (tests that never push it).
 	CollectIncidentSnapshot func(ctx context.Context, req pcfg.IncidentSnapshotRequest) telemetry.IncidentSnapshot
-
-	// RunTrace executes one config.TraceRequest (DIAG-001) and returns its terminal
-	// telemetry.TraceResult. Like CollectIncidentSnapshot it runs off the session
-	// goroutine; the engine it wraps owns the per-Agent concurrency limit.
-	// receivedAt is the request's arrival instant, captured on the session
-	// goroutine, so the engine anchors the request budget there instead of
-	// wherever the worker happened to be scheduled. Nil disables the feature.
-	RunTrace func(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult
 }
 
 // Run dials the server and keeps a session alive until ctx is cancelled,
@@ -415,17 +423,16 @@ func (r *runner) session(ctx context.Context) error {
 	ackCh := make(chan wire.Ack, 1)
 	pushCh := make(chan wire.Frame, 4)
 
-	// aw carries the async request machinery: incident-snapshot and traceroute
-	// pushes are handled OFF this goroutine (applyPush returns immediately) but
-	// their result Frames are funneled back through resultCh so the single
-	// session writer stays the only thing touching the socket. The in-flight sets
-	// are touched only on the session goroutine (applyPush inserts, sessionLoop
-	// clears), so they need no locking. resultCh is bounded; background workers
-	// drop their result if the session ends first.
+	// aw carries the async request machinery: an incident-snapshot push is handled
+	// OFF this goroutine (applyPush returns immediately) but its result Frame is
+	// funneled back through resultCh so the single session writer stays the only
+	// thing touching the socket. The in-flight set is touched only on the session
+	// goroutine (applyPush inserts, sessionLoop clears), so it needs no locking.
+	// resultCh is bounded; a background worker drops its result if the session
+	// ends first.
 	aw := &asyncWork{
-		resultCh:      make(chan wire.Frame, asyncResultBuffer),
-		inflightSnap:  map[string]struct{}{},
-		inflightTrace: map[string]struct{}{},
+		resultCh:     make(chan wire.Frame, asyncResultBuffer),
+		inflightSnap: map[string]struct{}{},
 	}
 
 	go r.readLoop(sessionCtx, c, ackCh, pushCh, errCh)
@@ -435,21 +442,23 @@ func (r *runner) session(ctx context.Context) error {
 }
 
 // asyncWork is one session's machinery for the asynchronous server->Agent
-// requests (incident snapshot, traceroute). Background workers compute a result
-// and push its Frame onto resultCh; the session goroutine drains resultCh, does
-// the actual socket write, and clears the matching in-flight id. Duplicate
-// in-flight request ids are ignored, so a server re-push while work is running
-// is idempotent.
+// incident-snapshot request. A background worker computes the result and pushes
+// its Frame onto resultCh; the session goroutine drains resultCh, does the actual
+// socket write, and clears the matching in-flight id. Duplicate in-flight request
+// ids are ignored, so a server re-push while work is running is idempotent.
+//
+// Traceroute used to share this machinery and no longer does: the agent triggers
+// its own traces and their results ride the WAL, so nothing about them belongs on
+// the socket's critical path.
 type asyncWork struct {
-	resultCh      chan wire.Frame
-	inflightSnap  map[string]struct{} // keyed by IncidentSnapshotRequest.RequestID
-	inflightTrace map[string]struct{} // keyed by TraceRequest.ReportID
+	resultCh     chan wire.Frame
+	inflightSnap map[string]struct{} // keyed by IncidentSnapshotRequest.RequestID
 }
 
-// asyncResultBuffer bounds the per-session result channel. It comfortably covers
-// the per-Agent traceroute concurrency (4) plus a few incident snapshots without
-// the session goroutine ever being the bottleneck; a full channel only briefly
-// parks a finished worker until the next drain.
+// asyncResultBuffer bounds the per-session result channel. A handful of
+// concurrent incident snapshots never makes the session goroutine the
+// bottleneck; a full channel only briefly parks a finished worker until the next
+// drain.
 const asyncResultBuffer = 16
 
 // readLoop is the session's sole reader: it decodes each frame and routes it
@@ -470,7 +479,7 @@ func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- 
 				return
 			}
 		case f.DesiredState != nil, f.SnapshotRequest != nil,
-			f.IncidentSnapshotRequest != nil, f.TraceRequest != nil:
+			f.IncidentSnapshotRequest != nil:
 			select {
 			case pushCh <- f:
 			case <-sessionCtx.Done():
@@ -536,9 +545,9 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 				return err
 			}
 		case f := <-aw.resultCh:
-			// A background incident-snapshot/traceroute worker finished: write its
-			// result on the session goroutine (single-writer invariant) and clear the
-			// in-flight id so a later request with the same id can run again.
+			// A background incident-snapshot worker finished: write its result on the
+			// session goroutine (single-writer invariant) and clear the in-flight id so
+			// a later request with the same id can run again.
 			r.clearInflight(aw, f)
 			if err := r.writeFrame(sessionCtx, c, f); err != nil {
 				return fmt.Errorf("write async result: %w", err)
@@ -560,11 +569,8 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 // clearInflight removes the in-flight id a finished async result Frame answers,
 // so a subsequent server re-push of the same request executes again.
 func (r *runner) clearInflight(aw *asyncWork, f wire.Frame) {
-	switch {
-	case f.IncidentSnapshot != nil:
+	if f.IncidentSnapshot != nil {
 		delete(aw.inflightSnap, f.IncidentSnapshot.RequestID)
-	case f.TraceResult != nil:
-		delete(aw.inflightTrace, f.TraceResult.ReportID)
 	}
 }
 
@@ -599,6 +605,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 			GameBuckets:           batch.GameBuckets,
 			GameGaps:              batch.GameGaps,
 			GameHostSeconds:       batch.GameHostSeconds,
+			TraceResults:          batch.TraceResults,
 			ReportedConfigVersion: r.appliedConfigVersion,
 		}
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {
@@ -689,8 +696,13 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		// The game half goes first because it writes nothing to the socket and
 		// cannot fail: putting it after the probe half would let a MonitorStatus
 		// write failure (which ends the session) swallow a configuration the agent
-		// has already been handed.
+		// has already been handed. The diagnostic policy rides with it for the same
+		// reason, and is applied unconditionally: it governs a trigger that must
+		// keep working while the session it arrived on is down.
 		r.applyGameConfig(ds.Game)
+		if r.deps.Diag != nil {
+			r.deps.Diag.ApplyDiagPolicy(ds.Diag)
+		}
 		if err := r.applyProbeConfig(sessionCtx, c, ds); err != nil {
 			return err
 		}
@@ -708,9 +720,6 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 
 	case f.IncidentSnapshotRequest != nil:
 		r.dispatchIncidentSnapshot(sessionCtx, aw, *f.IncidentSnapshotRequest)
-
-	case f.TraceRequest != nil:
-		r.dispatchTrace(sessionCtx, aw, *f.TraceRequest)
 	}
 	return nil
 }
@@ -822,33 +831,6 @@ func (r *runner) dispatchIncidentSnapshot(sessionCtx context.Context, aw *asyncW
 		snap := r.deps.CollectIncidentSnapshot(ctx.ctx, req)
 		ctx.cancel()
 		r.deliver(sessionCtx, aw, wire.Frame{IncidentSnapshot: &snap})
-	}()
-}
-
-// dispatchTrace starts the asynchronous traceroute for one request (DIAG-001).
-// Duplicate in-flight ReportIDs are ignored idempotently; distinct reports run
-// concurrently up to the engine's per-Agent limit. The engine owns clamping,
-// destination resolution/policy, and terminal-status classification, so this
-// only handles dedupe, cancellation scope, and single-writer delivery.
-func (r *runner) dispatchTrace(sessionCtx context.Context, aw *asyncWork, req pcfg.TraceRequest) {
-	if r.deps.RunTrace == nil {
-		r.logf("ignoring trace req=%s: engine not wired", req.ReportID)
-		return
-	}
-	if _, dup := aw.inflightTrace[req.ReportID]; dup {
-		r.logf("ignoring duplicate in-flight trace report=%s", req.ReportID)
-		return
-	}
-	aw.inflightTrace[req.ReportID] = struct{}{}
-	// Arrival instant for the request budget, taken here rather than in the worker
-	// for the same reason as the incident snapshot above.
-	receivedAt := time.Now()
-	go func() {
-		// The engine owns the request budget and total-timeout window (so it can tell
-		// an exhausted budget apart from a session cancel); it is given the raw
-		// session context, which cancels the trace on reconnect/shutdown.
-		res := r.deps.RunTrace(sessionCtx, req, receivedAt)
-		r.deliver(sessionCtx, aw, wire.Frame{TraceResult: &res})
 	}()
 }
 

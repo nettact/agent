@@ -19,13 +19,13 @@ func TestRunRejectsInvalidAndExpiredRequestsWithoutProbing(t *testing.T) {
 	e := New(nil, permission.Set{}, permission.Set{}, permission.Set{}, NewLimiter(1), nil)
 	for _, tc := range []struct {
 		name   string
-		req    pcfg.TraceRequest
+		req    Request
 		status string
 		reason string
 	}{
-		{"mode", pcfg.TraceRequest{ReportID: "bad-mode", Mode: "udp", DestinationHost: "1.1.1.1"}, telemetry.TraceStatusFailed, reasonInvalidMode},
-		{"destination", pcfg.TraceRequest{ReportID: "bad-dest", Mode: pcfg.TraceModeICMP}, telemetry.TraceStatusFailed, reasonInvalidDestination},
-		{"port", pcfg.TraceRequest{ReportID: "bad-port", Mode: pcfg.TraceModeTCP, DestinationHost: "1.1.1.1"}, telemetry.TraceStatusFailed, reasonInvalidPort},
+		{"mode", Request{ReportID: "bad-mode", Mode: "udp", DestHost: "1.1.1.1"}, telemetry.TraceStatusFailed, reasonInvalidMode},
+		{"destination", Request{ReportID: "bad-dest", Mode: pcfg.TraceModeICMP}, telemetry.TraceStatusFailed, reasonInvalidDestination},
+		{"port", Request{ReportID: "bad-port", Mode: pcfg.TraceModeTCP, DestHost: "1.1.1.1"}, telemetry.TraceStatusFailed, reasonInvalidPort},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := e.Run(context.Background(), tc.req, time.Now())
@@ -37,27 +37,47 @@ func TestRunRejectsInvalidAndExpiredRequestsWithoutProbing(t *testing.T) {
 
 	granted := permission.FromStrings([]string{string(permission.DiagnosticTracerouteICMP)})
 	e = New(nil, granted, granted, granted, NewLimiter(1), nil)
-	// A spent budget (the server pushed a window the trace can no longer fit in) is
-	// terminal-at-start, and never sends a probe.
-	for _, budgetMs := range []int{0, -1} {
-		got := e.Run(context.Background(), pcfg.TraceRequest{
-			ReportID: "expired", Mode: pcfg.TraceModeICMP, DestinationHost: "1.1.1.1", BudgetMs: budgetMs,
-		}, time.Now())
-		if got.Status != telemetry.TraceStatusTimedOut || got.Reason != reasonDeadlineExceeded {
-			t.Fatalf("budget %dms result = %s/%s, want %s/%s", budgetMs,
-				got.Status, got.Reason, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
-		}
-	}
-
-	// The budget runs from receivedAt, not from entry into Run: a request whose
-	// window already elapsed before the worker was scheduled must not be handed a
-	// fresh window just because it started late.
-	got := e.Run(context.Background(), pcfg.TraceRequest{
-		ReportID: "stale", Mode: pcfg.TraceModeICMP, DestinationHost: "1.1.1.1", BudgetMs: 1_000,
+	// The window runs from decidedAt, not from entry into Run: a trace whose whole
+	// budget elapsed while it waited for a goroutine or a concurrency slot must not
+	// be handed a fresh window just because it started late. Otherwise a backlog
+	// would produce hops describing a network minutes past the fault.
+	got := e.Run(context.Background(), Request{
+		ReportID: "stale", Mode: pcfg.TraceModeICMP, DestHost: "1.1.1.1", TotalTimeoutMs: 1_000,
 	}, time.Now().Add(-2*time.Second))
 	if got.Status != telemetry.TraceStatusTimedOut || got.Reason != reasonDeadlineExceeded {
-		t.Fatalf("stale receivedAt result = %s/%s, want %s/%s",
+		t.Fatalf("stale decidedAt result = %s/%s, want %s/%s",
 			got.Status, got.Reason, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
+	}
+}
+
+// A terminal-at-planning refusal still has to say what it was about: the server
+// keeps no plan to fill the description in from, so a result that drops the
+// subject or the trigger is a report nobody can file or explain.
+func TestRunEchoesTheReportDescriptionOnEveryTerminalResult(t *testing.T) {
+	e := New(nil, permission.Set{}, permission.Set{}, permission.Set{}, NewLimiter(1), nil)
+	firstFail := time.Now().Add(-time.Minute).UTC()
+	got := e.Run(context.Background(), Request{
+		ReportID: "described", Mode: "udp", DestHost: "1.1.1.1",
+		DestKey: "ip:1.1.1.1", Port: 53,
+		SubjectKind: telemetry.TraceSubjectResolver, SubjectReason: "",
+		FallbackFrom: pcfg.TraceModeTCP, FallbackReason: "raw_socket_unavailable",
+		TriggerReason: telemetry.TraceTriggerConsecutiveFailures, TriggerStreak: 4,
+		FirstFailedAt: firstFail,
+	}, time.Now())
+	if got.Status != telemetry.TraceStatusFailed {
+		t.Fatalf("status = %s, want %s", got.Status, telemetry.TraceStatusFailed)
+	}
+	if got.DestKey != "ip:1.1.1.1" || got.DestHost != "1.1.1.1" || got.Port != 53 {
+		t.Fatalf("destination = %s/%s/%d", got.DestKey, got.DestHost, got.Port)
+	}
+	if got.SubjectKind != telemetry.TraceSubjectResolver {
+		t.Fatalf("subject = %q", got.SubjectKind)
+	}
+	if got.FallbackFrom != pcfg.TraceModeTCP || got.FallbackReason != "raw_socket_unavailable" {
+		t.Fatalf("fallback = %s/%s", got.FallbackFrom, got.FallbackReason)
+	}
+	if got.TriggerReason != telemetry.TraceTriggerConsecutiveFailures || got.TriggerStreak != 4 || !got.FirstFailedAt.Equal(firstFail) {
+		t.Fatalf("trigger = %s/%d/%s", got.TriggerReason, got.TriggerStreak, got.FirstFailedAt)
 	}
 }
 
@@ -85,10 +105,10 @@ func TestWalkContinuesPastTimeoutHopAndStopsAtDestination(t *testing.T) {
 
 // egressRequest is a well-formed in-tunnel trace request; the engine must
 // honor or fail-close it depending on what the resolver says.
-func egressRequest() pcfg.TraceRequest {
-	return pcfg.TraceRequest{
-		ReportID: "egress-1", Mode: pcfg.TraceModeICMP, DestinationHost: "192.0.2.10",
-		MaxHops: 8, AttemptsPerHop: 1, TotalTimeoutMs: 5_000, BudgetMs: 30_000,
+func egressRequest() Request {
+	return Request{
+		ReportID: "egress-1", Mode: pcfg.TraceModeICMP, DestHost: "192.0.2.10",
+		MaxHops: 8, AttemptsPerHop: 1, TotalTimeoutMs: 30_000,
 		EgressProxyID: "prx_wg", EgressConfigSerial: 4,
 	}
 }
@@ -245,7 +265,7 @@ func TestRunEgressPermissionAndModeGates(t *testing.T) {
 	// TCP through a tunnel is not plannable; a request claiming it is malformed.
 	e = New(guard, granted, granted, granted, NewLimiter(1), neverResolve)
 	bad := egressRequest()
-	bad.Mode, bad.TCPPort = pcfg.TraceModeTCP, 443
+	bad.Mode, bad.Port = pcfg.TraceModeTCP, 443
 	res = e.Run(context.Background(), bad, time.Now())
 	if res.Status != telemetry.TraceStatusFailed || res.Reason != reasonInvalidMode {
 		t.Fatalf("tcp egress result = %s/%s, want failed/invalid_mode", res.Status, res.Reason)
@@ -263,10 +283,18 @@ func TestTraceBoundsClampDeterministically(t *testing.T) {
 	if got := clampTotalTimeout(999999); got != 600*time.Second {
 		t.Fatalf("timeout clamp = %v, want 600s", got)
 	}
-	if got := perAttemptBudget(time.Second, 64); got != minPerAttempt {
+	if got := perAttemptBudget(0, time.Second, 64); got != minPerAttempt {
 		t.Fatalf("minimum per-attempt budget = %v", got)
 	}
-	if got := perAttemptBudget(time.Hour, 1); got != maxPerAttempt {
+	if got := perAttemptBudget(0, time.Hour, 1); got != maxPerAttempt {
 		t.Fatalf("maximum per-attempt budget = %v", got)
+	}
+	// An explicit per-hop timeout overrides the derivation but is clamped by the
+	// same window: a policy cannot ask for a 10ms probe or a 30s one.
+	if got := perAttemptBudget(1200, time.Hour, 30); got != 1200*time.Millisecond {
+		t.Fatalf("explicit per-hop budget = %v", got)
+	}
+	if got := perAttemptBudget(10, time.Hour, 30); got != minPerAttempt {
+		t.Fatalf("explicit per-hop budget below the floor = %v", got)
 	}
 }

@@ -71,9 +71,14 @@ const (
 // engine maps it to an unsupported terminal status.
 var errUnsupported = errors.New("traceroute: mode not supported on this platform")
 
-// Engine executes incident traceroutes under a per-Agent concurrency limit. It
-// is constructed once per agent runtime and shared across reconnects; in-flight
-// traces are canceled with their session via the context passed to Run.
+// Engine executes traceroutes under a machine-wide concurrency limit. It is
+// constructed once per server in the agent runtime and shared across reconnects;
+// in-flight traces are canceled with the runtime via the context passed to Run.
+//
+// It has no opinion about WHY a trace runs: the trigger that decided decides,
+// builds the Request, and hands the result to the outbox. The engine only
+// adjudicates permission, resolves the destination, walks the TTLs, and
+// classifies the terminal status.
 type Engine struct {
 	guard     *netguard.Guard
 	effective permission.Set
@@ -135,18 +140,89 @@ func Supported() (icmp bool, tcp bool) {
 	return c.ICMP, c.TCP
 }
 
-// Run executes one trace and returns its terminal result. ctx is the session
-// context: cancellation (reconnect/shutdown) aborts the trace with a canceled
-// status. The request budget — anchored at receivedAt, the caller's arrival
-// instant, so worker scheduling delay is not handed back as extra window — and
-// the clamped total timeout bound the run; the destination is resolved once
-// through the guard and the actual destination IP is reported.
-func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time.Time) telemetry.TraceResult {
-	res := telemetry.TraceResult{ReportID: req.ReportID, Mode: req.Mode}
+// Request is one traceroute this agent has decided to run. It is built locally —
+// nothing pushes it — by the trigger that noticed a target failing round after
+// round, which is why it carries the whole description of the report and not
+// just the execution parameters: the server holds no plan to match the answer
+// against, so whatever is not in here is a fact nobody can supply later.
+//
+// The engine treats the descriptive half (DestKey through FirstFailedAt) as
+// opaque and copies it verbatim onto every terminal result, including the ones
+// that never send a packet. That keeps "what was this about" answerable for a
+// refusal exactly as it is for a completed sweep.
+type Request struct {
+	ReportID string // agent-minted; the server's idempotency key with the agent id
 
-	// The attestation is stamped before anything can fail, so EVERY terminal
-	// result — including the fail-closed ones — declares which path plan it
-	// answers and that no other path was used.
+	Mode     string // pcfg.TraceModeICMP | pcfg.TraceModeTCP
+	DestKey  string // canonical "ip:…" / "host:…" key the server files the report under
+	DestHost string // host or IP to trace toward
+	// Port is the endpoint's port as the failing probe used it. Required for
+	// Mode == TraceModeTCP; kept on an ICMP plan too when the evidence named one
+	// (a TCP monitor downgraded to ICMP), because it is part of what failed.
+	Port int
+
+	SubjectKind   string // telemetry.TraceSubject*
+	SubjectReason string // telemetry.TraceSubjectTunnel*, where a WireGuard fault needs one
+
+	FallbackFrom   string // '' | tcp — the mode this plan was downgraded from
+	FallbackReason string // why the downgrade happened
+
+	TriggerReason string    // telemetry.TraceTrigger*
+	TriggerStreak int       // consecutive failing rounds that fired it
+	FirstFailedAt time.Time // when that streak began
+
+	MaxHops        int // TTL ceiling
+	AttemptsPerHop int // probes sent per TTL
+	// TotalTimeoutMs is the whole sweep's wall-clock ceiling, measured from the
+	// instant the trigger decided to run (Run's decidedAt), so time spent waiting
+	// for a concurrency slot comes out of the same budget rather than extending it.
+	TotalTimeoutMs int
+	// PerHopTimeoutMs bounds one attempt. Zero derives it from the total budget
+	// and hop count, which is the sane relationship; a set value is clamped into
+	// the same window.
+	PerHopTimeoutMs     int
+	ResolveHopHostnames bool
+
+	// EgressProxyID pins this trace INSIDE one WireGuard tunnel: probes are sent
+	// in-tunnel toward DestHost (DIAG-004). Empty means a host-stack trace.
+	// EgressConfigSerial pins the exact config generation the diagnosed fault was
+	// observed on; the engine must match BOTH against the live proxy entries and
+	// fail closed on any mismatch (egress_generation_mismatch /
+	// egress_not_available) — never trace over a newer generation or the direct
+	// path, which would describe a route the fault never took.
+	EgressProxyID      string
+	EgressConfigSerial int
+}
+
+// Run executes one trace and returns its terminal result. ctx is the runtime
+// context: cancellation (shutdown) aborts the trace with a canceled status. The
+// total timeout is anchored at decidedAt — the instant the trigger chose to run,
+// so worker scheduling delay and time queued behind the concurrency limiter are
+// not handed back as extra window — and the destination is resolved once through
+// the guard, with the actual destination IP reported.
+func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) telemetry.TraceResult {
+	res := telemetry.TraceResult{
+		ReportID: req.ReportID,
+		Mode:     req.Mode,
+
+		DestKey:  req.DestKey,
+		DestHost: req.DestHost,
+		Port:     req.Port,
+
+		SubjectKind:   req.SubjectKind,
+		SubjectReason: req.SubjectReason,
+
+		FallbackFrom:   req.FallbackFrom,
+		FallbackReason: req.FallbackReason,
+
+		TriggerReason: req.TriggerReason,
+		TriggerStreak: req.TriggerStreak,
+		FirstFailedAt: req.FirstFailedAt,
+	}
+
+	// The path scope is stamped before anything can fail, so EVERY terminal
+	// result — including the fail-closed ones — declares which path it was about
+	// and that no other path was used.
 	egress := req.EgressProxyID != ""
 	res.PathScope = telemetry.TracePathDirect
 	if egress {
@@ -161,20 +237,21 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode)
 	}
 	if egress && mode != pcfg.TraceModeICMP {
-		// In-tunnel probing is ICMP echo only; the server never plans otherwise,
-		// so this is defense against a malformed push.
+		// In-tunnel probing is ICMP echo only; the planner never chooses otherwise,
+		// so this is defense against a malformed plan.
 		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode)
 	}
-	if req.DestinationHost == "" {
+	if req.DestHost == "" {
 		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidDestination)
 	}
-	port := req.TCPPort
+	port := req.Port
 	if mode == pcfg.TraceModeTCP && (port <= 0 || port > 65535) {
 		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidPort)
 	}
 	maxHops := clampInt(req.MaxHops, defaultMaxHops, 1, maxHopsCeiling)
 	attempts := clampInt(req.AttemptsPerHop, defaultAttempts, 1, maxAttempts)
 	totalTimeout := clampTotalTimeout(req.TotalTimeoutMs)
+	res.MaxHops, res.AttemptsPerHop = maxHops, attempts
 
 	// Permission/capability gate. For a host-stack trace, effective already =
 	// granted∩supported and supported reflects the real platform capability, so
@@ -194,11 +271,12 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 		return terminal(res, telemetry.TraceStatusUnsupported, e.capabilityReason(permID, mode))
 	}
 
-	// The request budget is the only validity window. It arrives as a duration and
-	// is anchored to this agent's own clock — never to a server timestamp, so clock
-	// skew between server and agent cannot shrink the window. Spent, do not start.
-	deadline, ok := pcfg.BudgetWindow(req.BudgetMs, receivedAt, time.Now())
-	if !ok {
+	// The whole sweep — queueing included — lives inside one window anchored at
+	// the trigger's decision. Spent already (a long queue behind the machine's
+	// concurrency budget), do not start: the fault has moved on and the hops
+	// would describe a later network.
+	deadline := decidedAt.Add(totalTimeout)
+	if !time.Now().Before(deadline) {
 		return terminal(res, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
 	}
 	if ctx.Err() != nil {
@@ -226,15 +304,15 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 	// IP. The host-stack resolution path is correct for in-tunnel traces too:
 	// WireGuard monitors resolve their targets the same way (DNS mode is forced
 	// local for the tunnel transport).
-	dest, reason := e.resolveDestination(ctx, req.DestinationHost)
+	dest, reason := e.resolveDestination(ctx, req.DestHost)
 	if reason != "" {
 		return terminal(res, telemetry.TraceStatusFailed, reason)
 	}
 	res.DestinationIP = dest.String()
 	res.StartedAt = time.Now().UTC()
 
-	// Acquire a per-Agent slot; distinct reports run concurrently up to the limit.
-	// A waiter that loses its whole budget/deadline before a slot frees returns a
+	// Acquire a per-machine slot; distinct reports run concurrently up to the
+	// limit. A waiter that loses its whole budget before a slot frees returns a
 	// clean terminal state rather than blocking forever.
 	if st, rsn, ok := e.acquire(ctx, deadline); !ok {
 		res.CompletedAt = time.Now().UTC()
@@ -242,21 +320,16 @@ func (e *Engine) Run(ctx context.Context, req pcfg.TraceRequest, receivedAt time
 	}
 	defer func() { <-e.sem }()
 
-	// Run window = earliest of the request's budget deadline and now+totalTimeout.
-	runDeadline := time.Now().Add(totalTimeout)
-	if deadline.Before(runDeadline) {
-		runDeadline = deadline
-	}
-	runCtx, cancel := context.WithDeadline(ctx, runDeadline)
+	runCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
 	probe := e.proberFor(mode)
 	if egress {
 		probe = tunnelProber(egressProbe)
 	}
-	perAttempt := perAttemptBudget(totalTimeout, maxHops)
+	perAttempt := perAttemptBudget(req.PerHopTimeoutMs, totalTimeout, maxHops)
 
-	out := e.walk(ctx, runCtx, probe, dest, port, maxHops, attempts, perAttempt, runDeadline)
+	out := e.walk(ctx, runCtx, probe, dest, port, maxHops, attempts, perAttempt, deadline)
 	res.Hops = out.hops
 	res.Reached = out.reached
 	res.ReachedTTL = out.reachedTTL
@@ -547,13 +620,19 @@ func clampTotalTimeout(ms int) time.Duration {
 	return d
 }
 
-// perAttemptBudget derives the per-probe timeout from the total budget and hop
-// count, clamped into [minPerAttempt, maxPerAttempt].
-func perAttemptBudget(total time.Duration, maxHops int) time.Duration {
+// perAttemptBudget picks the per-probe timeout: the policy's explicit value when
+// it set one, otherwise the total budget divided by the hop count — the sane
+// relationship, since a sweep that spends its whole window on hop 3 has measured
+// nothing. Either way it is clamped into [minPerAttempt, maxPerAttempt], so a
+// tiny budget still sends a real probe and one slow hop cannot starve the rest.
+func perAttemptBudget(perHopMs int, total time.Duration, maxHops int) time.Duration {
 	if maxHops <= 0 {
 		maxHops = defaultMaxHops
 	}
 	per := total / time.Duration(maxHops)
+	if perHopMs > 0 {
+		per = time.Duration(perHopMs) * time.Millisecond
+	}
 	if per < minPerAttempt {
 		per = minPerAttempt
 	}

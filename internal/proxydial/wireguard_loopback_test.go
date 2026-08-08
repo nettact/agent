@@ -506,19 +506,19 @@ func labTunnelPing(d *proxydial.Dialer, seq int) error {
 	}
 }
 
-func labTraceRequest(spec pcfg.ProxySpec, serial int) pcfg.TraceRequest {
-	return pcfg.TraceRequest{
-		ReportID: "trace-lab", Mode: pcfg.TraceModeICMP, DestinationHost: labDest.String(),
+func labTraceRequest(spec pcfg.ProxySpec, serial int) traceroute.Request {
+	return traceroute.Request{
+		ReportID: "trace-lab", Mode: pcfg.TraceModeICMP, DestHost: labDest.String(),
 		// The budget divided by the hop ceiling is the per-attempt wait, so keep it
 		// at the engine's 500ms floor: reachable hops answer in microseconds over
 		// loopback and only the silent one actually spends it.
-		MaxHops: 6, AttemptsPerHop: 1, TotalTimeoutMs: 3_000, BudgetMs: 30_000,
+		MaxHops: 6, AttemptsPerHop: 1, TotalTimeoutMs: 3_000,
 		EgressProxyID: spec.ID, EgressConfigSerial: serial,
 	}
 }
 
 func TestWireGuardLoopbackEngineProducesAnAttestedInTunnelTrace(t *testing.T) {
-	// The whole stack: server-shaped TraceRequest → Engine → egress resolver →
+	// The whole stack: locally-planned Request → Engine → egress resolver →
 	// Manager → tunnel → lab, and back as a TraceResult the server would ingest.
 	lab, spec := startWGLab(t, labRouter{addr: labHop1}, labRouter{addr: labHop2, silent: true})
 	m, d := labManager(t, spec)

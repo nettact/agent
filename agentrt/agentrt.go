@@ -556,6 +556,9 @@ func Run(ctx context.Context, cfg Config) error {
 		runnersWG.Wait()
 		for _, rt := range runtimes {
 			rt.sched.Wait()
+			// The trigger's in-flight traces also append to the outbox, so they are
+			// joined in the same phase as the schedulers that started them.
+			rt.trigger.Wait()
 		}
 		hbWG.Wait()
 		_ = outbox.Close()
@@ -637,6 +640,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	for _, rt := range runtimes {
 		rt.sched.Run(runCtx)
+		// Arm the traceroute trigger with the same context: it launches goroutines
+		// that append to the outbox, so it must start alongside the schedulers that
+		// feed it and be joined in the same phase.
+		rt.trigger.Start(runCtx)
 	}
 
 	// Status heartbeat: uptime + WAL depth over the same WAL→WS path. Emitted per
