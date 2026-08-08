@@ -62,13 +62,22 @@ start_service() {
 	procd_open_instance nettact
 	procd_set_param command /bin/sh /usr/lib/nettact/launch.sh
 
-	# Two variables, and no more. DATA_DIR stays in the environment on purpose:
+	# Three variables, and no more. DATA_DIR stays in the environment on purpose:
 	# the agent prefers a file value per key, so a hand-written config that omits
 	# data_dir still keeps its identity on flash instead of landing wherever
 	# procd happens to leave the working directory.
+	#
+	# STATUS_FILE travels the same way, and for a reason of its own: where the
+	# status file lands is the PACKAGE's decision, not the user's — it has to be
+	# tmpfs on a router whichever configuration is live. Passing it as
+	# environment rather than rendering it into the YAML is what makes it apply
+	# to a hand-written config too. The same file-over-environment rule means an
+	# operator who does set status_file by hand wins, and the LuCI panel then
+	# shows no live status; that is the documented trade for full control.
 	procd_set_param env \
 		NETTACT_AGENT_CONFIG_FILE="$cfg" \
-		NETTACT_AGENT_DATA_DIR="$NETTACT_DATA_DIR"
+		NETTACT_AGENT_DATA_DIR="$NETTACT_DATA_DIR" \
+		NETTACT_AGENT_STATUS_FILE="$NETTACT_STATUS_FILE"
 
 	# Retry forever, 10s apart: an agent that cannot reach its server yet is the
 	# normal state during boot, not a reason to give up. The 3600s threshold is
@@ -86,6 +95,10 @@ stop_service() {
 	if nettact_config_is_generated; then
 		rm -f "$NETTACT_GEN_CONFIG"
 	fi
+	# The agent removes its own status file on a clean exit; this covers the
+	# stops where it never gets the chance. A file left behind by a killed agent
+	# would read as live status frozen at the last thing that happened to it.
+	rm -f "$NETTACT_STATUS_FILE"
 }
 
 service_triggers() {

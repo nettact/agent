@@ -35,6 +35,18 @@ jobs:
           path: protocol
           ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
 
+      # Not a build dependency — openwrt/reasoncatalog_test.go reads
+      # ../../docs/{en,zh}/agent-config.md to hold the failure-reason tables to
+      # the Go constants that produce them. Without this the test does not skip,
+      # it fails on os.ReadFile, so `go test ./...` is red on a checkout that
+      # merely lacks a sibling repo.
+      - name: Checkout docs
+        uses: actions/checkout@v4
+        with:
+          repository: nettact/docs
+          path: docs
+          ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
@@ -121,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for f in openwrt/build-ipk.sh openwrt/test-scripts.sh \
+          for f in openwrt/build-ipk.sh openwrt/test-scripts.sh openwrt/install.sh \
                    openwrt/*/control/{postinst,prerm,postrm} \
                    openwrt/nettact-agent/files/etc/init.d/nettact \
                    openwrt/nettact-agent/files/usr/lib/nettact/*.sh \

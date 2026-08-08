@@ -127,6 +127,14 @@ var (
 	// keeps trying, and a first run with no token would otherwise retry a
 	// missing setting forever instead of failing where someone can see it.
 	ErrNoEnrollmentToken = fmt.Errorf("no enrollment token available: %w", ErrEnroll)
+	// ErrLocalState: this machine could not keep its own enrollment state — the
+	// credential returned by a SUCCESSFUL exchange could not be written down.
+	// Its own reason because every other enrollment failure is about the server
+	// or the token, and this one is about the disk: on a router that means a full
+	// or read-only overlay, and reporting it as a transport error sends the owner
+	// to check a network that is working. It is also the one failure where the
+	// retry is not free — the one-time token was already spent server-side.
+	ErrLocalState = fmt.Errorf("local state could not be saved: %w", ErrEnroll)
 	// ErrEnrollRejected: the server answered the enrollment and refused it — a
 	// spent or expired token, a site at its agent quota. It is NOT terminal (the
 	// runner keeps retrying, since the operator may fix the cause at that end
@@ -293,6 +301,25 @@ type Config struct {
 	// non-blocking: it runs on agent goroutines (a session goroutine for
 	// Connected/Disconnected), one per server.
 	OnEvent func(Event)
+
+	// StatusFile, when non-empty, names a JSON file the runtime keeps current
+	// with each server's connection state — connected or not, why not, when the
+	// next attempt is due, and how deep that server's unsent backlog is. It is
+	// replaced atomically, so a reader may poll it without coordinating.
+	//
+	// It answers the question the agent otherwise cannot: everything it knows
+	// about its own connection travels over that connection, which is precisely
+	// what is broken when someone needs to know. A person with a terminal reads
+	// the log instead; this exists for the installs where nobody will — the
+	// OpenWrt package points it at a tmpfs path and the LuCI page renders it, so
+	// a router owner can see "certificate expired, retrying in 30s" without ever
+	// meeting a shell.
+	//
+	// Empty disables it entirely, which is the default and what the desktop
+	// uses: it consumes OnEvent and has a console of its own. Put it on a
+	// memory-backed filesystem wherever flash wear matters — it is rewritten on
+	// every reconnect attempt.
+	StatusFile string
 }
 
 // PruneCredentials forgets the enrollment credentials of every server not named
@@ -380,6 +407,11 @@ type runEnv struct {
 	hostname    string
 	platformID  string
 	subprotocol string
+
+	// status is the local connection-status file, or nil when Config.StatusFile
+	// is empty. Every method on it is nil-safe, so the runners report into it
+	// unconditionally.
+	status *statusWriter
 }
 
 // Run starts the agent and blocks until ctx is cancelled or every configured
@@ -438,6 +470,9 @@ func Run(ctx context.Context, cfg Config) error {
 		cancel()
 		return fmt.Errorf("open wal: %w", err)
 	}
+	// The status file reports backlog depth, so it needs the outbox; the runners
+	// report into it, so it has to exist before they are built.
+	env.status = newStatusWriter(cfg.StatusFile, cfg, outbox)
 	owner := cfg.Servers[gameOwner].Name
 
 	// An installed sensor that cannot collect looks identical to no sensor at all
@@ -614,6 +649,14 @@ func Run(ctx context.Context, cfg Config) error {
 	// Each has monitors that went quiet because of it, and each needs to be able
 	// to say why.
 	start := time.Now()
+	// The status file's own goroutine joins hbWG so it is stopped before the WAL
+	// closes — it reads Pending, and a status write racing outbox.Close would be
+	// reading a closed store.
+	hbWG.Add(1)
+	go func() {
+		defer hbWG.Done()
+		env.status.run(runCtx)
+	}()
 	hbWG.Add(1)
 	go func() {
 		defer hbWG.Done()
@@ -642,6 +685,10 @@ func Run(ctx context.Context, cfg Config) error {
 					Events: overload,
 				}, name)
 			}
+			// Same cadence, same numbers, different audience: the metrics above
+			// go to the server, this keeps the machine's own status file from
+			// freezing between transitions.
+			env.status.refresh()
 		}
 		emit()
 		for {
@@ -672,6 +719,15 @@ func Run(ctx context.Context, cfg Config) error {
 			err := runServer(runCtx, env, rt, creds[rt.cfg.Name])
 			outcomes[i] = err
 			if err != nil {
+				// Terminal is recorded before the event fires and before Run
+				// tears down: it is the one state a status reader most needs,
+				// because nothing further will ever change it.
+				env.status.set(rt.cfg.Name, func(s *serverStatus) {
+					s.State = statusTerminal
+					s.Since = time.Now().Unix()
+					s.NextRetryAt = 0
+					s.LastError = &statusError{Code: terminalStatusCode(err), Detail: err.Error()}
+				})
 				cfg.emit(Event{Kind: EventTerminal, Server: rt.cfg.Name, Err: err})
 			}
 		}(i, rt)
@@ -699,11 +755,23 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 	enrolled := cred.AgentToken != ""
 	if enrolled {
 		log.Printf("[%s] resuming as %s (site %s)", rt.cfg.Name, cred.AgentID, cred.SiteID)
+		env.status.set(rt.cfg.Name, func(s *serverStatus) {
+			s.State = statusConnecting
+			s.AgentID = cred.AgentID
+			s.Since = time.Now().Unix()
+		})
 	}
 	backoff := enrollBackoffBase
 
 	for {
 		if !enrolled {
+			env.status.set(rt.cfg.Name, func(s *serverStatus) {
+				if s.State != statusEnrolling {
+					s.State = statusEnrolling
+					s.Since = time.Now().Unix()
+				}
+				s.AgentID = ""
+			})
 			c, err := enrollServer(ctx, env, rt)
 			if err != nil {
 				if ctx.Err() != nil {
@@ -714,7 +782,19 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 					// present and no credential to fall back on.
 					return err
 				}
+				if errors.Is(err, ErrLocalState) {
+					// Also terminal, and for a sharper reason: the exchange
+					// SUCCEEDED, so the one-time token is already spent. Retrying
+					// can only present a dead token and overwrite this diagnosis
+					// with `enroll_rejected`, burying the disk failure that is the
+					// only thing anyone can actually fix.
+					return err
+				}
 				log.Printf("[%s] enrollment failed, retrying in %s: %v", rt.cfg.Name, backoff, err)
+				env.status.set(rt.cfg.Name, func(s *serverStatus) {
+					s.NextRetryAt = time.Now().Add(backoff).Unix()
+					s.LastError = &statusError{Code: enrollStatusCode(err), Detail: err.Error()}
+				})
 				env.cfg.emit(Event{Kind: EventEnrollFailed, Server: rt.cfg.Name, Err: err})
 				if !sleepCtx(ctx, backoff) {
 					return nil
@@ -726,6 +806,13 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 			}
 			cred, enrolled, backoff = c, true, enrollBackoffBase
 			log.Printf("[%s] enrolled as %s (site %s)", rt.cfg.Name, cred.AgentID, cred.SiteID)
+			env.status.set(rt.cfg.Name, func(s *serverStatus) {
+				s.State = statusConnecting
+				s.AgentID = cred.AgentID
+				s.Since = time.Now().Unix()
+				s.NextRetryAt = 0
+				s.LastError = nil
+			})
 			env.cfg.emit(Event{Kind: EventEnrolled, Server: rt.cfg.Name, AgentID: cred.AgentID})
 		}
 
@@ -751,7 +838,31 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				if up {
 					kind = EventConnected
 				}
+				if up {
+					// Only the up edge writes status. The down edge is followed
+					// immediately by OnRetry with the reason and the delay, and
+					// writing "disconnected, cause unknown" in between would put
+					// a state on the router page that exists for milliseconds
+					// and explains nothing.
+					now := time.Now().Unix()
+					env.status.set(rt.cfg.Name, func(s *serverStatus) {
+						s.State = statusConnected
+						s.AgentID = agentID
+						s.Since = now
+						s.LastConnectedAt = now
+						s.NextRetryAt = 0
+						s.LastError = nil
+					})
+				}
 				env.cfg.emit(Event{Kind: kind, Server: rt.cfg.Name, AgentID: agentID})
+			},
+			OnRetry: func(err error, retryIn time.Duration) {
+				env.status.set(rt.cfg.Name, func(s *serverStatus) {
+					s.State = statusWaitingRetry
+					s.Since = time.Now().Unix()
+					s.NextRetryAt = time.Now().Add(retryIn).Unix()
+					s.LastError = &statusError{Code: string(conn.Classify(err)), Detail: err.Error()}
+				})
 			},
 		}, rt.connDeps(cred.AgentID))
 
@@ -812,11 +923,23 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		if errors.Is(err, ErrEnrollRejected) {
 			return identity.Credential{}, fmt.Errorf("enroll: %w", err)
 		}
-		return identity.Credential{}, fmt.Errorf("enroll: %v: %w", err, ErrEnroll)
+		// Both causes are wrapped, not just the sentinel: ErrEnroll is what the
+		// runner branches on, while the transport error underneath is what says
+		// whether this was a refused port, an expired certificate or a name that
+		// does not resolve. Folding the latter in with %v would leave the status
+		// file able to report only "enrollment failed", which is the black box
+		// this is meant to open.
+		return identity.Credential{}, fmt.Errorf("enroll: %w: %w", err, ErrEnroll)
 	}
 	cred := identity.Credential{AgentID: resp.AgentID, SiteID: resp.SiteID, AgentToken: resp.AgentToken}
 	if err := identity.SaveCredential(env.cfg.DataDir, rt.cfg.Name, cred); err != nil {
-		return identity.Credential{}, fmt.Errorf("save credential: %w", err)
+		// Wrapped so the status file can say what actually happened. The exchange
+		// SUCCEEDED here — the server issued a credential and marked the one-time
+		// token spent — and only writing it to disk failed (a full or read-only
+		// overlay, most likely). Reported as a transport failure it would read as
+		// "the server could not be reached", sending someone to check the network
+		// while the retry burns a token that is already gone.
+		return identity.Credential{}, fmt.Errorf("save credential: %w: %w", err, ErrLocalState)
 	}
 	return cred, nil
 }

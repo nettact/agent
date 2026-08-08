@@ -12,6 +12,18 @@ NETTACT_DATA_DIR=/etc/nettact/data
 NETTACT_FLASH_DIR=/usr/lib/nettact
 NETTACT_RAM_DIR=/tmp/nettact
 
+# The agent's connection-status file: which servers it is talking to, why it is
+# not, when it will try again, and how much is queued. The LuCI status page reads
+# it — a router owner has no terminal, so without it "the service is running" is
+# the most the page could ever say.
+#
+# On tmpfs, and not negotiable: it is rewritten on every reconnect attempt, and a
+# router that cannot reach its server retries for as long as that lasts. Putting
+# it anywhere on the overlay would spend erase cycles on exactly the failure it
+# exists to report. Overridable only so the offline test harness can point it
+# somewhere hermetic.
+NETTACT_STATUS_FILE="${NETTACT_STATUS_FILE:-/tmp/nettact/status.json}"
+
 # The agent's YAML configuration, rendered from UCI by genconfig.sh.
 #
 # It lands on tmpfs, not flash, for two reasons that both matter on a router:

@@ -36,10 +36,46 @@ binary_version() {
 }
 
 status() {
-	local bin
+	local bin running agent_status status_pid
 	bin="$(nettact_bin)"
+	running="$(service_running)"
+
+	# The agent's own account of its connections: connected or not, why not, when
+	# it retries, how much is queued. Everything the ROUTER can observe — procd
+	# state, files on disk — is below, and none of it can tell a working agent
+	# from one that has been failing its TLS handshake for an hour.
+	#
+	# Two guards, because procd saying "running" is not the same as "this file
+	# describes the process that is running". launch.sh removes the file before
+	# it starts waiting for the clock and the binary, which covers the respawn
+	# window; the pid check covers the gap between an agent dying and procd
+	# noticing. Read here, before json_init, because jshn keeps its state in
+	# globals and json_load would clobber the reply being built.
+	agent_status=""
+	if [ -s "$NETTACT_STATUS_FILE" ]; then
+		agent_status="$(cat "$NETTACT_STATUS_FILE" 2>/dev/null)"
+		# A document in which EVERY server is terminal is read whatever procd
+		# currently says. The agent writes it on the way out, so its pid is dead
+		# and the service is in a respawn delay — the two conditions that would
+		# otherwise discard it — and it is the answer to "why is this router not
+		# reporting".
+		#
+		# Every server, not any: with several configured, a dead process can
+		# leave one terminal row beside another that still says "connected".
+		# Waving the whole document through on the strength of the first would
+		# present that stale "connected" as current.
+		states="$(printf '%s' "$agent_status" | grep -o '"state":"[a-z_]*"' | wc -l)"
+		terminals="$(printf '%s' "$agent_status" | grep -o '"state":"terminal"' | wc -l)"
+		if [ "$states" -lt 1 ] || [ "$states" != "$terminals" ]; then
+			status_pid="$(printf '%s' "$agent_status" | sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+			if [ "$running" != 1 ] || [ -z "$status_pid" ] || ! kill -0 "$status_pid" 2>/dev/null; then
+				agent_status=""
+			fi
+		fi
+	fi
+
 	json_init
-	json_add_boolean running "$(service_running)"
+	json_add_boolean running "$running"
 	json_add_boolean enabled "$(service_enabled)"
 	# agent.json is the credential written when enrollment succeeds, so its
 	# presence is the honest answer to "is this router registered".
@@ -59,6 +95,15 @@ status() {
 		json_add_string config_source manual
 	fi
 	json_add_string config_path "$(nettact_config_file)"
+
+	# Passed through as an opaque STRING: jshn builds JSON by appending scalars
+	# and cannot graft a document it did not build, so the view JSON.parses this
+	# field (and tolerates it being absent or unparseable).
+	[ -n "$agent_status" ] && json_add_string agent_status "$agent_status"
+	# The router's clock, so the page can render "retrying in 32s" from the
+	# absolute instant in the status file without trusting the browser's clock to
+	# agree with the router's.
+	json_add_int now "$(date +%s)"
 
 	# Collect first, then loop OUTSIDE a pipeline. Every stage of a pipeline is
 	# its own subshell in ash, so a `logread | while read` loop would call

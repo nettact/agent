@@ -94,12 +94,27 @@ func wsDialer(opts Options) (wire.Dialer, error) {
 	httpClient := &http.Client{Transport: tr}
 
 	return func(ctx context.Context, token string) (wire.Conn, error) {
-		c, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		c, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 			HTTPHeader:   http.Header{"Authorization": {"Bearer " + token}},
 			Subprotocols: []string{opts.Format},
 			HTTPClient:   httpClient,
 		})
 		if err != nil {
+			// A refused credential is an ordinary failed upgrade as far as the
+			// WebSocket library is concerned, and the status code that says so
+			// lives only on this response — which is otherwise dropped on the
+			// floor. Reading it here is what lets a stale token be reported as
+			// "the server rejected this agent" instead of a nameless dial error
+			// the user is left to guess at.
+			if resp != nil {
+				code := resp.StatusCode
+				if resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				if code == http.StatusUnauthorized || code == http.StatusForbidden {
+					return nil, fmt.Errorf("dial: %w (HTTP %d): %v", ErrAuthRejected, code, err)
+				}
+			}
 			return nil, fmt.Errorf("dial: %w", err)
 		}
 		c.SetReadLimit(readLimit)

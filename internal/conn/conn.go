@@ -45,7 +45,21 @@ var (
 	// ErrRevoked: the agent row was deleted server-side; the credential is dead
 	// and the process must re-enroll to come back.
 	ErrRevoked = errors.New("agent revoked on server")
+
+	// ErrAuthRejected: the server refused the credential on the upgrade request
+	// (HTTP 401/403). Unlike the three above it is NOT terminal — the runner
+	// keeps retrying, because the fix ("re-add the agent", "the clock skew that
+	// invalidated the token is gone") is at the server end and needs no restart
+	// here. It exists only so the failure classifies as auth rather than as an
+	// anonymous dial error: the handshake response is the sole place that
+	// distinction survives, and it is discarded a line later.
+	ErrAuthRejected = errors.New("server rejected agent credential")
 )
+
+// errAckTimeout marks the "session open but not acking" failure so Classify can
+// name it. It is unexported because nothing outside this package branches on
+// it; the exported vocabulary for that state is ReasonAckTimeout.
+var errAckTimeout = errors.New("no acknowledgement from server")
 
 const (
 	writeTimeout = 10 * time.Second
@@ -103,6 +117,21 @@ type Options struct {
 	// transient reconnect as an error. Must be fast and non-blocking: it runs on
 	// the session goroutine.
 	OnSession func(up bool)
+
+	// OnRetry, if non-nil, is called once per failed attempt — a dial that never
+	// connected or a session that ended — with the error that ended it and the
+	// delay Run will wait before redialing. Terminal outcomes return from Run
+	// instead and never fire it.
+	//
+	// It exists because the delay is knowable in exactly one place and one
+	// instant: the backoff computes it here and immediately sleeps on it, so a
+	// supervisor that wants to say "retrying in 32s" cannot derive it afterwards
+	// from anything Run exposes. Pairing it with the error keeps the two halves
+	// of "why, and how long" from having to be re-joined by the caller.
+	//
+	// Must be fast and non-blocking: it runs on the session goroutine, between
+	// the failure and the sleep.
+	OnRetry func(err error, retryIn time.Duration)
 
 	// Test knobs. Zero values select the production defaults above; only tests
 	// (same package) can set them, so the production surface stays minimal.
@@ -270,9 +299,17 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 			bo.reset()
 		}
 		delay := bo.next()
+		if r.opts.OnRetry != nil {
+			r.opts.OnRetry(err, delay)
+		}
 		// One line per attempt; backoff caps this at ~2 lines/min steady-state,
-		// so an unreachable server doesn't flood the log.
-		r.logf("session ended: %v; reconnecting in %s", err, delay.Round(time.Millisecond))
+		// so an unreachable server doesn't flood the log. It carries the whole
+		// answer on purpose — kind of failure, raw cause, when the next try is,
+		// and how much is queued behind the outage — because on the platforms
+		// with no status surface this line IS the status surface. Same goroutine
+		// as every other outbox access here.
+		r.logf("session ended (%s): %v; reconnecting in %s (pending %d)",
+			Classify(err), err, delay.Round(time.Millisecond), r.deps.Outbox.Pending(r.opts.ServerName))
 		select {
 		case <-ctx.Done():
 			return nil
@@ -366,6 +403,10 @@ func (r *runner) session(ctx context.Context) error {
 		r.opts.OnSession(true)
 		defer r.opts.OnSession(false)
 	}
+	// Say so out loud. Success used to be inferable only from a later drain or
+	// config line, which means a healthy agent with nothing yet to send looked
+	// exactly like a broken one in the log.
+	r.logf("connected to %s (agent %s)", r.opts.ServerURL, r.opts.AgentID)
 
 	// One reader goroutine feeds these; the session goroutine is the ONLY
 	// writer and the only place config/WAL state is touched, so no locking is
@@ -622,7 +663,7 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-
 		case <-timer.C:
 			// A connection that swallows packets without acking is as dead as a
 			// broken one — end the session and redial.
-			return wire.Ack{}, fmt.Errorf("ack timeout for seq=%d", seq)
+			return wire.Ack{}, fmt.Errorf("ack timeout for seq=%d: %w", seq, errAckTimeout)
 		}
 	}
 }

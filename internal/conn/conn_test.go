@@ -661,3 +661,91 @@ func TestGracefulShutdownSendsNormalClosure(t *testing.T) {
 		t.Fatal("server never observed the client close")
 	}
 }
+
+// TestOnRetryReportsDelayAndCause: the reconnect delay exists only inside the
+// backoff, so a supervisor can report "retrying in N" only if Run hands it over
+// at the moment it is computed. A dial that never connects must still fire it —
+// that is the case a status page most needs to explain.
+func TestOnRetryReportsDelayAndCause(t *testing.T) {
+	deps, _, _, _ := newTestDeps(t)
+
+	type retry struct {
+		err     error
+		retryIn time.Duration
+	}
+	retries := make(chan retry, 8)
+
+	// A server that refuses the upgrade: every dial fails, nothing ever connects.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no", http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts := testOptions(srv.URL, wire.SubprotocolJSON)
+	opts.OnRetry = func(err error, retryIn time.Duration) {
+		select {
+		case retries <- retry{err: err, retryIn: retryIn}:
+		default:
+		}
+	}
+	runAgent(t, opts, deps)
+
+	select {
+	case r := <-retries:
+		if r.err == nil {
+			t.Error("OnRetry got a nil error; want the failure that ended the attempt")
+		}
+		if r.retryIn <= 0 {
+			t.Errorf("OnRetry got retryIn = %v, want a positive delay", r.retryIn)
+		}
+		if got := Classify(r.err); got != ReasonAuth {
+			t.Errorf("Classify(%v) = %q, want %q for a 401 upgrade", r.err, got, ReasonAuth)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnRetry never fired for a server that refuses every dial")
+	}
+}
+
+// TestOnRetryFollowsSessionEnd: a session that dies mid-flight must report the
+// disconnect first and the retry second, so a supervisor never shows "retrying"
+// for a link it still believes is up.
+func TestOnRetryFollowsSessionEnd(t *testing.T) {
+	deps, _, _, _ := newTestDeps(t)
+
+	order := make(chan string, 8)
+	srv := startServer(t, func(ctx context.Context, c *websocket.Conn) {
+		if f, err := srvRead(ctx, c); err != nil || f.Hello == nil {
+			t.Errorf("first frame: %+v, err %v; want Hello", f, err)
+			return
+		}
+		_ = c.Close(websocket.StatusGoingAway, "server restart")
+	})
+
+	opts := testOptions(srv.URL, wire.SubprotocolJSON)
+	opts.OnSession = func(up bool) {
+		if !up {
+			select {
+			case order <- "session-down":
+			default:
+			}
+		}
+	}
+	opts.OnRetry = func(error, time.Duration) {
+		select {
+		case order <- "retry":
+		default:
+		}
+	}
+	runAgent(t, opts, deps)
+
+	for _, want := range []string{"session-down", "retry"} {
+		select {
+		case got := <-order:
+			if got != want {
+				t.Fatalf("callback order: got %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %q", want)
+		}
+	}
+}

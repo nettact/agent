@@ -59,6 +59,7 @@ type fileConfig struct {
 	Servers             []serverEntryFile `yaml:"servers"`
 	ServerURL           *string           `yaml:"server_url"`
 	DataDir             *string           `yaml:"data_dir"`
+	StatusFile          *string           `yaml:"status_file"`
 	EnrollToken         *string           `yaml:"enroll_token"`
 	EnrollTokenFile     *string           `yaml:"enroll_token_file"`
 	TLSInsecure         *bool             `yaml:"tls_insecure"`
@@ -152,6 +153,9 @@ func (fc *fileConfig) flatten() map[string]string {
 	}
 	put("NETTACT_AGENT_SERVER_URL", fc.ServerURL)
 	put("NETTACT_AGENT_DATA_DIR", fc.DataDir)
+	// Process-wide, not per server: the file is one document describing every
+	// server, so it has no place in a `servers:` entry.
+	put("NETTACT_AGENT_STATUS_FILE", fc.StatusFile)
 	put("NETTACT_AGENT_ENROLL_TOKEN", fc.EnrollToken)
 	put("NETTACT_AGENT_ENROLL_TOKEN_FILE", fc.EnrollTokenFile)
 	if fc.TLSInsecure != nil {

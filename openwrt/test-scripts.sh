@@ -7,6 +7,12 @@
 # a boot loop rather than an error message.
 #
 # opkg and uci are stubbed, so this runs anywhere with a POSIX shell.
+#
+# One limitation worth stating: this runs on the developer's or CI runner's
+# shell and coreutils, not BusyBox. Divergences between the two are invisible
+# here — `tr -d '[:space:]'` deleting the literal characters of the class rather
+# than whitespace is a real example that only a router caught — so a script that
+# passes this still has to be run on a device once.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -476,12 +482,65 @@ out="$(T_ARCH=x86_64 "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')
 got="$(printf '%s' "$out" | sed -n 's/.*log_entries:\([0-9]*\).*/\1/p')"
 check "3" "${got:-0}" "status returns the log lines"
 
-for key in running enabled enrolled binary_present mode config_source config_path log; do
+for key in running enabled enrolled binary_present mode config_source config_path now log; do
 	case " $out " in
 		*" $key"*) printf '  ok   %-28s -> present\n' "status.$key" ;;
 		*) printf '  FAIL %-28s -> missing\n' "status.$key"; fail=1 ;;
 	esac
 done
+
+# The agent's connection status is passed through only when the agent wrote one
+# AND the process that wrote it is still alive. All three cases matter: a missing
+# file must not produce an empty agent_status the view would try to parse; a live
+# one must actually reach the page — that is the whole difference between "the
+# service is running" and "the server rejected our certificate"; and a document
+# from a process that is gone must be dropped, because procd reports the
+# respawned launch.sh as running for minutes before a new agent writes anything.
+STATUS_STUB="$STUB/status.json"
+rm -f "$STATUS_STUB"
+out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
+case " $out " in
+	*" agent_status"*) printf '  FAIL %-28s -> present with no status file\n' "status.agent_status"; fail=1 ;;
+	*) printf '  ok   %-28s -> absent with no status file\n' "status.agent_status" ;;
+esac
+
+# $$ is this script: a pid that is certainly alive.
+printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$STATUS_STUB"
+out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
+case " $out " in
+	*" agent_status"*) printf '  ok   %-28s -> passed through for a live pid\n' "status.agent_status" ;;
+	*) printf '  FAIL %-28s -> not passed through for a live pid\n' "status.agent_status"; fail=1 ;;
+esac
+
+# A reaped child's pid: Linux hands pids out in increasing order, so the one we
+# just waited on is not about to come back as something else.
+sh -c 'exit 0' & dead_pid=$!
+wait "$dead_pid" 2>/dev/null || true
+printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$dead_pid" > "$STATUS_STUB"
+out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
+case " $out " in
+	*" agent_status"*) printf '  FAIL %-28s -> stale status from a dead pid passed through\n' "status.agent_status"; fail=1 ;;
+	*) printf '  ok   %-28s -> dropped for a dead pid\n' "status.agent_status" ;;
+esac
+
+# A document with no pid at all cannot be attributed to a process, so it is not
+# status either.
+printf '{"schema":1,"servers":[{"name":"default","state":"connected"}]}\n' > "$STATUS_STUB"
+out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
+case " $out " in
+	*" agent_status"*) printf '  FAIL %-28s -> pid-less document passed through\n' "status.agent_status"; fail=1 ;;
+	*) printf '  ok   %-28s -> dropped when it names no pid\n' "status.agent_status" ;;
+esac
+rm -f "$STATUS_STUB"
+
+# launch.sh must clear the previous process's file before it starts waiting, or
+# the status page shows a dead agent's last state for as long as the clock and
+# binary waits take.
+if grep -q 'rm -f "$NETTACT_STATUS_FILE"' "$HERE/nettact-agent/files/usr/lib/nettact/launch.sh"; then
+	printf '  ok   %-28s -> clears the stale status file\n' "launch.status"
+else
+	printf '  FAIL %-28s -> does not clear the stale status file\n' "launch.status"; fail=1
+fi
 
 # The methods the views call must all be listed, or ubus rejects them.
 listed="$("$RPCD" list </dev/null 2>/dev/null || true)"
@@ -558,6 +617,310 @@ check "stop disable" "$(cat "$LIFE/actions" 2>/dev/null | tr '\n' ' ' | sed 's/ 
 # An argument nobody anticipated must clean up rather than silently keep state.
 run_prerm something-new
 check "stop disable" "$(cat "$LIFE/actions" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')" "unknown arg: cleans up"
+
+# --- one-command installer ---------------------------------------------------
+#
+# install.sh is what the console hands a router owner, so its mistakes are made
+# by someone who cannot read a shell script to find out what happened. Three of
+# these are worth having offline in particular: a permission list that ACCUMULATES
+# across runs would quietly widen a grant nobody widened; forcing enabled=1 before
+# the server is written would make an install phone home mid-configuration; and
+# "connected" being read from a status file left behind by a dead process would
+# report success for a router that is in a respawn loop.
+
+echo "one-command installer:"
+
+INST="$STUB/inst"
+mkdir -p "$INST/bin" "$INST/etc/nettact/data" "$INST/tmp"
+
+# A recording uci: state as key=value lines (repeated keys are a list), plus a
+# log of every subcommand so ordering can be asserted.
+cat > "$INST/bin/uci" <<EOF
+#!/bin/sh
+S="$INST/uci.state"
+L="$INST/uci.log"
+[ "\$1" = "-q" ] && shift
+cmd="\$1"; shift
+printf '%s %s\n' "\$cmd" "\$*" >> "\$L"
+case "\$cmd" in
+	get)
+		v="\$(sed -n "s/^\$1=//p" "\$S" 2>/dev/null | tail -n 1)"
+		[ -n "\$v" ] || exit 1
+		printf '%s\n' "\$v" ;;
+	set)
+		k="\${1%%=*}"; v="\${1#*=}"
+		[ -f "\$S" ] && sed -i "/^\$k=/d" "\$S"
+		printf '%s=%s\n' "\$k" "\$v" >> "\$S" ;;
+	add_list)
+		k="\${1%%=*}"; v="\${1#*=}"
+		printf '%s=%s\n' "\$k" "\$v" >> "\$S" ;;
+	delete)
+		grep -q "^\$1=" "\$S" 2>/dev/null || exit 1
+		sed -i "/^\$1=/d" "\$S" ;;
+	commit) ;;
+esac
+exit 0
+EOF
+
+cat > "$INST/bin/opkg" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$INST/opkg.log"
+case "\$1" in
+	list-installed) exit 0 ;;
+	install) [ -n "\${T_OPKG_FAIL:-}" ] && exit 1 ;;
+esac
+exit 0
+EOF
+
+cat > "$INST/bin/nettact-init" <<EOF
+#!/bin/sh
+printf '%s\n' "\$1" >> "$INST/init.log"
+[ "\$1" = status ] && echo "\${T_SERVICE_STATE:-running}"
+exit 0
+EOF
+
+# Root is asserted, not assumed, so the test has to answer for it.
+cat > "$INST/bin/id" <<'EOF'
+#!/bin/sh
+[ "$1" = "-u" ] && echo 0
+exit 0
+EOF
+
+cat > "$INST/bin/logread" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
+# Just the one query install.sh makes. The real jsonfilter is OpenWrt base
+# system; this keeps the credential check testable off a router.
+cat > "$INST/bin/jsonfilter" <<'EOF'
+#!/bin/sh
+file=""; expr=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-i) file="$2"; shift 2 ;;
+		-e) expr="$2"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ "$expr" = '@.servers.default.agent_token' ] || exit 1
+tr -d ' \n\t' < "$file" 2>/dev/null \
+	| sed -n 's/.*"default":{[^}]*"agent_token":"\([^"]*\)".*/\1/p'
+EOF
+
+# The real common.sh, then the paths moved onto the fake root. Sourcing the real
+# file rather than restating it means install.sh keeps being tested against the
+# same variable names the package actually defines.
+cat > "$INST/common.sh" <<EOF
+. $HERE/nettact-agent/files/usr/lib/nettact/common.sh
+NETTACT_CONF_DIR="$INST/etc/nettact"
+NETTACT_DATA_DIR="$INST/etc/nettact/data"
+NETTACT_FLASH_DIR="$INST/usr/lib/nettact"
+NETTACT_RAM_DIR="$INST/tmp/nettact"
+NETTACT_STATUS_FILE="$INST/tmp/status.json"
+NETTACT_GEN_CONFIG="$INST/var/etc/nettact/agent.yaml"
+EOF
+
+INSTALLER="$INST/install.sh"
+# DATA_DIR is rewritten too: the installer checks for a saved credential BEFORE
+# it installs the package that would define NETTACT_DATA_DIR, so it carries its
+# own copy of that path and the fake root has to reach it.
+sed -e "s#^\. /usr/lib/nettact/common.sh#. $INST/common.sh#" \
+    -e "s#^DATA_DIR=/etc/nettact/data#DATA_DIR=$INST/etc/nettact/data#" \
+    -e "s#/etc/init.d/nettact#$INST/bin/nettact-init#g" \
+    "$HERE/install.sh" > "$INSTALLER"
+chmod 0755 "$INSTALLER" "$INST/bin"/*
+
+# run_install [args...] — a clean run against the fake root; exit status kept.
+run_install() {
+	rm -f "$INST/uci.state" "$INST/uci.log" "$INST/opkg.log" "$INST/init.log"
+	PATH="$INST/bin:$PATH" sh "$INSTALLER" "$@" >"$INST/out" 2>&1
+}
+
+# rerun_install — same, keeping whatever state the previous run left.
+rerun_install() {
+	rm -f "$INST/opkg.log" "$INST/init.log"
+	PATH="$INST/bin:$PATH" sh "$INSTALLER" "$@" >"$INST/out" 2>&1
+}
+
+ucival() { sed -n "s/^nettact\.main\.$1=//p" "$INST/uci.state" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'; }
+
+# Refusals. Each of these would otherwise be discovered by the agent at startup,
+# on a router whose owner is looking at a LuCI page that says "not running".
+run_install --wait 0 && check "exit!=0" "exit=0" "no --server-url" \
+	|| printf '  ok   %-28s -> refused\n' "no --server-url"
+run_install --server-url http://s:1 --token t --mode bogus --wait 0 && check "exit!=0" "exit=0" "bad --mode" \
+	|| printf '  ok   %-28s -> refused\n' "bad --mode"
+run_install --server-url http://s:1 --token t --permissions '*' --wait 0 && check "exit!=0" "exit=0" "wildcard permissions" \
+	|| printf '  ok   %-28s -> refused\n' "wildcard permissions"
+run_install --server-url http://s:1 --token t --permissions ',,,' --wait 0 && check "exit!=0" "exit=0" "empty permission list" \
+	|| printf '  ok   %-28s -> refused\n' "empty permission list"
+run_install --server-url http://s:1 --token t --token-file /dev/null --wait 0 && check "exit!=0" "exit=0" "token and token-file" \
+	|| printf '  ok   %-28s -> refused\n' "token and token-file"
+
+# No token and no saved credential cannot enroll; no token WITH one is the
+# ordinary re-run, and must not be turned into an error.
+rm -f "$INST/etc/nettact/data/agent.json"
+run_install --server-url http://s:1 --wait 0 && check "exit!=0" "exit=0" "no token, not enrolled" \
+	|| printf '  ok   %-28s -> refused\n' "no token, not enrolled"
+# …and refused before anything is installed. Reaching that verdict after two
+# opkg installs leaves a fresh router carrying packages it never got to use.
+check "0" "$(grep -c '\.ipk' "$INST/opkg.log" 2>/dev/null || echo 0)" "refusal installs nothing"
+
+# A credential file is not the same thing as a credential for THIS install.
+# Single mode enrolls under the name `default`; a router coming off multi-server
+# mode has entries named after its servers and nothing under `default`, so
+# accepting it would produce a config the agent cannot enroll with at all.
+printf '{"v":2}' > "$INST/etc/nettact/data/agent.json"
+run_install --server-url http://s:1 --wait 0 && check "exit!=0" "exit=0" "no token, credential-less file" \
+	|| printf '  ok   %-28s -> refused\n' "no token, credential-less file"
+
+cat > "$INST/etc/nettact/data/agent.json" <<'EOF'
+{"v":2,"servers":{"home":{"agent_id":"a","site_id":"s","agent_token":"t"},
+"work":{"agent_id":"b","site_id":"s","agent_token":"u"}}}
+EOF
+run_install --server-url http://s:1 --wait 0 && check "exit!=0" "exit=0" "no token, no 'default' entry" \
+	|| printf '  ok   %-28s -> refused\n' "no token, no 'default' entry"
+
+cat > "$INST/etc/nettact/data/agent.json" <<'EOF'
+{
+  "v": 2,
+  "servers": {
+    "default": {
+      "agent_id": "agent_1",
+      "site_id": "site_default",
+      "agent_token": "tok"
+    }
+  }
+}
+EOF
+run_install --server-url http://s:1 --wait 0 \
+	&& printf '  ok   %-28s -> accepted\n' "no token, already enrolled" \
+	|| { printf '  FAIL %-28s -> refused\n' "no token, already enrolled"; fail=1; }
+
+# The ordinary install.
+run_install --server-url http://srv:12450 --token tok-1 --mode flash \
+	--permissions 'probe.icmp,probe.dns' --wait 0 || true
+check "http://srv:12450" "$(ucival server_url)" "server_url"
+check "tok-1" "$(ucival enroll_token)" "enroll_token"
+check "single" "$(ucival server_mode)" "server_mode"
+check "flash" "$(ucival mode)" "mode"
+check "custom" "$(ucival permission_mode)" "permission_mode"
+check "probe.icmp probe.dns" "$(ucival permissions)" "permissions"
+check "1" "$(ucival enabled)" "enabled"
+check "enable restart" "$(tr '\n' ' ' < "$INST/init.log" | sed 's/ *$//')" "service actions"
+check "2" "$(grep -c '\.ipk' "$INST/opkg.log")" "packages installed"
+
+# enabled=1 must be written AFTER the server: the package ships enabled='0' so
+# that installing it cannot make a router report to a server nobody configured,
+# and that property has to hold until there is one.
+enabled_at="$(grep -n '^set nettact.main.enabled=1' "$INST/uci.log" | head -n 1 | cut -d: -f1)"
+server_at="$(grep -n '^set nettact.main.server_url=' "$INST/uci.log" | head -n 1 | cut -d: -f1)"
+if [ -n "$enabled_at" ] && [ -n "$server_at" ] && [ "$enabled_at" -gt "$server_at" ]; then
+	printf '  ok   %-28s -> line %s after %s\n' "enabled written last" "$enabled_at" "$server_at"
+else
+	printf '  FAIL %-28s -> enabled@%s server@%s\n' "enabled written last" "${enabled_at:-none}" "${server_at:-none}"
+	fail=1
+fi
+
+# The regression that matters: a second run REPLACES the grant. Unioning it with
+# the previous one would widen a permission set nobody widened.
+rerun_install --server-url http://srv:12450 --token tok-2 --permissions 'probe.http' --wait 0 || true
+check "probe.http" "$(ucival permissions)" "permissions replaced"
+check "custom" "$(ucival permission_mode)" "permission_mode kept"
+
+# "none" is a grant, not an absence: it must not leave a stale custom list behind.
+rerun_install --server-url http://srv:12450 --token tok-3 --permissions none --wait 0 || true
+check "none" "$(ucival permission_mode)" "permission_mode none"
+check "" "$(ucival permissions)" "permissions cleared"
+
+# Omitting --permissions leaves whatever was configured alone rather than
+# silently resetting a router to the default grant.
+rerun_install --server-url http://srv:12450 --token tok-4 --wait 0 || true
+check "none" "$(ucival permission_mode)" "permission_mode untouched"
+
+# A value wrapped across a shell line keeps its ids intact: only whitespace goes,
+# and every character of a permission id stays.
+rerun_install --server-url http://srv:12450 --token tok-5 --permissions ' probe.icmp,
+	probe.dns ' --wait 0 || true
+check "probe.icmp probe.dns" "$(ucival permissions)" "whitespace trimmed"
+
+run_install --server-url http://srv:12450 --token t --no-luci --wait 0 || true
+check "1" "$(grep -c '\.ipk' "$INST/opkg.log")" "--no-luci installs one package"
+
+run_install --server-url http://srv:12450 --token t --ipk-base /tmp/out --wait 0 || true
+check "1" "$(grep -c 'install /tmp/out/nettact-agent.ipk' "$INST/opkg.log")" "local --ipk-base"
+
+# The online check. A live pid plus a connected server is success; the same file
+# naming a dead process is the respawn loop this exists to catch, so it must time
+# out instead of believing it.
+printf '{"schema":1,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
+run_install --server-url http://srv:12450 --token t --wait 9 \
+	&& printf '  ok   %-28s -> connected\n' "status: live pid" \
+	|| { printf '  FAIL %-28s -> not detected\n' "status: live pid"; fail=1; }
+
+dead=4194303
+while kill -0 "$dead" 2>/dev/null; do dead=$(( dead - 1 )); done
+printf '{"schema":1,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connected"}]}\n' "$dead" > "$INST/tmp/status.json"
+run_install --server-url http://srv:12450 --token t --wait 6 \
+	&& { printf '  FAIL %-28s -> reported connected\n' "status: dead pid"; fail=1; } \
+	|| printf '  ok   %-28s -> not connected\n' "status: dead pid"
+
+# A server that is reachable but not connected is not success either.
+printf '{"schema":1,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connecting"}]}\n' "$$" > "$INST/tmp/status.json"
+run_install --server-url http://srv:12450 --token t --wait 6 \
+	&& { printf '  FAIL %-28s -> reported connected\n' "status: connecting" ; fail=1; } \
+	|| printf '  ok   %-28s -> not connected\n' "status: connecting"
+
+rm -f "$INST/tmp/status.json"
+
+# --reinstall: the console mints a token bound to one agent, and the agent
+# prefers a saved credential over any token — so the credential has to go, but
+# only reversibly. Losing a working credential AND its queue because a URL was
+# wrong is not a trade this should ever make.
+cat > "$INST/etc/nettact/data/agent.json" <<'EOF'
+{"v":2,"servers":{"default":{"agent_id":"a","site_id":"s","agent_token":"old"}}}
+EOF
+mkdir -p "$INST/etc/nettact/data/wal" && : > "$INST/etc/nettact/data/wal/seg-1"
+
+run_install --server-url http://srv:12450 --reinstall --wait 0 \
+	&& { printf '  FAIL %-28s -> accepted\n' "--reinstall without a token"; fail=1; } \
+	|| printf '  ok   %-28s -> refused\n' "--reinstall without a token"
+if [ -s "$INST/etc/nettact/data/agent.json" ]; then
+	printf '  ok   %-28s -> untouched\n' "refusal keeps the credential"
+else
+	printf '  FAIL %-28s -> deleted\n' "refusal keeps the credential"; fail=1
+fi
+
+# The safety property is WHEN the wipe happens, not a backup: anything that can
+# still abort — a bad option, a failed uci write — aborts with the working
+# credential untouched, because the wipe is the last thing before the restart.
+rerun_install --server-url http://srv:12450 --token new-tok --reinstall --mode bogus --wait 0 \
+	&& { printf '  FAIL %-28s -> accepted\n' "--reinstall, bad option"; fail=1; } \
+	|| printf '  ok   %-28s -> refused\n' "--reinstall, bad option"
+check "old" "$(sed -n 's/.*"agent_token":"\([^"]*\)".*/\1/p' "$INST/etc/nettact/data/agent.json" 2>/dev/null)" "abort keeps credential"
+[ -e "$INST/etc/nettact/data/wal/seg-1" ] \
+	&& printf '  ok   %-28s -> kept\n' "abort keeps queue" \
+	|| { printf '  FAIL %-28s -> lost\n' "abort keeps queue"; fail=1; }
+
+# Once the service starts the contract is the native installer's: the previous
+# identity is replaced, so the token given here is the one that enrolls.
+printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
+rerun_install --server-url http://srv:12450 --token new-tok --reinstall --wait 9 \
+	&& printf '  ok   %-28s -> connected\n' "--reinstall that connects" \
+	|| { printf '  FAIL %-28s -> failed\n' "--reinstall that connects"; fail=1; }
+[ -e "$INST/etc/nettact/data/agent.json" ] \
+	&& { printf '  FAIL %-28s -> kept\n' "reinstall replaces identity"; fail=1; } \
+	|| printf '  ok   %-28s -> replaced\n' "reinstall replaces identity"
+rm -f "$INST/tmp/status.json"
+
+# `--permissions default` is an explicit reset, not a no-op: the console shows
+# "recommended", so a rerun must land on the built-in grant rather than keep a
+# broader one the router happened to be carrying.
+rerun_install --server-url http://srv:12450 --token t --permissions full --wait 0 || true
+rerun_install --server-url http://srv:12450 --token t --permissions default --wait 0 || true
+check "default" "$(ucival permission_mode)" "--permissions default resets"
+check "" "$(ucival permissions)" "--permissions default clears"
 
 [ "$fail" = 0 ] && echo "all checks passed" || echo "FAILURES" >&2
 exit "$fail"

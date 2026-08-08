@@ -7,6 +7,14 @@ Two ipks, neither containing a compiled binary:
 - **`luci-app-nettact`** — the LuCI pages, their rpcd backend, and the Chinese
   translation. Architecture `all`, depends on `nettact-agent`.
 
+`install.sh` here installs both, writes the connection settings into
+`/etc/config/nettact` and waits until the router reports itself connected — it
+is what the console's OpenWrt tab hands out, served from the branch as
+`https://d.nettact.org/agent/openwrt.sh`. It is a separate script from the
+module's `install.sh` on purpose: that one is bash targeting systemd/launchd and
+wipes the previous identity, both of which are wrong for a router (see the
+header comment).
+
 ## Why nothing is bundled
 
 A full agent is around 11 MB. Shipping it would mean a package per CPU
@@ -111,6 +119,9 @@ luci-app-nettact/
   files/www/luci-static/resources/view/nettact/{status,settings}.js
   po/zh_Hans/nettact.po                 compiled to nettact.zh-cn.lmo
 openwrt.go, permcatalog_test.go         the parity test for permcatalog.js
+install.sh                              one-command installer (both ipks + UCI
+                                        + online check); served as
+                                        d.nettact.org/agent/openwrt.sh
 tools/po2lmo.py                         .po -> .lmo without the OpenWrt SDK
 ```
 

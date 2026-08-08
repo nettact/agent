@@ -49,6 +49,14 @@ func Load(lookup Lookup, file File) (agentrt.Config, error) {
 		cfg.DataDir = v
 	}
 
+	// STATUS_FILE (default off). Off by design: a standalone agent's status
+	// surface is its log, and writing a file nobody reads only costs disk. It is
+	// set by the installs where nothing reads the log — the OpenWrt package
+	// points it at tmpfs so the LuCI page can render the connection state.
+	if v, ok := nonEmpty(lookup, "NETTACT_AGENT_STATUS_FILE", &errs); ok {
+		cfg.StatusFile = v
+	}
+
 	// UPLOAD_INTERVAL (duration, default 30s — the protocol constant, so the
 	// server's StaleAfter fallback and the agent's real cadence stay one value).
 	cfg.UploadInterval = pcfg.DefaultUploadInterval

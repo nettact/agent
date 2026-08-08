@@ -13,6 +13,27 @@ set -e
 
 BIN="$(nettact_bin)"
 
+# 0. Drop the previous process's status file, first thing.
+#
+#    An agent that was killed or crashed never got to remove its own, and procd
+#    reports THIS wrapper as running from the moment it starts — while the waits
+#    below can take ten minutes between them. Without this, the status page
+#    would spend that whole window showing the dead process's last state, and
+#    "Connected" is the most likely thing for it to have been.
+#
+#    A terminal document is the exception, and the only one. The agent writes it
+#    on the way out precisely because it gave up for a reason no retry can fix —
+#    no token, a refused enrollment, a credential it could not save — and it is
+#    then respawned straight back into the same wall. Deleting it here would mean
+#    the one state worth reading is erased seconds after it is written, every
+#    time, and the page would show nothing but startup states forever. It is
+#    replaced by the first real transition once the agent below gets that far.
+states=$(grep -o '"state":"[a-z_]*"' "$NETTACT_STATUS_FILE" 2>/dev/null | wc -l)
+terminals=$(grep -o '"state":"terminal"' "$NETTACT_STATUS_FILE" 2>/dev/null | wc -l)
+if [ "$states" -lt 1 ] || [ "$states" != "$terminals" ]; then
+	rm -f "$NETTACT_STATUS_FILE"
+fi
+
 # 1. A believable clock. Many routers have no RTC and boot in 1970, which makes
 #    every server certificate "not yet valid" and the agent's first TLS dial fail
 #    for a reason that looks nothing like a clock problem. sysntpd (START=98)

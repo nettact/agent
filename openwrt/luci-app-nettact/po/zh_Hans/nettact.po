@@ -518,3 +518,125 @@ msgstr "正在应用…"
 
 msgid "Action failed (exit code %d)."
 msgstr "操作失败（退出码 %d）。"
+
+# --- Server connections (status page) ---------------------------------------
+
+msgid "Server connections"
+msgstr "服务器连接"
+
+msgid "Connected"
+msgstr "已连接"
+
+msgid "Not connected"
+msgstr "未连接"
+
+msgid "Connecting"
+msgstr "连接中"
+
+msgid "Enrolling"
+msgstr "注册中"
+
+msgid "Reason"
+msgstr "原因"
+
+msgid "Pending upload"
+msgstr "待上传"
+
+msgid "Last connected"
+msgstr "上次连接"
+
+msgid "%d entries"
+msgstr "%d 条"
+
+msgid "not since the agent started"
+msgstr "本次启动后尚未连接"
+
+msgid "connecting…"
+msgstr "正在连接…"
+
+msgid "retrying in %ds"
+msgstr "%d 秒后重试"
+
+msgid "for %s"
+msgstr "已持续 %s"
+
+msgid "needs attention — it will not retry on its own"
+msgstr "需要人工处理 —— 它不会自行重试"
+
+msgid "No connection status yet — the agent is starting."
+msgstr "尚无连接状态 —— 探针正在启动。"
+
+msgid "The agent has not refreshed this status for over a minute; it may be stuck."
+msgstr "探针已超过一分钟没有刷新此状态，可能已卡住。"
+
+msgid "%ds"
+msgstr "%d 秒"
+
+msgid "%dm"
+msgstr "%d 分钟"
+
+msgid "%dh %dm"
+msgstr "%d 小时 %d 分钟"
+
+msgid "%dd %dh"
+msgstr "%d 天 %d 小时"
+
+# Failure reasons. The agent reports a stable code; these are what the code
+# means to someone standing in front of the router.
+
+msgid "The server name could not be resolved"
+msgstr "无法解析服务器域名"
+
+msgid "The server refused the connection"
+msgstr "服务器拒绝连接"
+
+msgid "The connection timed out"
+msgstr "连接超时"
+
+msgid "The server certificate has expired, or this router clock is wrong"
+msgstr "服务器证书已过期，也可能是本路由器时钟不正确"
+
+msgid "The server certificate is not trusted"
+msgstr "服务器证书不受信任"
+
+msgid "The server certificate is for a different host name"
+msgstr "服务器证书对应的是另一个主机名"
+
+msgid "The TLS handshake failed"
+msgstr "TLS 握手失败"
+
+msgid "The server rejected this agent credential"
+msgstr "服务器拒绝了本探针的凭据"
+
+msgid "The server stopped acknowledging uploads"
+msgstr "服务器不再确认上传"
+
+msgid "Another agent connected with the same credential"
+msgstr "另一个探针使用相同凭据建立了连接"
+
+msgid "The server does not support this agent version"
+msgstr "服务器不支持此探针版本"
+
+msgid "This agent was deleted on the server"
+msgstr "此探针已在服务器上被删除"
+
+msgid "The server could not be reached"
+msgstr "无法连接到服务器"
+
+msgid "No enrollment token — enroll this router first"
+msgstr "没有注册令牌 —— 请先注册本路由器"
+
+msgid "The server refused the enrollment token"
+msgstr "服务器拒绝了注册令牌"
+
+msgid "Enrolled, but the credential could not be saved — check free space on the router"
+msgstr "注册成功，但凭据没能保存下来 —— 请检查路由器的可用空间"
+
+msgid "The agent stopped talking to this server"
+msgstr "探针已停止与此服务器通信"
+
+msgid "Unknown"
+msgstr "未知"
+
+msgid "last reported %s, %s ago"
+msgstr "最后一次报告是「%s」，在 %s 之前"

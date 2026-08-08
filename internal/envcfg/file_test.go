@@ -76,6 +76,41 @@ max_probe_concurrency: 32
 	}
 }
 
+// TestFileStatusFileLayersLikeAnyOtherScalar: the status file is a deployment
+// concern, so the OpenWrt package sets it in the environment while the user's
+// config file may or may not mention it. Both paths must reach Config, with the
+// file winning — the same precedence as every other key.
+func TestFileStatusFileLayersLikeAnyOtherScalar(t *testing.T) {
+	env := map[string]string{
+		"NETTACT_AGENT_SERVER_URL":  "https://server.example",
+		"NETTACT_AGENT_STATUS_FILE": "/tmp/nettact/status.json",
+	}
+	cfg, err := loadLayered(t, "# no keys\n", env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StatusFile != "/tmp/nettact/status.json" {
+		t.Errorf("StatusFile = %q, want the environment value", cfg.StatusFile)
+	}
+
+	cfg, err = loadLayered(t, "server_url: https://server.example\nstatus_file: /run/nettact/status.json\n", env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StatusFile != "/run/nettact/status.json" {
+		t.Errorf("StatusFile = %q, want the file value to win", cfg.StatusFile)
+	}
+
+	// Unset is the default, and the default is off.
+	cfg, err = loadLayered(t, "server_url: https://server.example\n", nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StatusFile != "" {
+		t.Errorf("StatusFile = %q with nothing configured, want off", cfg.StatusFile)
+	}
+}
+
 func TestEmptyFileIsPureEnv(t *testing.T) {
 	file, err := LoadFile(writeYAML(t, "# just a comment, no keys\n"))
 	if err != nil {

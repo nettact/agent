@@ -29,6 +29,18 @@ server_url: http://host:12450
 # Agent state directory (holds agent.key, agent.json, wal/). Default ./agent-data.
 #data_dir: ./agent-data
 
+# Write a JSON connection-status file here: per server, whether the session is
+# live, why it is not, when the next attempt is due, and how many entries are
+# waiting to upload. Default: off — the agent's log already says all of this, and
+# this exists for supervised installs where nobody reads the log (the OpenWrt
+# package points it at tmpfs and renders it in LuCI).
+#
+# It is rewritten on every reconnect attempt, so put it on a memory-backed
+# filesystem where flash wear matters. It is removed on a clean exit; a file left
+# behind means the agent did not exit cleanly, so treat it as live status only
+# while the process is running.
+#status_file: /run/nettact/status.json
+
 # Skip TLS verification — LAN self-signed servers only. Default false.
 #tls_insecure: false
 
