@@ -200,8 +200,13 @@ func icmpProbe(_ context.Context, dest netip.Addr, _ int, ttl int, timeout time.
 const ipTTL = 4
 
 // wsaeConnRefused is WSAECONNREFUSED — a destination RST, which for TCP
-// traceroute still means the destination was reached.
-const wsaeConnRefused = windows.Errno(10061)
+// traceroute still means the destination was reached. wsaeNetDown is
+// WSAENETDOWN — the local network subsystem has failed, which no remote router
+// can report, so it is unambiguously a local send failure.
+const (
+	wsaeConnRefused = windows.Errno(10061)
+	wsaeNetDown     = windows.Errno(10050)
+)
 
 // tcpProbe runs one TTL-aware TCP probe. It sets IP_TTL on a connect socket and,
 // on a raw ICMP socket, watches for a Time-Exceeded whose quoted TCP header
@@ -255,13 +260,15 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 	// destination answering. It stays blocked on other outcomes until the socket
 	// is closed below, which unblocks it with an error (no result).
 	//
-	// No routing errno is classified here, unlike the unix path. There the check
-	// sits on a NON-BLOCKING connect that returns before a SYN could leave, so
-	// ENETUNREACH can only be the local routing decision. This connect blocks:
-	// when a router on the path answers the SYN with an ICMP unreachable,
-	// Winsock surfaces it as WSAENETUNREACH / WSAEHOSTUNREACH on this call, and
-	// nothing in the errno says which of the two happened. Only the raw socket
-	// knows, because it has the responder's address (see isLocalAddr below).
+	// WSAENETUNREACH / WSAEHOSTUNREACH are deliberately NOT classified here,
+	// unlike the unix path. There the check sits on a NON-BLOCKING connect that
+	// returns before a SYN could leave, so the errno can only be the local
+	// routing decision. This connect blocks: when a router on the path answers
+	// the SYN with an ICMP unreachable, Winsock surfaces it as one of those two,
+	// and nothing in the errno says which of the two happened. Only the raw
+	// socket knows, because it has the responder's address (see isLocalAddr).
+	// WSAENETDOWN carries no such ambiguity — a failed network subsystem is never
+	// something a remote router reported — so it stays.
 	go func() {
 		cerr := windows.Connect(tcp, &windows.SockaddrInet4{Addr: ip4, Port: port})
 		rtt := float64(time.Since(start).Microseconds()) / 1000.0
@@ -270,9 +277,15 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 			return
 		}
 		var errno windows.Errno
-		if errors.As(cerr, &errno) && errno == wsaeConnRefused {
-			connCh <- probeOutcome{responder: dest, reached: true, rttMs: rtt}
-			return
+		if errors.As(cerr, &errno) {
+			switch errno {
+			case wsaeConnRefused:
+				connCh <- probeOutcome{responder: dest, reached: true, rttMs: rtt}
+				return
+			case wsaeNetDown:
+				connCh <- probeOutcome{localUnreachable: true}
+				return
+			}
 		}
 		connCh <- probeOutcome{} // no usable result
 	}()
@@ -284,6 +297,16 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 		for {
 			n, from, rerr := windows.Recvfrom(raw, buf, 0)
 			if rerr != nil {
+				// Normally this is the deferred close unblocking us, which says
+				// nothing about the path. WSAENETDOWN does say something, and it
+				// can surface on either socket: classify it here the same way the
+				// connect side does, so which of the two racing goroutines noticed
+				// the failed subsystem first cannot change the verdict.
+				var errno windows.Errno
+				if errors.As(rerr, &errno) && errno == wsaeNetDown {
+					icmpCh <- probeOutcome{localUnreachable: true}
+					return
+				}
 				icmpCh <- probeOutcome{}
 				return
 			}
@@ -306,14 +329,22 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 	var out probeOutcome
 	select {
 	case o := <-connCh:
-		if o.reached {
+		if o.reached || o.localUnreachable {
 			out = o
 		} else {
-			// Connect gave no clear reach; prefer an ICMP responder if one is ready.
+			// Connect gave no clear verdict, so the raw socket is the only thing
+			// that can name the responder — and, since this connect blocks, the
+			// only thing that can tell a router's unreachable from this host's own.
+			// Wait for it on the same budget rather than polling once: Winsock can
+			// wake Connect with the very ICMP the capture goroutine is still
+			// parsing, and giving up in that instant discards a real responder
+			// nondeterministically.
 			select {
 			case oi := <-icmpCh:
 				out = pickResponder(oi)
-			default:
+			case <-timer.C:
+				out = probeOutcome{timeout: true}
+			case <-ctx.Done():
 				out = probeOutcome{timeout: true}
 			}
 		}
