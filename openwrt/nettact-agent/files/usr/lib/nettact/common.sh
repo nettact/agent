@@ -124,3 +124,124 @@ nettact_err() {
 	logger -t nettact -p daemon.err -- "$@"
 	echo "$@" >&2
 }
+
+# --- automatic binary updates ------------------------------------------------
+
+# The crontab line update.sh runs from, and the marker that identifies it. The
+# marker is what makes the line ours to rewrite or remove without touching
+# whatever else the owner has in root's crontab. The path is overridable only so
+# the offline test harness can point it somewhere hermetic.
+NETTACT_CRONTAB="${NETTACT_CRONTAB:-/etc/crontabs/root}"
+NETTACT_CRON_MARK='# nettact-auto-update'
+
+# nettact_update_hhmm — the daily update time for THIS router, as "minute hour".
+#
+# Spread across 02:00–04:59 rather than fixed, for the same reason the server's
+# updater bakes a random time in that window: a fleet on one schedule arrives at
+# the download source as a spike, and 03:00 sharp is when everything else on a
+# router is already running. Derived from the first MAC address (hostname, then
+# a constant, as fallbacks) instead of $RANDOM so it is STABLE: a value re-rolled
+# at every service start would move the job around and, worse, rewrite the
+# crontab on every boot.
+nettact_update_hhmm() {
+	local seed n
+	seed="$(cat /sys/class/net/*/address 2>/dev/null | grep -v '^00:00:00:00:00:00$' | head -n 1)"
+	# `|| true` on each fallback, and it is load-bearing rather than defensive.
+	# An assignment takes the exit status of its command substitution, and as the
+	# right operand of `||` that status is NOT exempt from `set -e` — so on a
+	# device with no readable MAC, `uci` exiting 1 (no such option) aborts this
+	# function halfway. It then returns an EMPTY string, and the caller writes a
+	# crontab line with no minute and no hour:
+	#
+	#     " * * * /usr/lib/nettact/update.sh # nettact-auto-update"
+	#
+	# cron rejects that, so automatic updates silently never run and nothing
+	# anywhere says why. launch.sh and the init script both run under `set -e`,
+	# which is exactly where this would have bitten.
+	[ -n "$seed" ] || seed="$(uci -q get system.@system[0].hostname 2>/dev/null)" || true
+	[ -n "$seed" ] || seed=nettact
+	n="$(printf '%s' "$seed" | md5sum | tr -dc '0-9' | cut -c1-6)" || true
+	[ -n "$n" ] || n=137
+	# Strip leading zeros before any arithmetic. POSIX `$((...))` reads a leading
+	# zero as OCTAL, so a digest whose first six digits are e.g. 089123 is not a
+	# large number here — it is a syntax error ("value too great for base"), which
+	# aborts the command substitution and returns an EMPTY string. The caller then
+	# writes a crontab line whose minute and hour fields are simply missing, cron
+	# rejects the malformed entry, and automatic updates never run on that router
+	# with nothing anywhere saying why. Which routers were affected depended on
+	# their MAC, so it would have looked random.
+	#
+	# ${n#"${n%%[!0]*}"} removes the run of leading zeros; the || guards the case
+	# where every digit was zero and the strip leaves nothing.
+	n="${n#"${n%%[!0]*}"}"
+	[ -n "$n" ] || n=137
+	printf '%d %d' "$((n % 60))" "$((2 + (n / 60) % 3))"
+}
+
+# nettact_cron_lines_without_ours prints the crontab with our line removed.
+nettact_cron_lines_without_ours() {
+	[ -f "$NETTACT_CRONTAB" ] || return 0
+	grep -v -- "$NETTACT_CRON_MARK" "$NETTACT_CRONTAB" 2>/dev/null || true
+}
+
+# nettact_write_cron makes our line in root's crontab exactly $1 (empty removes
+# it), and does nothing at all when it already is.
+#
+# That last part is not an optimisation: the crontab lives on the overlay, and a
+# rewrite on every service start would spend flash erase cycles to change
+# nothing. It is also why the init script syncs on start only — a stop/start pair
+# that removed the line and put it straight back would write twice per restart.
+#
+# Never fatal. A read-only overlay or a missing /etc/crontabs is a reason to log
+# and carry on starting the agent, not to fail the service over its update job.
+nettact_write_cron() {
+	local want="$1" current tmp
+	current="$(grep -- "$NETTACT_CRON_MARK" "$NETTACT_CRONTAB" 2>/dev/null || true)"
+	[ "$current" = "$want" ] && return 0
+
+	mkdir -p "$(dirname "$NETTACT_CRONTAB")" 2>/dev/null || true
+	tmp="$NETTACT_CRONTAB.nettact.tmp"
+	# `if` rather than `[ -n "$want" ] && printf`: a group's exit status is its
+	# LAST command's, so the short-circuit form reports failure whenever $want is
+	# empty — which is exactly the removal case, and it would take the removal
+	# with it. The write it is guarding is the redirection, not the printf.
+	{
+		nettact_cron_lines_without_ours
+		if [ -n "$want" ]; then printf '%s\n' "$want"; fi
+	} > "$tmp" 2>/dev/null || {
+		rm -f "$tmp" 2>/dev/null || true
+		nettact_err "could not write $tmp (automatic updates unchanged)"
+		return 0
+	}
+	if ! mv -f "$tmp" "$NETTACT_CRONTAB" 2>/dev/null; then
+		rm -f "$tmp" 2>/dev/null || true
+		nettact_err "could not update $NETTACT_CRONTAB (automatic updates unchanged)"
+		return 0
+	fi
+
+	if [ -n "$want" ]; then
+		nettact_log "automatic agent updates on: $want"
+	else
+		nettact_log "automatic agent updates off; cron entry removed"
+	fi
+	# busybox crond notices the file on its own within a minute; reloading only
+	# when we actually wrote keeps the unchanged path free of side effects.
+	/etc/init.d/cron reload >/dev/null 2>&1 || /etc/init.d/cron restart >/dev/null 2>&1 || true
+	return 0
+}
+
+# nettact_sync_cron makes the update job match UCI: present when the service is
+# enabled AND auto_update is on, absent otherwise.
+nettact_sync_cron() {
+	if [ "$(nettact_cfg enabled 0)" = 1 ] && [ "$(nettact_cfg auto_update 0)" = 1 ]; then
+		nettact_write_cron "$(nettact_update_hhmm) * * * /usr/lib/nettact/update.sh $NETTACT_CRON_MARK"
+	else
+		nettact_write_cron ""
+	fi
+}
+
+# nettact_remove_cron drops the job regardless of UCI — for package removal,
+# where update.sh is about to stop existing.
+nettact_remove_cron() {
+	nettact_write_cron ""
+}

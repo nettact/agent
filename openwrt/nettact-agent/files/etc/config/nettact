@@ -153,6 +153,20 @@ config nettact 'main'
 	# 'latest', or a pinned release tag such as v1.2.3.
 	option version 'latest'
 
+	# Check once a day for a newer agent binary, install it and restart the
+	# service. This is the router's version of what `--auto-update` sets up on a
+	# Linux or macOS host. Off by default: a router updates itself only when its
+	# owner says so.
+	#
+	# The check runs at a fixed time between 02:00 and 05:00, derived from this
+	# device's MAC address — so it does not move around between reboots, and a
+	# fleet of routers does not arrive at the download source all at once.
+	#
+	# Ignored while 'version' above is pinned to a release: a pin means stay
+	# there. In 'ram' mode the binary is re-downloaded at every boot anyway, so
+	# this mostly matters for routers that stay up for months, and for 'flash'.
+	option auto_update '0'
+
 # --- Reporting to more than one server ---------------------------------------
 #
 # Used only when server_mode is 'multi'. One agent can report to several servers

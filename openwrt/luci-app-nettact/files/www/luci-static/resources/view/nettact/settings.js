@@ -378,6 +378,11 @@ return view.extend({
 		}
 		o.default = 'latest';
 
+		o = s.option(form.Flag, 'auto_update', _('Automatic updates'),
+			_('Check once a day for a newer agent and install it, restarting the service only when the binary actually changed. The check runs at a fixed time between 02:00 and 05:00 derived from this router's MAC address, so a fleet does not hit the download source at once. Ignored while a specific version is pinned above.'));
+		o.default = '0';
+		o.rmempty = false;
+
 		// --- Servers ---------------------------------------------------------
 
 		s = m.section(form.TypedSection, 'server', _('Servers'),

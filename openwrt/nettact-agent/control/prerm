@@ -24,6 +24,13 @@ fi
 /etc/init.d/nettact stop 2>/dev/null
 /etc/init.d/nettact disable 2>/dev/null
 
+# The update job points at a script this removal is about to delete, so it goes
+# with the package rather than failing in cron every night from here on.
+if [ -r /usr/lib/nettact/common.sh ]; then
+	. /usr/lib/nettact/common.sh
+	nettact_remove_cron 2>/dev/null
+fi
+
 # The downloaded binary is not owned by the package (it was fetched, not
 # installed), so opkg will not remove it. The rendered config is not owned
 # either, and it holds a copy of the enrollment token.

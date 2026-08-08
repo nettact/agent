@@ -90,6 +90,7 @@ build_one() {
 		"$stage/data/usr/lib/nettact/fetch.sh" \
 		"$stage/data/usr/lib/nettact/genconfig.sh" \
 		"$stage/data/usr/lib/nettact/launch.sh" \
+		"$stage/data/usr/lib/nettact/update.sh" \
 		"$stage/data/usr/libexec/rpcd/luci.nettact"
 	do
 		[ -f "$f" ] && chmod 0755 "$f"

@@ -371,6 +371,20 @@ msgstr "版本"
 msgid "Pin a release, or track the newest one."
 msgstr "锁定某个版本，或始终跟随最新版本。"
 
+msgid "Automatic updates"
+msgstr "自动更新"
+
+msgid ""
+"Check once a day for a newer agent and install it, restarting the service "
+"only when the binary actually changed. The check runs at a fixed time "
+"between 02:00 and 05:00 derived from this router's MAC address, so a fleet "
+"does not hit the download source at once. Ignored while a specific version "
+"is pinned above."
+msgstr ""
+"每天检查一次是否有更新的 Agent，有就装上；只有二进制确实变了才重启服务。检查时"
+"间取自本路由器 MAC 地址，固定落在 02:00–05:00 之间，这样一批路由器不会同时压向"
+"下载源。上面锁定了具体版本时本项无效。"
+
 msgid "Latest (%s)"
 msgstr "最新版（%s）"
 

@@ -699,6 +699,17 @@ printf '%s\n' "\$1" >> "$INST/init.log"
 exit 0
 EOF
 
+# A recording fetch.sh. The real one downloads ~11 MB, verifies it and replaces
+# the binary; what the installer's contract needs asserting is only that it is
+# CALLED on every run, with the version asked for, before the service starts.
+# T_FETCH_FAIL turns it into the unreachable-mirror case.
+cat > "$INST/bin/nettact-fetch" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$INST/fetch.log"
+[ -n "\${T_FETCH_FAIL:-}" ] && exit 1
+exit 0
+EOF
+
 # Root is asserted, not assumed, so the test has to answer for it.
 cat > "$INST/bin/id" <<'EOF'
 #!/bin/sh
@@ -747,23 +758,35 @@ INSTALLER="$INST/install.sh"
 # own copy of that path and the fake root has to reach it.
 sed -e "s#^\. /usr/lib/nettact/common.sh#. $INST/common.sh#" \
     -e "s#^DATA_DIR=/etc/nettact/data#DATA_DIR=$INST/etc/nettact/data#" \
+    -e "s#/usr/lib/nettact/fetch.sh#$INST/bin/nettact-fetch#g" \
     -e "s#/etc/init.d/nettact#$INST/bin/nettact-init#g" \
     "$HERE/install.sh" > "$INSTALLER"
 chmod 0755 "$INSTALLER" "$INST/bin"/*
 
 # run_install [args...] — a clean run against the fake root; exit status kept.
 run_install() {
-	rm -f "$INST/uci.state" "$INST/uci.log" "$INST/opkg.log" "$INST/init.log"
+	rm -f "$INST/uci.state" "$INST/uci.log" "$INST/opkg.log" "$INST/init.log" "$INST/fetch.log"
 	PATH="$INST/bin:$PATH" sh "$INSTALLER" "$@" >"$INST/out" 2>&1
 }
 
 # rerun_install — same, keeping whatever state the previous run left.
 rerun_install() {
-	rm -f "$INST/opkg.log" "$INST/init.log"
+	rm -f "$INST/opkg.log" "$INST/init.log" "$INST/fetch.log"
 	PATH="$INST/bin:$PATH" sh "$INSTALLER" "$@" >"$INST/out" 2>&1
 }
 
 ucival() { sed -n "s/^nettact\.main\.$1=//p" "$INST/uci.state" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'; }
+
+# initlog — the service actions this run took, space-separated, and empty when the
+# run never got as far as touching the service. A missing file is a real expected
+# outcome (a refusal exits before the service is started), and it has to be tested
+# for rather than redirected away: the shell reports a failed `< file` itself,
+# before the command's own `2>/dev/null` is in effect, so the error would land in
+# the middle of the results either way.
+initlog() {
+	[ -f "$INST/init.log" ] || return 0
+	tr '\n' ' ' < "$INST/init.log" | sed 's/ *$//'
+}
 
 # Refusals. Each of these would otherwise be discovered by the agent at startup,
 # on a router whose owner is looking at a LuCI page that says "not running".
@@ -786,6 +809,9 @@ run_install --server-url http://s:1 --wait 0 && check "exit!=0" "exit=0" "no tok
 # …and refused before anything is installed. Reaching that verdict after two
 # opkg installs leaves a fresh router carrying packages it never got to use.
 check "0" "$(grep -c '\.ipk' "$INST/opkg.log" 2>/dev/null || echo 0)" "refusal installs nothing"
+# Nor downloaded: an 11 MB fetch onto a router that is about to be told its
+# options are wrong wastes the one resource a slow uplink cannot spare.
+check "0" "$(grep -c '^install' "$INST/fetch.log" 2>/dev/null || echo 0)" "refusal fetches nothing"
 
 # A credential file is not the same thing as a credential for THIS install.
 # Single mode enrolls under the name `default`; a router coming off multi-server
@@ -848,6 +874,72 @@ fi
 rerun_install --server-url http://srv:12450 --token tok-2 --permissions 'probe.http' --wait 0 || true
 check "probe.http" "$(ucival permissions)" "permissions replaced"
 check "custom" "$(ucival permission_mode)" "permission_mode kept"
+
+# The binary is refreshed on EVERY run, not only when one is missing. launch.sh
+# asks whether a binary exists and never which version it is, so a router that
+# downloaded the agent before a release would otherwise keep running the old one
+# until it rebooted — in flash mode, indefinitely. Re-running the installer is
+# the documented upgrade path, so a re-run that skipped the download would make
+# the upgrade silently do nothing. A real router failed exactly this way.
+check "1" "$(grep -c '^install' "$INST/fetch.log" 2>/dev/null || echo 0)" "re-run refreshes binary"
+
+# …and before the service starts, or procd would exec the old binary and the new
+# one would sit unused until something restarted it again. Asserted on the
+# installer's own output rather than on file mtimes: both stub logs are written
+# within the same second, and `-ot` has one-second granularity, so an mtime
+# comparison would hold just as well with the two steps in the wrong order.
+rerun_install --server-url http://srv:12450 --token tok-2b --wait 0 || true
+refresh_at="$(grep -n 'refreshing the agent binary' "$INST/out" | head -n 1 | cut -d: -f1)"
+start_at="$(grep -n 'starting the service' "$INST/out" | head -n 1 | cut -d: -f1)"
+if [ -n "$refresh_at" ] && [ -n "$start_at" ] && [ "$refresh_at" -lt "$start_at" ]; then
+	printf '  ok   %-28s -> line %s before %s\n' "refresh precedes start" "$refresh_at" "$start_at"
+else
+	printf '  FAIL %-28s -> refresh@%s start@%s\n' "refresh precedes start" "${refresh_at:-none}" "${start_at:-none}"
+	fail=1
+fi
+
+# A pinned --version is what gets fetched. Passing the tag through matters most
+# for the opposite of an upgrade: pinning a router BACK to a known-good release.
+rerun_install --server-url http://srv:12450 --token tok-2c --version v0.3.1 --wait 0 || true
+check "install v0.3.1" "$(tr -d '\n' < "$INST/fetch.log")" "--version reaches fetch"
+
+# An unreachable mirror with a usable binary already present finishes and warns:
+# the usual cause is a brief network failure, and refusing to complete a re-run
+# meant to change a permission would be its own kind of broken.
+#
+# The stub binary gets a shebang rather than being an empty file, and that is not
+# cosmetic: on Git Bash (which CI and most developers run this on) `chmod 0755`
+# leaves an EMPTY file non-executable, so `[ -x ]` in the installer would answer
+# false and this would test the fallback path instead of the one it names. On
+# BusyBox either file works. It is the divergence this script's header warns
+# about, caught here rather than on a router.
+mkdir -p "$INST/tmp/nettact"
+printf '#!/bin/sh\nexit 0\n' > "$INST/tmp/nettact/nettact-agent"
+chmod 0755 "$INST/tmp/nettact/nettact-agent"
+if T_FETCH_FAIL=1 rerun_install --server-url http://srv:12450 --token tok-2d --mode ram --wait 0; then
+	if grep -q 'could not refresh' "$INST/out"; then
+		printf '  ok   %-28s -> warned, continued\n' "fetch fails, binary present"
+	else
+		printf '  FAIL %-28s -> continued silently\n' "fetch fails, binary present"
+		fail=1
+	fi
+else
+	printf '  FAIL %-28s -> refused\n' "fetch fails, binary present"
+	fail=1
+fi
+check "enable restart" "$(initlog)" "…and still starts"
+
+# With nothing to fall back on it is fatal, and fatal BEFORE the wait: the
+# alternative is three minutes of "waiting for the agent to start" on a router
+# that has no agent to start.
+rm -f "$INST/tmp/nettact/nettact-agent"
+if T_FETCH_FAIL=1 rerun_install --server-url http://srv:12450 --token tok-2e --mode ram --wait 0; then
+	printf '  FAIL %-28s -> reported success\n' "fetch fails, no binary"
+	fail=1
+else
+	printf '  ok   %-28s -> refused\n' "fetch fails, no binary"
+fi
+check "" "$(initlog)" "…and never starts"
 
 # "none" is a grant, not an absence: it must not leave a stale custom list behind.
 rerun_install --server-url http://srv:12450 --token tok-3 --permissions none --wait 0 || true
@@ -923,6 +1015,23 @@ check "old" "$(sed -n 's/.*"agent_token":"\([^"]*\)".*/\1/p' "$INST/etc/nettact/
 	&& printf '  ok   %-28s -> kept\n' "abort keeps queue" \
 	|| { printf '  FAIL %-28s -> lost\n' "abort keeps queue"; fail=1; }
 
+# The same promise has to survive the step that was added last: the binary refresh
+# sits between the config write and the wipe, so a router that cannot download —
+# with nothing to fall back on — must still abort holding its old credential. Had
+# the refresh gone in AFTER the wipe, this exact case would have discarded a
+# working identity in exchange for an agent that cannot run.
+rm -f "$INST/tmp/nettact/nettact-agent" "$INST/usr/lib/nettact/nettact-agent"
+if T_FETCH_FAIL=1 rerun_install --server-url http://srv:12450 --token new-tok --reinstall --mode ram --wait 0; then
+	printf '  FAIL %-28s -> accepted\n' "reinstall, fetch fails"
+	fail=1
+else
+	printf '  ok   %-28s -> refused\n' "reinstall, fetch fails"
+fi
+check "old" "$(sed -n 's/.*"agent_token":"\([^"]*\)".*/\1/p' "$INST/etc/nettact/data/agent.json" 2>/dev/null)" "…credential survives"
+[ -e "$INST/etc/nettact/data/wal/seg-1" ] \
+	&& printf '  ok   %-28s -> kept\n' "…queue survives" \
+	|| { printf '  FAIL %-28s -> lost\n' "…queue survives"; fail=1; }
+
 # Once the service starts the contract is the native installer's: the previous
 # identity is replaced, so the token given here is the one that enrolls.
 printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
@@ -941,6 +1050,122 @@ rerun_install --server-url http://srv:12450 --token t --permissions full --wait 
 rerun_install --server-url http://srv:12450 --token t --permissions default --wait 0 || true
 check "default" "$(ucival permission_mode)" "--permissions default resets"
 check "" "$(ucival permissions)" "--permissions default clears"
+
+# --- automatic-update cron sync ----------------------------------------------
+#
+# The crontab lives on the overlay, so the interesting properties are not just
+# "the line appears" but also "nothing else in it is touched" and "an unchanged
+# state writes nothing at all". A rewrite per boot would spend flash erase cycles
+# to change nothing, and that is invisible on a developer's machine.
+
+CRONDIR="$STUB/cron"
+mkdir -p "$CRONDIR"
+NETTACT_CRONTAB="$CRONDIR/root"
+export NETTACT_CRONTAB
+# common.sh reads the path through the environment, so it has to be sourced again
+# now that one is set — the earlier source above baked in the default.
+. "$HERE/nettact-agent/files/usr/lib/nettact/common.sh"
+
+# A crontab the router's owner already has entries in. Ours must land beside
+# them and leave them alone.
+printf '%s
+' '0 5 * * * /usr/bin/something-else' > "$NETTACT_CRONTAB"
+
+# `grep -c` already prints 0 when it matches nothing — and exits 1 doing it, so
+# the `|| echo 0` idiom used elsewhere in this file would print a SECOND zero
+# here (that one guards a file that may not exist at all, where grep prints
+# nothing). Only the missing-file case needs a substitute.
+cronline() {
+	[ -f "$NETTACT_CRONTAB" ] || { echo 0; return 0; }
+	grep -c -- 'nettact-auto-update' "$NETTACT_CRONTAB" 2>/dev/null || true
+}
+
+T_UCI='nettact.main.enabled=1
+nettact.main.auto_update=1' nettact_sync_cron
+check "1" "$(cronline)" "cron added when on"
+check "1" "$(grep -c 'something-else' "$NETTACT_CRONTAB")" "other entries kept"
+check "1" "$(grep -c '/usr/lib/nettact/update.sh' "$NETTACT_CRONTAB")" "cron runs update.sh"
+
+# The time must sit in the 02:00–04:59 window and stay put across calls: a value
+# re-rolled per start would move the job and rewrite the crontab every boot.
+hh="$(awk '/nettact-auto-update/ {print $2}' "$NETTACT_CRONTAB")"
+mm="$(awk '/nettact-auto-update/ {print $1}' "$NETTACT_CRONTAB")"
+case "$hh" in 2|3|4) printf '  ok   %-28s -> %s
+' "cron hour in 02-04" "$hh" ;;
+	*) printf '  FAIL %-28s -> %s
+' "cron hour in 02-04" "$hh"; fail=1 ;;
+esac
+case "$mm" in ''|*[!0-9]*) printf '  FAIL %-28s -> %s
+' "cron minute numeric" "$mm"; fail=1 ;;
+	*) [ "$mm" -lt 60 ] && printf '  ok   %-28s -> %s
+' "cron minute numeric" "$mm" 		|| { printf '  FAIL %-28s -> %s
+' "cron minute numeric" "$mm"; fail=1; } ;;
+esac
+
+# Two separate ways this function has produced an EMPTY time, both of which end
+# with cron silently never running the update job:
+#
+#   1. `set -e` plus a failing fallback. An assignment takes its command
+#      substitution's exit status, and as the right operand of `||` that status is
+#      NOT exempt — so on a device with no readable MAC, `uci` exiting 1 aborted
+#      the function halfway. launch.sh and the init script both run under set -e.
+#   2. Octal. The seed is six DECIMAL digits, and `$((089123))` is not a big
+#      number, it is "value too great for base" — a syntax error that kills the
+#      substitution.
+#
+# Driven through the REAL function under `set -e`, not a copy of its arithmetic:
+# an inline re-implementation is what let case 1 pass a green suite while the
+# shipped code was broken.
+echo "cron time derivation:"
+hhmm_out="$(nettact_update_hhmm)" || hhmm_out=""
+set -- $hhmm_out
+if [ $# -eq 2 ] && [ "$1" -lt 60 ] && [ "$2" -ge 2 ] && [ "$2" -le 4 ]; then
+	printf '  ok   %-28s -> %s\n' "hhmm under set -e" "$hhmm_out"
+else
+	printf '  FAIL %-28s -> %s\n' "hhmm under set -e" "'$hhmm_out'"; fail=1
+fi
+
+# The octal halves of the same guard, fed the digit shapes a digest can take.
+for digits in 796206 089123 012345 000123 000000 099999; do
+	n="$digits"
+	n="${n#"${n%%[!0]*}"}"
+	[ -n "$n" ] || n=137
+	if out="$( (printf '%d %d' "$((n % 60))" "$((2 + (n / 60) % 3))") 2>&1 )"; then
+		set -- $out
+		if [ "$1" -lt 60 ] && [ "$2" -ge 2 ] && [ "$2" -le 4 ]; then
+			printf '  ok   %-28s -> %s\n' "digits $digits" "$out"
+		else
+			printf '  FAIL %-28s -> %s (out of range)\n' "digits $digits" "$out"; fail=1
+		fi
+	else
+		printf '  FAIL %-28s -> arithmetic failed: %s\n' "digits $digits" "$out"; fail=1
+	fi
+done
+
+before="$(cat "$NETTACT_CRONTAB")"
+T_UCI='nettact.main.enabled=1
+nettact.main.auto_update=1' nettact_sync_cron
+check "$before" "$(cat "$NETTACT_CRONTAB")" "no-op sync rewrites nothing"
+
+# Off, and off by way of the master switch: both must remove the entry, or a
+# disabled agent keeps downloading new binaries for itself every night.
+T_UCI='nettact.main.enabled=1
+nettact.main.auto_update=0' nettact_sync_cron
+check "0" "$(cronline)" "cron removed when off"
+check "1" "$(grep -c 'something-else' "$NETTACT_CRONTAB")" "removal keeps other entries"
+
+T_UCI='nettact.main.enabled=1
+nettact.main.auto_update=1' nettact_sync_cron
+T_UCI='nettact.main.enabled=0
+nettact.main.auto_update=1' nettact_sync_cron
+check "0" "$(cronline)" "cron removed when disabled"
+
+# Package removal drops it regardless of what UCI still says.
+T_UCI='nettact.main.enabled=1
+nettact.main.auto_update=1' nettact_sync_cron
+T_UCI='nettact.main.enabled=1
+nettact.main.auto_update=1' nettact_remove_cron
+check "0" "$(cronline)" "remove_cron ignores UCI"
 
 [ "$fail" = 0 ] && echo "all checks passed" || echo "FAILURES" >&2
 exit "$fail"

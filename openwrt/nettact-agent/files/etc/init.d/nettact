@@ -14,6 +14,14 @@ start_service() {
 
 	config_load nettact
 	config_get_bool enabled main enabled 0
+
+	# Synced here, before the enabled check below returns: switching the service
+	# off has to take its update job with it. Only on start, never on stop — a
+	# restart would otherwise rewrite the crontab twice for no net change, and it
+	# lives on the overlay. A service that is merely stopped keeps the entry, and
+	# update.sh does nothing while it is not running.
+	nettact_sync_cron
+
 	if [ "$enabled" != 1 ]; then
 		return 0
 	fi

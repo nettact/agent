@@ -24,11 +24,14 @@ MODE=""
 VERSION=""
 DOWNLOAD_BASE=""
 TLS_INSECURE=false
+AUTO_UPDATE=false
 WITH_LUCI=true
 REINSTALL=false
-# The window has to outlast a first start in RAM mode, which downloads ~11 MB
-# over whatever uplink this router has before the agent has run at all. The
-# native installer's 75s would report a perfectly healthy install as a failure.
+# The download is no longer inside this window — the binary is fetched
+# synchronously below, before the service starts — so this covers enrollment and
+# the first connection only. Still generous rather than tight: launch.sh blocks
+# on a plausible clock and a default route before the agent runs at all, and on a
+# router that has just come up both can take a while.
 WAIT_SECONDS=180
 
 usage() {
@@ -43,6 +46,10 @@ settings into /etc/config/nettact, starts the service, and waits until the
 router reports itself connected. Re-running it is safe: the agent's identity in
 /etc/nettact/data is never touched, so an already-enrolled router keeps its
 credential and does not need a token.
+
+Every run also refreshes the agent binary to the configured version, so
+re-running this is how a router is upgraded — and why a router that has been
+running an older agent does not stay on it.
 
 Options:
   --token-file <path>  Read the one-time token from a file instead of the
@@ -59,6 +66,13 @@ Options:
                        downloads it once to /usr/lib/nettact and needs ~12 MB
                        free on the overlay but boots offline.
   --version <tag>      Pin the agent binary to a release tag (default: latest).
+  --auto-update        Check daily for a newer agent binary and install it,
+                       restarting the service only when it actually changed.
+                       The check runs at a fixed time between 02:00 and 05:00
+                       derived from this router's MAC address. Cannot be
+                       combined with a pinned --version. Off unless this option
+                       is on THIS command line: re-running without it turns
+                       automatic updates back off.
   --download-base <url>
                        Where the agent BINARY is fetched from; point it at a
                        local mirror to keep the router off the internet.
@@ -101,6 +115,7 @@ while [ $# -gt 0 ]; do
 		--download-base) DOWNLOAD_BASE="${2:?--download-base needs a value}"; shift 2 ;;
 		--ipk-base) IPK_BASE="${2:?--ipk-base needs a value}"; shift 2 ;;
 		--tls-insecure) TLS_INSECURE=true; shift ;;
+		--auto-update) AUTO_UPDATE=true; shift ;;
 		--no-luci) WITH_LUCI=false; shift ;;
 		--reinstall) REINSTALL=true; shift ;;
 		--wait) WAIT_SECONDS="${2:?--wait needs a value}"; shift 2 ;;
@@ -117,6 +132,11 @@ done
 [ "$(id -u)" = 0 ] || die "this installer must run as root"
 
 [ -n "$SERVER_URL" ] || die "--server-url is required"
+# Same rule as the Linux/macOS installer: a pin says "stay on this version", and
+# a nightly updater would walk straight past it.
+if $AUTO_UPDATE && [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
+	die "--auto-update cannot be combined with a pinned --version"
+fi
 
 case "$MODE" in
 	''|ram|flash) ;;
@@ -291,6 +311,11 @@ if [ -n "$TOKEN_FILE" ]; then
 fi
 if [ -n "$MODE" ]; then uci_set mode "$MODE"; fi
 if [ -n "$VERSION" ]; then uci_set version "$VERSION"; fi
+# Written either way, for the same reason tls_insecure is (below): the console
+# renders this command with every choice stated, so an absent flag has to MEAN
+# off. Re-running the command with the box unticked must actually turn automatic
+# updates off, not inherit the previous run's answer.
+if $AUTO_UPDATE; then uci_set auto_update 1; else uci_set auto_update 0; fi
 if [ -n "$DOWNLOAD_BASE" ]; then uci_set download_base "$DOWNLOAD_BASE"; fi
 # Written either way, never just when the flag is present. A router that was
 # once pointed at a private-CA server keeps tls_insecure=1 in its config, and
@@ -334,10 +359,49 @@ esac
 uci_set enabled 1
 uci commit nettact
 
-# Now, and not before: the configuration is written and valid, so this is the
-# last point at which anything could still have aborted with the old credential
-# intact. Stopped first because the running agent holds that credential in
-# memory and would go on using it regardless of what is on disk.
+# --- the binary ---------------------------------------------------------------
+
+# Every run refreshes the binary, and it happens HERE rather than being left to
+# launch.sh, which only asks whether a binary exists — never which version it is.
+# That existence check is right for a boot (re-resolving `latest` on every respawn
+# would put a download in the path of a crash loop), but it means a router that
+# downloaded the agent before a release keeps running the old one for as long as
+# it stays up. In RAM mode that is bounded by the next reboot; in flash mode it is
+# forever. Either way the symptom is the worst kind: an agent that starts, fails
+# to enroll against a server that has moved on, and respawns every 10s with the
+# reason buried in syslog.
+#
+# So re-running this script is the upgrade path, and it has to actually download.
+# fetch.sh is already idempotent — it resolves the version, verifies SHA256, and
+# leaves the file alone when the bytes match — so the cost of the guarantee is one
+# download that usually changes nothing.
+#
+# Two constraints fix this position exactly. After `uci commit`: mode, version and
+# download_base all come from UCI, so fetching earlier would fetch for the
+# PREVIOUS configuration. And before the --reinstall wipe below: a failed download
+# then aborts with the old credential and queue still intact, which is the same
+# promise the rest of this script makes — nothing destructive happens until
+# everything that can fail has succeeded. Replacing the binary under the running
+# agent is safe; Linux keeps the old inode alive until the restart below.
+log "refreshing the agent binary"
+if ! /usr/lib/nettact/fetch.sh install "$VERSION"; then
+	# A binary already on the router is worth more than a failed refresh: the
+	# usual cause is a mirror or an uplink being briefly unreachable, and
+	# refusing to finish a re-run that was only meant to change a permission
+	# would be its own kind of broken. But it is a warning, not silence — this is
+	# exactly the state where the agent about to start may be too old for its
+	# server, and the online check below is what catches that.
+	if [ -x "$(nettact_bin)" ]; then
+		warn "could not refresh the agent binary; continuing with the copy already at $(nettact_bin). If this router does not come online below, an out-of-date agent is the first thing to suspect: re-run once the download source is reachable."
+	else
+		die "could not download the agent binary, and this router has none to fall back on. Check --download-base/--version and that the router can reach it, then re-run. Nothing has been discarded: this router's identity and queued telemetry are as they were."
+	fi
+fi
+
+# Now, and not before: the configuration is written and valid and the binary is in
+# place, so this is the last point at which anything could still have aborted with
+# the old credential intact. Stopped first because the running agent holds that
+# credential in memory and would go on using it regardless of what is on disk.
 if $REINSTALL; then
 	log "reinstall: discarding the saved credential and queued telemetry"
 	/etc/init.d/nettact stop >/dev/null 2>&1 || true
@@ -382,7 +446,14 @@ Worth checking:
   logread -e nettact                     the service log
   cat $NETTACT_GEN_CONFIG   the configuration UCI produced
   /usr/lib/nettact/fetch.sh arch         the build this device resolves to
+  /usr/lib/nettact/fetch.sh resolve      the release tag 'latest' points at
+  $(nettact_bin) --version   the agent this router will run
   ls -l $NETTACT_DATA_DIR/          agent.json present means enrollment succeeded
+
+An agent that exits immediately, over and over, is most often one the server
+refuses: a spent or wrong token, or a build too old for it. The reason is on the
+agent's own stderr — run it once in the foreground to see it:
+  NETTACT_AGENT_CONFIG_FILE=$NETTACT_GEN_CONFIG NETTACT_AGENT_DATA_DIR=$NETTACT_DATA_DIR $(nettact_bin)
 EOF
 }
 
@@ -416,7 +487,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 		if $saw_status; then
 			log "still connecting..."
 		else
-			log "waiting for the agent to start (the binary is downloaded on first start)..."
+			log "waiting for the agent to start (it waits for the clock and a default route first)..."
 		fi
 	fi
 done
