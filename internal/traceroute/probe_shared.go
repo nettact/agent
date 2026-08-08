@@ -11,8 +11,14 @@ import (
 // socket calls differ per OS.
 
 // pickResponder normalizes an ICMP capture result: a valid responder is an
-// intermediate hop; an invalid one (socket closed, nothing captured) is a timeout.
+// intermediate hop; an invalid one (socket closed, nothing captured) is a
+// timeout. A local send failure carries no responder by construction and must
+// survive the normalization — it is a different verdict from silence, not a
+// weaker one.
 func pickResponder(o probeOutcome) probeOutcome {
+	if o.localUnreachable {
+		return o
+	}
 	if o.responder.IsValid() && o.responder != netip.AddrFrom4([4]byte{}) {
 		return o
 	}
@@ -36,6 +42,53 @@ func localIPv4For(dest netip.Addr) [4]byte {
 		}
 	}
 	return [4]byte{}
+}
+
+// isLocalAddr reports whether a is an address of this host: a loopback address,
+// or one configured on any local interface.
+//
+// It is how the ICMP paths tell "a router on the path refused to forward" apart
+// from "our own kernel refused to send at all". Both arrive as an ICMP
+// Destination Unreachable quoting our probe, and neither the type nor the code
+// distinguishes them: when a next hop cannot be resolved — no route, ARP that
+// never answers, a link that lost carrier — Linux synthesizes the error itself
+// (icmp_send off dst_link_failure), sources it from a local address and routes
+// it back to us over loopback, where a raw ICMP socket bound to 0.0.0.0 reads it
+// exactly like a reply from the wire. Taking it at face value makes every TTL in
+// the sweep report the agent's own address as a hop, at a plausible-looking RTT,
+// for a packet that never left the machine.
+//
+// It walks the interface list rather than comparing against the source address
+// the probe would have used (localIPv4For), because the case that matters most
+// is precisely the one where there is no route left to derive that address from.
+// The walk only happens when an unreachable actually arrives, which on a healthy
+// path is never.
+func isLocalAddr(a netip.Addr) bool {
+	if !a.IsValid() || a.IsUnspecified() {
+		return false
+	}
+	if a.IsLoopback() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, ia := range addrs {
+		var ip net.IP
+		switch v := ia.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		default:
+			continue
+		}
+		if got, ok := netip.AddrFromSlice(ip); ok && got.Unmap() == a {
+			return true
+		}
+	}
+	return false
 }
 
 // matchQuotedEcho reports whether the quotation carried by an ICMP error (the

@@ -26,11 +26,20 @@ const (
 	defaultAttempts     = 3
 	defaultTotalTimeout = 300 * time.Second
 
-	// Per-attempt probe budget bounds, derived from the total timeout and hop
-	// count and then clamped into this window so one slow hop cannot starve the
-	// rest and a tiny budget still sends a real probe.
+	// Per-attempt probe budget bounds, derived from the total timeout, the hop
+	// count and the attempts per hop, then clamped into this window so one slow
+	// hop cannot starve the rest and a tiny budget still sends a real probe.
+	//
+	// The ceiling is deliberately well under what an interactive traceroute waits.
+	// This sweep is unattended evidence collection for a fault that already
+	// happened, and its dominant cost is silent hops: a path that filters ICMP
+	// spends maxHops x attempts x this value doing nothing, and every second of
+	// that is a second further from the moment being diagnosed. 1.5s still clears
+	// any real RTT by a wide margin — intercontinental paths land near 300ms and
+	// even geostationary satellite legs under 800ms — so a hop that has not
+	// answered by then was not going to.
 	minPerAttempt = 500 * time.Millisecond
-	maxPerAttempt = 3 * time.Second
+	maxPerAttempt = 1500 * time.Millisecond
 
 	// Reverse-DNS budget (spec): per-lookup and total ceilings with bounded
 	// concurrency. A lookup failure leaves the hostname empty and never changes
@@ -59,6 +68,16 @@ const (
 	reasonProbeFailed        = "probe_failed"
 	reasonDeadlineExceeded   = "deadline_exceeded"
 	reasonCanceled           = "canceled"
+
+	// reasonLocalNoRoute: this host could not send the probe at all — no route to
+	// the destination, a next hop that never resolved, an egress link that lost
+	// carrier. It is a terminal verdict rather than a hop-shaped one because the
+	// packets never reached the wire: the path was not measured, and the useful
+	// finding is about the agent's own machine. Reporting it this way is also the
+	// only way to keep it out of the hop table, since the local kernel names
+	// ITSELF as the ICMP responder (see isLocalAddr) and would otherwise appear
+	// as a fabricated router at every TTL.
+	reasonLocalNoRoute = "local_no_route"
 
 	// Fail-closed egress outcomes (DIAG-004): the pinned tunnel generation was
 	// not honorable, and by contract the trace refuses rather than measuring a
@@ -327,7 +346,7 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 	if egress {
 		probe = tunnelProber(egressProbe)
 	}
-	perAttempt := perAttemptBudget(req.PerHopTimeoutMs, totalTimeout, maxHops)
+	perAttempt := perAttemptBudget(req.PerHopTimeoutMs, totalTimeout, maxHops, attempts)
 
 	out := e.walk(ctx, runCtx, probe, dest, port, maxHops, attempts, perAttempt, deadline)
 	res.Hops = out.hops
@@ -356,12 +375,16 @@ type walkResult struct {
 // non-responding (`*`) hops; only a destination response stops the sweep. Session
 // cancellation ends it as canceled; running out of the deadline/budget ends it as
 // timed_out with the partial hops captured so far; a hard probe error ends it as
-// failed; completing the sweep with usable-but-no-reach hops is partial.
+// failed; a probe this host could not send at all ends it as failed with
+// local_no_route — no later TTL would fare differently, and continuing would only
+// burn the budget re-proving the same local fact; completing the sweep with
+// usable-but-no-reach hops is partial.
 func (e *Engine) walk(sessionCtx, runCtx context.Context, probe prober, dest netip.Addr, port, maxHops, attempts int, perAttempt time.Duration, runDeadline time.Time) walkResult {
 	var out walkResult
 	var hardErr error
 	canceled := false
 	budgetExpired := false
+	localFail := false
 
 sweep:
 	for ttl := 1; ttl <= maxHops; ttl++ {
@@ -383,6 +406,16 @@ sweep:
 			outcome, err := probe(runCtx, dest, port, ttl, to)
 			if err != nil {
 				hardErr = err
+				break sweep
+			}
+			if outcome.localUnreachable {
+				// Nothing was put on the wire, so this attempt describes no hop.
+				// Earlier TTLs of this same hop may have measured real responders
+				// before the route went away mid-sweep; those are kept.
+				localFail = true
+				if len(hop.Attempts) > 0 {
+					out.hops = append(out.hops, hop)
+				}
 				break sweep
 			}
 			att := telemetry.TraceAttempt{}
@@ -407,6 +440,8 @@ sweep:
 	switch {
 	case out.reached:
 		out.status = telemetry.TraceStatusSucceeded
+	case localFail:
+		out.status, out.reason = telemetry.TraceStatusFailed, reasonLocalNoRoute
 	case hardErr != nil:
 		// The egress sentinels mean the same thing here as they do at resolution:
 		// the pinned tunnel stopped being the one the fault was observed on. A
@@ -621,15 +656,19 @@ func clampTotalTimeout(ms int) time.Duration {
 }
 
 // perAttemptBudget picks the per-probe timeout: the policy's explicit value when
-// it set one, otherwise the total budget divided by the hop count — the sane
-// relationship, since a sweep that spends its whole window on hop 3 has measured
-// nothing. Either way it is clamped into [minPerAttempt, maxPerAttempt], so a
-// tiny budget still sends a real probe and one slow hop cannot starve the rest.
-func perAttemptBudget(perHopMs int, total time.Duration, maxHops int) time.Duration {
+// it set one, otherwise the total budget divided by the number of probes the
+// sweep will actually send — hops x attempts, since a sweep that spends its
+// whole window on hop 3 has measured nothing. Either way it is clamped into
+// [minPerAttempt, maxPerAttempt], so a tiny budget still sends a real probe and
+// one slow hop cannot starve the rest.
+func perAttemptBudget(perHopMs int, total time.Duration, maxHops, attempts int) time.Duration {
 	if maxHops <= 0 {
 		maxHops = defaultMaxHops
 	}
-	per := total / time.Duration(maxHops)
+	if attempts <= 0 {
+		attempts = defaultAttempts
+	}
+	per := total / time.Duration(maxHops*attempts)
 	if perHopMs > 0 {
 		per = time.Duration(perHopMs) * time.Millisecond
 	}

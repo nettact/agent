@@ -87,10 +87,37 @@ type ipOptionInformation struct {
 // IP_STATUS codes returned in ICMP_ECHO_REPLY.Status.
 const (
 	ipStatusSuccess           = 0
+	ipStatusDestNetUnreach    = 11002
+	ipStatusDestHostUnreach   = 11003
 	ipStatusReqTimedOut       = 11010
 	ipStatusTTLExpiredTransit = 11013
 	ipStatusTTLExpiredReassem = 11014
+	ipStatusBadRoute          = 11012
 )
+
+// Win32 routing failures IcmpSendEcho can surface through GetLastError instead of
+// the IP_STATUS namespace. Defined locally, like wsaeConnRefused below, so the
+// code does not depend on x/sys/windows exporting them.
+const (
+	errorNetworkUnreachable = 1231 // ERROR_NETWORK_UNREACHABLE
+	errorHostUnreachable    = 1232 // ERROR_HOST_UNREACHABLE
+)
+
+// localSendFailureStatus reports whether an IcmpSendEcho failure code means this
+// host could not emit the probe at all — no route, no reachable next hop. It is
+// only consulted when the call returned NO reply record: with a record present
+// the same unreachable codes describe a remote responder instead, which is a
+// nameable hop. The Win32 pair (ERROR_NETWORK_UNREACHABLE / HOST_UNREACHABLE)
+// is included because the API reports a local routing failure through either
+// namespace depending on where the stack gave up.
+func localSendFailureStatus(code uintptr) bool {
+	switch code {
+	case ipStatusDestNetUnreach, ipStatusDestHostUnreach, ipStatusBadRoute,
+		errorNetworkUnreachable, errorHostUnreachable:
+		return true
+	}
+	return false
+}
 
 // icmpProbe sends one ICMP echo toward dest with the given TTL. An IP_SUCCESS
 // reply means the destination itself answered (reached); IP_TTL_EXPIRED means an
@@ -118,7 +145,7 @@ func icmpProbe(_ context.Context, dest netip.Addr, _ int, ttl int, timeout time.
 		to = 1000
 	}
 
-	ret, _, _ := procIcmpSendEcho.Call(
+	ret, _, callErr := procIcmpSendEcho.Call(
 		handle,
 		uintptr(destAddr),
 		uintptr(unsafe.Pointer(&reqData[0])),
@@ -131,7 +158,14 @@ func icmpProbe(_ context.Context, dest netip.Addr, _ int, ttl int, timeout time.
 	runtime.KeepAlive(reqData)
 	runtime.KeepAlive(opts)
 	if ret == 0 {
-		return probeOutcome{timeout: true}, nil // timeout or unreachable, no reply
+		// No reply record at all. GetLastError separates "this host had nowhere to
+		// send it" from an ordinary silent hop; only the former invalidates the
+		// sweep, since no TTL would fare any better.
+		var errno windows.Errno
+		if errors.As(callErr, &errno) && localSendFailureStatus(uintptr(errno)) {
+			return probeOutcome{localUnreachable: true}, nil
+		}
+		return probeOutcome{timeout: true}, nil
 	}
 	reply := (*icmpEchoReply)(unsafe.Pointer(&replyBuf[0]))
 	responder := ipFromUint32(reply.Address)
@@ -145,8 +179,13 @@ func icmpProbe(_ context.Context, dest netip.Addr, _ int, ttl int, timeout time.
 		return probeOutcome{timeout: true}, nil
 	default:
 		// A responder returned an unreachable/other status: record its address as an
-		// intermediate hop (never reached, since only an echo reply marks arrival).
+		// intermediate hop (never reached, since only an echo reply marks arrival) —
+		// unless the address is one of ours, which means our own stack produced the
+		// error and the probe never reached the wire (see isLocalAddr).
 		if responder.IsValid() && responder != netip.AddrFrom4([4]byte{}) {
+			if isLocalAddr(responder) {
+				return probeOutcome{localUnreachable: true}, nil
+			}
 			return probeOutcome{responder: responder, rttMs: rtt}, nil
 		}
 		return probeOutcome{timeout: true}, nil
@@ -158,8 +197,15 @@ func icmpProbe(_ context.Context, dest netip.Addr, _ int, ttl int, timeout time.
 const ipTTL = 4
 
 // wsaeConnRefused is WSAECONNREFUSED — a destination RST, which for TCP
-// traceroute still means the destination was reached.
-const wsaeConnRefused = windows.Errno(10061)
+// traceroute still means the destination was reached. The three that follow are
+// the Winsock routing failures: the SYN never left this host, so they are local
+// send failures, not path evidence.
+const (
+	wsaeConnRefused = windows.Errno(10061)
+	wsaeNetDown     = windows.Errno(10050)
+	wsaeNetUnreach  = windows.Errno(10051)
+	wsaeHostUnreach = windows.Errno(10065)
+)
 
 // tcpProbe runs one TTL-aware TCP probe. It sets IP_TTL on a connect socket and,
 // on a raw ICMP socket, watches for a Time-Exceeded whose quoted TCP header
@@ -220,9 +266,16 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 			return
 		}
 		var errno windows.Errno
-		if errors.As(cerr, &errno) && errno == wsaeConnRefused {
-			connCh <- probeOutcome{responder: dest, reached: true, rttMs: rtt}
-			return
+		if errors.As(cerr, &errno) {
+			switch errno {
+			case wsaeConnRefused:
+				connCh <- probeOutcome{responder: dest, reached: true, rttMs: rtt}
+				return
+			case wsaeNetUnreach, wsaeHostUnreach, wsaeNetDown:
+				// The stack had nowhere to send the SYN; see the unix path.
+				connCh <- probeOutcome{localUnreachable: true}
+				return
+			}
 		}
 		connCh <- probeOutcome{} // no usable result
 	}()
@@ -241,6 +294,10 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 				continue
 			}
 			responder := responderAddr(from)
+			if isLocalAddr(responder) {
+				icmpCh <- probeOutcome{localUnreachable: true}
+				return
+			}
 			icmpCh <- probeOutcome{responder: responder, rttMs: float64(time.Since(start).Microseconds()) / 1000.0}
 			return
 		}
@@ -252,9 +309,10 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 	var out probeOutcome
 	select {
 	case o := <-connCh:
-		if o.reached {
+		switch {
+		case o.reached, o.localUnreachable:
 			out = o
-		} else {
+		default:
 			// Connect gave no clear reach; prefer an ICMP responder if one is ready.
 			select {
 			case oi := <-icmpCh:

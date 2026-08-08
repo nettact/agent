@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -283,18 +284,106 @@ func TestTraceBoundsClampDeterministically(t *testing.T) {
 	if got := clampTotalTimeout(999999); got != 600*time.Second {
 		t.Fatalf("timeout clamp = %v, want 600s", got)
 	}
-	if got := perAttemptBudget(0, time.Second, 64); got != minPerAttempt {
+	if got := perAttemptBudget(0, time.Second, 64, 3); got != minPerAttempt {
 		t.Fatalf("minimum per-attempt budget = %v", got)
 	}
-	if got := perAttemptBudget(0, time.Hour, 1); got != maxPerAttempt {
+	if got := perAttemptBudget(0, time.Hour, 1, 1); got != maxPerAttempt {
 		t.Fatalf("maximum per-attempt budget = %v", got)
+	}
+	// The derivation counts every probe the sweep will send, not just the hops:
+	// with 3 attempts each, the default budget has to cover 90 of them.
+	if got := perAttemptBudget(0, 90*time.Second, 30, 3); got != time.Second {
+		t.Fatalf("derived per-attempt budget = %v, want 1s", got)
 	}
 	// An explicit per-hop timeout overrides the derivation but is clamped by the
 	// same window: a policy cannot ask for a 10ms probe or a 30s one.
-	if got := perAttemptBudget(1200, time.Hour, 30); got != 1200*time.Millisecond {
+	if got := perAttemptBudget(1200, time.Hour, 30, 3); got != 1200*time.Millisecond {
 		t.Fatalf("explicit per-hop budget = %v", got)
 	}
-	if got := perAttemptBudget(10, time.Hour, 30); got != minPerAttempt {
+	if got := perAttemptBudget(10, time.Hour, 30, 3); got != minPerAttempt {
 		t.Fatalf("explicit per-hop budget below the floor = %v", got)
 	}
+	if got := perAttemptBudget(9000, time.Hour, 30, 3); got != maxPerAttempt {
+		t.Fatalf("explicit per-hop budget above the ceiling = %v", got)
+	}
+}
+
+// A probe this host could not send is not a hop: the local kernel names itself as
+// the ICMP responder, so accepting it would fabricate one identical router per
+// TTL. The sweep must stop at the first one and say what actually happened.
+func TestWalkStopsAtLocalSendFailureWithoutInventingHops(t *testing.T) {
+	e := &Engine{}
+	dest := netip.MustParseAddr("192.0.2.10")
+	sent := 0
+	probe := func(_ context.Context, _ netip.Addr, _ int, _ int, _ time.Duration) (probeOutcome, error) {
+		sent++
+		return probeOutcome{localUnreachable: true}, nil
+	}
+	out := e.walk(context.Background(), context.Background(), probe, dest, 0, 30, 3, time.Second, time.Now().Add(time.Minute))
+	if out.status != telemetry.TraceStatusFailed || out.reason != reasonLocalNoRoute {
+		t.Fatalf("walk = %s/%s, want %s/%s", out.status, out.reason, telemetry.TraceStatusFailed, reasonLocalNoRoute)
+	}
+	if out.reached || len(out.hops) != 0 {
+		t.Fatalf("hops = %+v, reached = %v; want no hops and no reach", out.hops, out.reached)
+	}
+	if sent != 1 {
+		t.Fatalf("probes sent = %d, want 1 — the sweep must not retry a local failure", sent)
+	}
+}
+
+// Hops measured before the route went away are real evidence and are kept, even
+// though the TTL they were measured on ends the sweep.
+func TestWalkKeepsHopsMeasuredBeforeALocalFailure(t *testing.T) {
+	e := &Engine{}
+	dest := netip.MustParseAddr("192.0.2.10")
+	probe := func(_ context.Context, _ netip.Addr, _ int, ttl int, _ time.Duration) (probeOutcome, error) {
+		if ttl == 1 {
+			return probeOutcome{responder: netip.MustParseAddr("192.0.2.1"), rttMs: 1.5}, nil
+		}
+		return probeOutcome{localUnreachable: true}, nil
+	}
+	out := e.walk(context.Background(), context.Background(), probe, dest, 0, 30, 1, time.Second, time.Now().Add(time.Minute))
+	if out.status != telemetry.TraceStatusFailed || out.reason != reasonLocalNoRoute {
+		t.Fatalf("walk = %s/%s", out.status, out.reason)
+	}
+	if len(out.hops) != 1 || out.hops[0].Attempts[0].ResponderAddr != "192.0.2.1" {
+		t.Fatalf("hops = %+v, want the one real hop preserved", out.hops)
+	}
+}
+
+// isLocalAddr is the whole basis for telling our own kernel's unreachable from a
+// router's, so it has to recognize this host's own addresses and nothing else.
+func TestIsLocalAddrRecognizesThisHostOnly(t *testing.T) {
+	if !isLocalAddr(netip.MustParseAddr("127.0.0.1")) {
+		t.Fatal("loopback must count as local")
+	}
+	if isLocalAddr(netip.Addr{}) || isLocalAddr(netip.MustParseAddr("0.0.0.0")) {
+		t.Fatal("invalid/unspecified addresses must not count as local")
+	}
+	// 192.0.2.0/24 is TEST-NET-1: reserved for documentation, so no interface on
+	// any real machine carries it.
+	if isLocalAddr(netip.MustParseAddr("192.0.2.1")) {
+		t.Fatal("a documentation-range address must not count as local")
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("interface addresses unreadable: %v", err)
+	}
+	for _, ia := range addrs {
+		n, ok := ia.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		a, ok := netip.AddrFromSlice(n.IP)
+		if !ok {
+			continue
+		}
+		if a = a.Unmap(); a.Is4() && !a.IsLoopback() {
+			if !isLocalAddr(a) {
+				t.Fatalf("own interface address %s not recognized as local", a)
+			}
+			return
+		}
+	}
+	t.Skip("no non-loopback IPv4 interface address to check against")
 }

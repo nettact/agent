@@ -24,11 +24,21 @@ import (
 // within the per-attempt budget (rendered as `*`): responder is zero and rttMs
 // is 0. reached is set only when the destination itself answered (an ICMP echo
 // reply, or a TCP SYN-ACK/RST), never for an intermediate TTL-expired responder.
+//
+// localUnreachable is the one outcome that is not about the path at all: this
+// host refused to send the probe (no route, an unresolvable next hop, a link
+// that lost carrier), so the packet never reached the wire. It is kept separate
+// from timeout because the two demand opposite handling — a timeout is one
+// silent hop and the sweep must continue past it, while a local send failure
+// invalidates the whole sweep: every remaining TTL would fail the same way, and
+// the TTL had no part in the answer. See isLocalAddr for why it cannot simply be
+// read off the ICMP type.
 type probeOutcome struct {
-	responder netip.Addr
-	reached   bool
-	timeout   bool
-	rttMs     float64
+	responder        netip.Addr
+	reached          bool
+	timeout          bool
+	localUnreachable bool
+	rttMs            float64
 }
 
 // prober runs one TTL probe toward dest (port is used by TCP only). It returns a

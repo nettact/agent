@@ -4,6 +4,7 @@ package traceroute
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -84,6 +85,12 @@ func icmpProbe(ctx context.Context, dest netip.Addr, _ int, ttl int, timeout tim
 
 	start := time.Now()
 	if _, err := conn.WriteTo(wb, &net.IPAddr{IP: dest.AsSlice()}); err != nil {
+		// The kernel refused the packet outright (no route, the egress link down).
+		// That is not a silent hop: nothing was sent, so the sweep has nothing left
+		// to learn from further TTLs.
+		if isLocalSendFailure(err) {
+			return probeOutcome{localUnreachable: true}, nil
+		}
 		return probeOutcome{timeout: true}, nil
 	}
 
@@ -111,12 +118,29 @@ func icmpProbe(ctx context.Context, dest netip.Addr, _ int, ttl int, timeout tim
 			}
 		case *icmp.DstUnreach:
 			// A router refusing to forward is still a hop we can name; it is
-			// never "reached", which only an echo reply establishes.
+			// never "reached", which only an echo reply establishes. But an
+			// unreachable sourced from THIS host is our own kernel reporting that
+			// it could not send at all — the packet never reached the wire, the
+			// TTL played no part in it, and naming ourselves as the hop would
+			// invent a router that does not exist.
 			if matchQuotedEcho(body.Data, id, seq) {
+				if isLocalAddr(responder) {
+					return probeOutcome{localUnreachable: true}, nil
+				}
 				return probeOutcome{responder: responder, rttMs: rtt}, nil
 			}
 		}
 	}
+}
+
+// isLocalSendFailure reports whether a send failed because this host had no way
+// to emit the packet, as opposed to any transient socket error. These are the
+// errnos the stack returns when routing itself fails, so the probe never made it
+// out and no TTL sweep can say anything about the path.
+func isLocalSendFailure(err error) bool {
+	return errors.Is(err, unix.ENETUNREACH) ||
+		errors.Is(err, unix.EHOSTUNREACH) ||
+		errors.Is(err, unix.ENETDOWN)
 }
 
 // tcpProbe runs one TTL-aware TCP probe. It sets IP_TTL on a non-blocking connect
@@ -176,6 +200,10 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 		// Normal: the handshake is in flight, resolved by the poll loop below.
 	case unix.ECONNREFUSED:
 		return probeOutcome{responder: dest, reached: true, rttMs: rtt()}, nil
+	case unix.ENETUNREACH, unix.EHOSTUNREACH, unix.ENETDOWN:
+		// Refused before a SYN could leave: this is the local routing decision,
+		// not the path answering. No TTL sweep can learn anything from here.
+		return probeOutcome{localUnreachable: true}, nil
 	default:
 		return probeOutcome{timeout: true}, nil
 	}
@@ -230,7 +258,13 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 			rn, from, rerr := unix.Recvfrom(raw, buf, 0)
 			if rerr == nil && rn > 0 && matchICMPQuotation(buf[:rn], ip4, port, srcPort) {
 				if s4, ok := from.(*unix.SockaddrInet4); ok {
-					return probeOutcome{responder: netip.AddrFrom4(s4.Addr), rttMs: rtt()}, nil
+					responder := netip.AddrFrom4(s4.Addr)
+					// Same distinction the ICMP prober makes: an unreachable this
+					// host sourced itself is a local send failure, not a hop.
+					if isLocalAddr(responder) {
+						return probeOutcome{localUnreachable: true}, nil
+					}
+					return probeOutcome{responder: responder, rttMs: rtt()}, nil
 				}
 			}
 		}
