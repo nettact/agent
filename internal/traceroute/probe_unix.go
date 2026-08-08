@@ -136,10 +136,13 @@ func icmpProbe(ctx context.Context, dest netip.Addr, _ int, ttl int, timeout tim
 // isLocalSendFailure reports whether a send failed because this host had no way
 // to emit the packet, as opposed to any transient socket error. These are the
 // errnos the stack returns when routing itself fails, so the probe never made it
-// out and no TTL sweep can say anything about the path.
+// out and no TTL sweep can say anything about the path. EHOSTDOWN is in the list
+// for macOS, where a neighbour entry that never resolved commonly surfaces as
+// that rather than EHOSTUNREACH.
 func isLocalSendFailure(err error) bool {
 	return errors.Is(err, unix.ENETUNREACH) ||
 		errors.Is(err, unix.EHOSTUNREACH) ||
+		errors.Is(err, unix.EHOSTDOWN) ||
 		errors.Is(err, unix.ENETDOWN)
 }
 
@@ -200,9 +203,10 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 		// Normal: the handshake is in flight, resolved by the poll loop below.
 	case unix.ECONNREFUSED:
 		return probeOutcome{responder: dest, reached: true, rttMs: rtt()}, nil
-	case unix.ENETUNREACH, unix.EHOSTUNREACH, unix.ENETDOWN:
-		// Refused before a SYN could leave: this is the local routing decision,
-		// not the path answering. No TTL sweep can learn anything from here.
+	case unix.ENETUNREACH, unix.EHOSTUNREACH, unix.EHOSTDOWN, unix.ENETDOWN:
+		// Refused before a SYN could leave — this connect is non-blocking, so an
+		// immediate return is the local routing decision and not the path
+		// answering. No TTL sweep can learn anything from here.
 		return probeOutcome{localUnreachable: true}, nil
 	default:
 		return probeOutcome{timeout: true}, nil

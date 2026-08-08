@@ -360,25 +360,43 @@ func TestIsLocalAddrRecognizesThisHostOnly(t *testing.T) {
 	if isLocalAddr(netip.Addr{}) || isLocalAddr(netip.MustParseAddr("0.0.0.0")) {
 		t.Fatal("invalid/unspecified addresses must not count as local")
 	}
-	// 192.0.2.0/24 is TEST-NET-1: reserved for documentation, so no interface on
-	// any real machine carries it.
-	if isLocalAddr(netip.MustParseAddr("192.0.2.1")) {
-		t.Fatal("a documentation-range address must not count as local")
-	}
+
+	// Read the interface list once and drive both directions off it. The negative
+	// case cannot just assume a documentation-range address is unassigned: RFC 5737
+	// reserves 192.0.2.0/24 from public routing, not from a lab or CI host, so a
+	// hard-coded one there would fail on a machine that legitimately carries it.
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		t.Skipf("interface addresses unreadable: %v", err)
 	}
+	local := map[netip.Addr]bool{}
 	for _, ia := range addrs {
 		n, ok := ia.(*net.IPNet)
 		if !ok {
 			continue
 		}
-		a, ok := netip.AddrFromSlice(n.IP)
-		if !ok {
-			continue
+		if a, ok := netip.AddrFromSlice(n.IP); ok {
+			local[a.Unmap()] = true
 		}
-		if a = a.Unmap(); a.Is4() && !a.IsLoopback() {
+	}
+
+	notMine := netip.Addr{}
+	for i := 1; i < 255; i++ {
+		c := netip.AddrFrom4([4]byte{192, 0, 2, byte(i)})
+		if !local[c] {
+			notMine = c
+			break
+		}
+	}
+	if !notMine.IsValid() {
+		t.Skip("no unassigned documentation address to check against")
+	}
+	if isLocalAddr(notMine) {
+		t.Fatalf("%s is on no interface but was called local", notMine)
+	}
+
+	for a := range local {
+		if a.Is4() && !a.IsLoopback() {
 			if !isLocalAddr(a) {
 				t.Fatalf("own interface address %s not recognized as local", a)
 			}
