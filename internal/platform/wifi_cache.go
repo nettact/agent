@@ -39,14 +39,17 @@ type wifiCacheConfig struct {
 	// one gated read. Stamped per ATTEMPT, not per success, so a failing refresh
 	// cannot hot-loop the gated API.
 	MinRefreshInterval time.Duration
-	// SSIDDemandWindow guards platforms where reading the SSID is itself the
-	// gated OS call (macOS -[CWInterface ssid]): a gated refresh may read the
-	// SSID only if some caller passed includeSSID=true within this window, so
-	// when every server's ssid grant is revoked the OS reads stop and the cached
-	// SSID is dropped. Zero disables the guard for platforms where the SSID
-	// bytes arrive embedded in a struct that must be fetched anyway (Windows
-	// wlanConnectionAttributes) — there the disclosure gate is decode-time, per
-	// caller, exactly as it was before the cache existed.
+	// SSIDDemandWindow gates materializing the SSID at all: a gated refresh may
+	// capture it only if some caller passed includeSSID=true within this window,
+	// so when every server's ssid grant is revoked the name stops being read and
+	// the cached copy is dropped. Both platforms need this, for different
+	// reasons. On macOS -[CWInterface ssid] IS the gated OS call. On Windows the
+	// bytes arrive embedded in the wlanConnectionAttributes struct that must be
+	// fetched anyway for band/dBm — there is no "current_connection without the
+	// SSID" — so the read cannot be avoided, but RETAINING the name in a
+	// process-lifetime cache that no caller is entitled to read from is a
+	// different thing from holding it in a struct for the length of one call.
+	// The window keeps the retention tied to an actual grant.
 	SSIDDemandWindow time.Duration
 	// ReasonPermissionWhenSSIDAbsent preserves the historical macOS telemetry
 	// semantics: a connected row whose SSID is not disclosed to THIS caller
@@ -109,6 +112,14 @@ type wifiCacheEntry struct {
 	// refresh should run (subject to the rate limit).
 	dirty       bool
 	lastAttempt time.Time
+	// gen is bumped by every event that invalidates an in-flight refresh. The
+	// OS read runs OUTSIDE the mutex (it can block for milliseconds), so a
+	// notification can land between ClaimRefresh and ApplyRefresh; without this
+	// the apply would write facts describing the state the adapter was in
+	// BEFORE that event and clear dirty, so a disconnect/reconnect that the tick
+	// reconcile cannot see (same channel, same band) would leave the previous
+	// network's name cached and looking clean indefinitely.
+	gen uint64
 	// liveQuality is the most recent event-pushed signal quality. Once it
 	// diverges from the refresh-time reading, the refresh-time native dBm no
 	// longer describes the current signal either, so dbmStale flips and the
@@ -127,6 +138,21 @@ type wifiCache struct {
 	now            func() time.Time
 	entries        map[string]*wifiCacheEntry
 	lastSSIDDemand time.Time
+	// epoch is the entry-map generation, bumped whenever an entry is DELETED
+	// (adapter removal, Reset). A per-entry gen cannot cover deletion: the entry
+	// a stale apply names no longer exists, and recreating it would start at gen
+	// 0 and match a claim taken at gen 0.
+	epoch uint64
+}
+
+// wifiRefreshClaim is the token ClaimRefresh hands out and ApplyRefresh must
+// present. It pins the entry state the claim was taken against so an apply
+// whose OS read was overtaken by a newer event is dropped instead of
+// resurrecting what that event decided.
+type wifiRefreshClaim struct {
+	id    string
+	gen   uint64
+	epoch uint64
 }
 
 func newWiFiCache(cfg wifiCacheConfig, now func() time.Time) *wifiCache {
@@ -147,7 +173,9 @@ func (c *wifiCache) entry(id string) *wifiCacheEntry {
 func (c *wifiCache) NoteConnect(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entry(id).dirty = true
+	e := c.entry(id)
+	e.dirty = true
+	e.gen++
 }
 
 // NoteDisconnect is authoritative without any OS call: a disconnected adapter
@@ -163,6 +191,7 @@ func (c *wifiCache) NoteDisconnect(id string) {
 	e.dirty = false
 	e.liveQuality = nil
 	e.dbmStale = false
+	e.gen++
 }
 
 // NoteRoamEnd marks a completed roam: still connected, but the BSS (and so
@@ -170,7 +199,9 @@ func (c *wifiCache) NoteDisconnect(id string) {
 func (c *wifiCache) NoteRoamEnd(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entry(id).dirty = true
+	e := c.entry(id)
+	e.dirty = true
+	e.gen++
 }
 
 // NoteChangeAll marks every entry dirty — for platforms whose change callback
@@ -183,11 +214,15 @@ func (c *wifiCache) NoteChangeAll() {
 	defer c.mu.Unlock()
 	for _, e := range c.entries {
 		e.dirty = true
+		e.gen++
 	}
 }
 
 // NoteSignalQuality records an event-pushed quality reading (0-100). For an
 // unknown adapter it implies a missed connect, so the fresh entry starts dirty.
+// It does NOT bump gen: a signal update says nothing about the association's
+// identity, and invalidating an in-flight refresh over one would throw away the
+// read a connect burst just started (signal events arrive in that burst).
 func (c *wifiCache) NoteSignalQuality(id string, quality int) {
 	if quality < 0 {
 		quality = 0
@@ -201,6 +236,7 @@ func (c *wifiCache) NoteSignalQuality(id string, quality int) {
 	e := c.entry(id)
 	if !known {
 		e.dirty = true
+		e.gen++
 	}
 	q := quality
 	e.liveQuality = &q
@@ -211,6 +247,7 @@ func (c *wifiCache) NoteAdapterRemoved(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.entries, id)
+	c.epoch++
 }
 
 // Reset drops every entry — used when the watcher (re)starts or its OS handle
@@ -220,24 +257,26 @@ func (c *wifiCache) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string]*wifiCacheEntry)
+	c.epoch++
 }
 
 // ClaimRefresh reports whether a gated refresh of id should run now, stamping
-// the attempt when it says yes. Split from ApplyRefresh so the state machine
-// stays pure while the actual OS read happens outside the lock; the stamp-on-
-// claim (not on apply) is what prevents a failing refresh from hot-looping.
-func (c *wifiCache) ClaimRefresh(id string) bool {
+// the attempt and handing back the token ApplyRefresh must present. Split from
+// ApplyRefresh so the state machine stays pure while the actual OS read happens
+// outside the lock; the stamp-on-claim (not on apply) is what prevents a
+// failing refresh from hot-looping.
+func (c *wifiCache) ClaimRefresh(id string) (wifiRefreshClaim, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e := c.entries[id]
 	if e == nil || !e.dirty {
-		return false
+		return wifiRefreshClaim{}, false
 	}
 	if !e.lastAttempt.IsZero() && c.now().Sub(e.lastAttempt) < c.cfg.MinRefreshInterval {
-		return false
+		return wifiRefreshClaim{}, false
 	}
 	e.lastAttempt = c.now()
-	return true
+	return wifiRefreshClaim{id: id, gen: e.gen, epoch: c.epoch}, true
 }
 
 // entryDirty reports whether id currently wants a refresh — used by the eager
@@ -249,11 +288,18 @@ func (c *wifiCache) entryDirty(id string) bool {
 	return e != nil && e.dirty
 }
 
-// ApplyRefresh stores the product of a gated refresh.
-func (c *wifiCache) ApplyRefresh(id string, f wifiGatedFacts) {
+// ApplyRefresh stores the product of a gated refresh, unless a newer event
+// overtook the OS read (see wifiRefreshClaim) — in which case the result
+// describes a state the adapter has already left and is discarded; the event
+// that overtook it left the entry dirty or gone, so nothing is lost but one
+// read.
+func (c *wifiCache) ApplyRefresh(claim wifiRefreshClaim, f wifiGatedFacts) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e := c.entry(id)
+	e := c.entries[claim.id]
+	if e == nil || c.epoch != claim.epoch || e.gen != claim.gen {
+		return false
+	}
 	e.facts = f
 	e.haveFacts = true
 	e.dirty = false
@@ -264,6 +310,7 @@ func (c *wifiCache) ApplyRefresh(id string, f wifiGatedFacts) {
 	} else {
 		e.liveQuality = nil
 	}
+	return true
 }
 
 // WantSSID reports whether a gated refresh is currently allowed to read the
@@ -403,20 +450,34 @@ func (c *wifiCache) assembleLocked(e *wifiCacheEntry, ob wifiObs, includeSSID bo
 	}
 	st.State = "connected"
 
-	factsUsable := e.haveFacts && e.facts.Connected
-	if factsUsable && e.facts.Permission {
+	// Two different questions, deliberately not the same predicate:
+	//
+	//   factsKnown — do we have a verdict about our ACCESS to this adapter? A
+	//     permission denial does not go stale when the network changes; it is
+	//     about us, not about the association, so it survives a dirty entry (the
+	//     slow permission retry re-dirties every 15 minutes and the row must not
+	//     drop its reason for the tick that takes).
+	//   factsFresh — may these facts describe the CURRENT association? Only
+	//     while the entry is clean. dirty means an event or a reconcile said the
+	//     association may have changed, so serving the cached name/band would
+	//     report the previous network as the current one — the same leak the
+	//     state-mismatch path guards, arriving by a different door (a roam whose
+	//     refresh is rate-limited or failed).
+	factsKnown := e.haveFacts && e.facts.Connected
+	factsFresh := factsKnown && !e.dirty
+	if factsKnown && e.facts.Permission {
 		st.Reason = "permission"
 	}
-	if includeSSID && factsUsable && e.facts.HasSSID {
+	if includeSSID && factsFresh && e.facts.HasSSID {
 		st.SSID = string(e.facts.SSIDRaw)
 	}
 
 	st.Band = ob.Band
-	if st.Band == "" && factsUsable {
+	if st.Band == "" && factsFresh {
 		st.Band = e.facts.Band
 	}
 	st.Channel = ob.Channel
-	if st.Channel == 0 && factsUsable {
+	if st.Channel == 0 && factsFresh {
 		st.Channel = e.facts.Channel
 	}
 	// Only 2.4 GHz channel numbers are unambiguous; 5/6 GHz overlap, so band is
@@ -429,7 +490,7 @@ func (c *wifiCache) assembleLocked(e *wifiCacheEntry, ob wifiObs, includeSSID bo
 	if quality == nil {
 		quality = e.liveQuality
 	}
-	if quality == nil && factsUsable {
+	if quality == nil && factsFresh {
 		quality = e.facts.Quality
 	}
 	if quality != nil {
@@ -441,7 +502,7 @@ func (c *wifiCache) assembleLocked(e *wifiCacheEntry, ob wifiObs, includeSSID bo
 	case ob.SignalDBm != nil:
 		v := *ob.SignalDBm
 		st.SignalDBm = &v
-	case factsUsable && !e.dbmStale && e.facts.SignalDBm != nil:
+	case factsFresh && !e.dbmStale && e.facts.SignalDBm != nil:
 		v := *e.facts.SignalDBm
 		st.SignalDBm = &v
 	case quality != nil:

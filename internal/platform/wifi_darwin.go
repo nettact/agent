@@ -97,12 +97,14 @@ func darwinWiFiTick(cl cwClient, cache *wifiCache, includeSSID bool) WiFiResult 
 	if len(need) > 0 {
 		applied := false
 		for _, id := range need {
-			if !cache.ClaimRefresh(id) {
+			claim, ok := cache.ClaimRefresh(id)
+			if !ok {
 				continue
 			}
-			if facts, ok := refreshDarwinAdapter(cl, cache, id); ok {
-				cache.ApplyRefresh(id, facts)
-				applied = true
+			if facts, rok := refreshDarwinAdapter(cl, cache, id); rok {
+				if cache.ApplyRefresh(claim, facts) {
+					applied = true
+				}
 			}
 		}
 		if applied {

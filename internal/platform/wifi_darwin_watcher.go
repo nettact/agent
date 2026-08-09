@@ -172,12 +172,13 @@ func (w *darwinWiFiWatcher) eagerRefresh() {
 			continue
 		}
 		w.cache.NoteConnect(a.Name)
-		if !w.cache.ClaimRefresh(a.Name) {
+		claim, ok := w.cache.ClaimRefresh(a.Name)
+		if !ok {
 			stillDirty = true
 			continue
 		}
-		if facts, ok := refreshDarwinAdapter(w.cl, w.cache, a.Name); ok {
-			w.cache.ApplyRefresh(a.Name, facts)
+		if facts, rok := refreshDarwinAdapter(w.cl, w.cache, a.Name); rok {
+			w.cache.ApplyRefresh(claim, facts)
 		} else {
 			stillDirty = true
 		}

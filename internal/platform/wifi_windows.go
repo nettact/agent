@@ -217,7 +217,7 @@ func readWinAdapter(handle windows.Handle, info *wlanInterfaceInfo, includeSSID 
 		return st
 	}
 
-	facts, ok := refreshWinAdapter(handle, &info.InterfaceGUID)
+	facts, ok := refreshWinAdapter(handle, &info.InterfaceGUID, includeSSID)
 	if !ok {
 		st.State, st.Reason = "unreadable", "driver"
 		return st
@@ -272,7 +272,15 @@ func readWinAdapter(handle windows.Handle, info *wlanInterfaceInfo, includeSSID 
 // place current_connection and the BSS list are queried. ok=false means a
 // transient failure the caller should retry later (the cache keeps the entry
 // dirty); every classified outcome, including "the OS denied us", is ok=true.
-func refreshWinAdapter(handle windows.Handle, guid *windows.GUID) (wifiGatedFacts, bool) {
+//
+// withSSID decides whether the network name is materialized at all. The bytes
+// come back inside wlanConnectionAttributes either way — Windows offers no
+// current_connection variant without them, and the struct must be fetched for
+// band and dBm — but decoding them into a value the process then KEEPS is a
+// separate act, and one no caller without network.wifi.ssid.read is entitled
+// to. Leaving SSIDRaw empty also leaves HasSSID false, which is what makes the
+// cache re-read once a granted caller does appear.
+func refreshWinAdapter(handle windows.Handle, guid *windows.GUID, withSSID bool) (wifiGatedFacts, bool) {
 	conn, r := queryCurrentConnection(handle, guid)
 	switch r {
 	case 0:
@@ -297,10 +305,10 @@ func refreshWinAdapter(handle windows.Handle, guid *windows.GUID) (wifiGatedFact
 		return wifiGatedFacts{Connected: true, Permission: true}, true
 	}
 
-	facts := wifiGatedFacts{
-		Connected: true,
-		SSIDRaw:   []byte(decodeDot11SSID(assoc.dot11Ssid)),
-		HasSSID:   true,
+	facts := wifiGatedFacts{Connected: true}
+	if withSSID {
+		facts.SSIDRaw = []byte(decodeDot11SSID(assoc.dot11Ssid))
+		facts.HasSSID = true
 	}
 	q := int(assoc.wlanSignalQuality)
 	if q > 100 {

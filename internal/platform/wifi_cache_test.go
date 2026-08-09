@@ -42,6 +42,21 @@ func connFacts(ssid string, band string, ch int, dbm, q int) wifiGatedFacts {
 	}
 }
 
+// applyNow performs a full claim→apply cycle, seeding the entry if the scenario
+// has not created one yet. Scenarios that care about the claim/apply race drive
+// the two halves themselves.
+func applyNow(t *testing.T, c *wifiCache, id string, f wifiGatedFacts) {
+	t.Helper()
+	c.NoteConnect(id)
+	claim, ok := c.ClaimRefresh(id)
+	if !ok {
+		t.Fatalf("claim %s", id)
+	}
+	if !c.ApplyRefresh(claim, f) {
+		t.Fatalf("apply %s", id)
+	}
+}
+
 func TestWiFiCacheStartupSeeding(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
@@ -59,10 +74,13 @@ func TestWiFiCacheStartupSeeding(t *testing.T) {
 		t.Fatalf("need=%v", need)
 	}
 
-	if !c.ClaimRefresh("a") {
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
 		t.Fatal("claim should succeed")
 	}
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	if !c.ApplyRefresh(claim, connFacts("home", "5", 44, -52, 96)) {
+		t.Fatal("apply")
+	}
 	rows, need = c.Snapshot([]wifiObs{connObs("a")}, true)
 	if len(need) != 0 {
 		t.Fatalf("clean entry still wants refresh: %v", need)
@@ -77,7 +95,7 @@ func TestWiFiCacheStartupSeeding(t *testing.T) {
 func TestWiFiCacheDisconnectIsImmediateAndFree(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	c.NoteDisconnect("a")
 	rows, need := c.Snapshot([]wifiObs{{ID: "a", Name: "a"}}, true)
@@ -87,7 +105,7 @@ func TestWiFiCacheDisconnectIsImmediateAndFree(t *testing.T) {
 	if len(need) != 0 {
 		t.Fatalf("disconnect must not request a gated refresh: %v", need)
 	}
-	if c.ClaimRefresh("a") {
+	if _, ok := c.ClaimRefresh("a"); ok {
 		t.Fatal("nothing to refresh on a down link")
 	}
 }
@@ -95,14 +113,17 @@ func TestWiFiCacheDisconnectIsImmediateAndFree(t *testing.T) {
 func TestWiFiCacheRoamRefreshesIdentity(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("home", "2.4", 6, -60, 80))
+	applyNow(t, c, "a", connFacts("home", "2.4", 6, -60, 80))
 
 	clk.advance(30 * time.Second)
 	c.NoteRoamEnd("a")
-	if !c.ClaimRefresh("a") {
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
 		t.Fatal("roam should open a refresh")
 	}
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -50, 100))
+	if !c.ApplyRefresh(claim, connFacts("home", "5", 44, -50, 100)) {
+		t.Fatal("apply")
+	}
 	rows, _ := c.Snapshot([]wifiObs{connObs("a")}, true)
 	if rows[0].Band != "5" || rows[0].Channel != 44 {
 		t.Fatalf("row=%+v", rows[0])
@@ -112,7 +133,7 @@ func TestWiFiCacheRoamRefreshesIdentity(t *testing.T) {
 func TestWiFiCacheSignalEventsGoLiveAndStaleDBm(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	// Event-pushed quality diverges from the refresh-time reading: the row must
 	// follow the event and derive dBm rather than serve the stale native value.
@@ -147,7 +168,7 @@ func TestWiFiCacheSignalEventsGoLiveAndStaleDBm(t *testing.T) {
 func TestWiFiCacheReconcileStateMismatch(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	// Missed disconnect: observation says down → row down immediately, facts
 	// folded to disconnected locally, no gated refresh.
@@ -171,7 +192,7 @@ func TestWiFiCacheReconcileStateMismatch(t *testing.T) {
 func TestWiFiCacheReconcileChannelDrift(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	ob := connObs("a")
 	ob.Channel = 44
@@ -184,7 +205,7 @@ func TestWiFiCacheReconcileChannelDrift(t *testing.T) {
 		t.Fatal("channel drift must trigger a refresh")
 	}
 	// An unknown (0) channel this tick is "don't know", never a change signal.
-	c.ApplyRefresh("a", connFacts("home", "5", 149, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 149, -52, 96))
 	ob.Channel = 0
 	if _, need := c.Snapshot([]wifiObs{ob}, true); len(need) != 0 {
 		t.Fatalf("unknown channel dirtied: %v", need)
@@ -198,20 +219,20 @@ func TestWiFiCacheRefreshRateLimit(t *testing.T) {
 	// A connect burst collapses into one gated attempt.
 	c.NoteConnect("a")
 	c.NoteRoamEnd("a")
-	if !c.ClaimRefresh("a") {
+	if _, ok := c.ClaimRefresh("a"); !ok {
 		t.Fatal("first claim")
 	}
-	if c.ClaimRefresh("a") {
+	if _, ok := c.ClaimRefresh("a"); ok {
 		t.Fatal("burst must be rate-limited")
 	}
 	// The refresh FAILED (no Apply): dirty persists but the window still holds —
 	// stamping per attempt is what stops a hot loop against a failing API.
 	clk.advance(2 * time.Second)
-	if c.ClaimRefresh("a") {
+	if _, ok := c.ClaimRefresh("a"); ok {
 		t.Fatal("failed attempt must not reopen early")
 	}
 	clk.advance(4 * time.Second)
-	if !c.ClaimRefresh("a") {
+	if _, ok := c.ClaimRefresh("a"); !ok {
 		t.Fatal("window elapsed, dirty entry must be claimable again")
 	}
 }
@@ -227,7 +248,7 @@ func TestWiFiCacheSSIDDemandWindow(t *testing.T) {
 	if !c.WantSSID() {
 		t.Fatal("demand stamped")
 	}
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	// Every server revokes ssid-read: demand expires, cached SSID is dropped and
 	// the OS reads stop.
@@ -259,10 +280,13 @@ func TestWiFiCachePermissionSemantics(t *testing.T) {
 	// from ungated observations and marked permission. Claim precedes Apply as
 	// in the real refresh flow, so the attempt is stamped.
 	c.NoteConnect("a")
-	if !c.ClaimRefresh("a") {
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
 		t.Fatal("claim")
 	}
-	c.ApplyRefresh("a", wifiGatedFacts{Connected: true, Permission: true})
+	if !c.ApplyRefresh(claim, wifiGatedFacts{Connected: true, Permission: true}) {
+		t.Fatal("apply")
+	}
 	ob := connObs("a")
 	ob.Channel = 6
 	ob.RxMbps, ob.TxMbps = f64p(400), f64p(300)
@@ -290,7 +314,7 @@ func TestWiFiCacheReasonPermissionWhenSSIDAbsent(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(macCacheCfg(), clk.now)
 	c.Snapshot([]wifiObs{connObs("a")}, true) // establish demand
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	// macOS semantics: a connected row that does not disclose an SSID to THIS
 	// caller carries reason=permission (historical normalizeCW behavior)...
@@ -308,7 +332,7 @@ func TestWiFiCacheReasonPermissionWhenSSIDAbsent(t *testing.T) {
 func TestWiFiCacheNeverDecodesWithoutGrant(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("secret", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("secret", "5", 44, -52, 96))
 	rows, _ := c.Snapshot([]wifiObs{connObs("a")}, false)
 	if rows[0].SSID != "" {
 		t.Fatalf("SSID disclosed to ungranted caller: %+v", rows[0])
@@ -321,8 +345,8 @@ func TestWiFiCacheNeverDecodesWithoutGrant(t *testing.T) {
 func TestWiFiCacheRemovalAndPrune(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(winCacheCfg(), clk.now)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
-	c.ApplyRefresh("b", connFacts("attic", "2.4", 6, -70, 60))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "b", connFacts("attic", "2.4", 6, -70, 60))
 
 	c.NoteAdapterRemoved("b")
 	rows, _ := c.Snapshot([]wifiObs{connObs("a")}, true)
@@ -342,7 +366,7 @@ func TestWiFiCacheNoteChangeAll(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(macCacheCfg(), clk.now)
 	c.Snapshot([]wifiObs{connObs("a"), {ID: "b", Name: "b"}}, true)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	// Coarse change event: everything goes dirty, but a down adapter is cleaned
 	// up by reconcile rather than gated-refreshed.
@@ -354,11 +378,88 @@ func TestWiFiCacheNoteChangeAll(t *testing.T) {
 	}
 }
 
+func TestWiFiCacheDirtyFactsNeverSupplyIdentity(t *testing.T) {
+	clk := newWiFiClock()
+	c := newWiFiCache(winCacheCfg(), clk.now)
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
+
+	// A roam marks the entry dirty. Until the refresh lands, the row must not
+	// present the PREVIOUS network as the current one — even though the link
+	// never went down and the observation looks unchanged.
+	c.NoteRoamEnd("a")
+	rows, _ := c.Snapshot([]wifiObs{connObs("a")}, true)
+	if rows[0].State != "connected" {
+		t.Fatalf("row=%+v", rows[0])
+	}
+	if rows[0].SSID != "" || rows[0].Band != "" || rows[0].Channel != 0 {
+		t.Fatalf("stale identity served while dirty: %+v", rows[0])
+	}
+
+	// A permission verdict is about our access, not about the association, so it
+	// survives the slow re-dirty rather than flickering away for a tick.
+	c2 := newWiFiCache(winCacheCfg(), clk.now)
+	applyNow(t, c2, "a", wifiGatedFacts{Connected: true, Permission: true})
+	clk.advance(wifiPermissionRetryInterval + time.Second)
+	rows, need := c2.Snapshot([]wifiObs{connObs("a")}, true)
+	if len(need) != 1 {
+		t.Fatalf("permission verdict must retry: %v", need)
+	}
+	if rows[0].Reason != "permission" {
+		t.Fatalf("reason lost while re-dirtied: %+v", rows[0])
+	}
+}
+
+func TestWiFiCacheApplyRejectsOvertakenClaim(t *testing.T) {
+	clk := newWiFiClock()
+	c := newWiFiCache(winCacheCfg(), clk.now)
+
+	// The OS read runs outside the lock, so events can land mid-flight. Each of
+	// these must invalidate the in-flight refresh rather than be overwritten by
+	// it — the tick reconcile cannot catch a same-channel reconnect, so a
+	// wrongly-applied refresh would leave the old SSID cached and looking clean.
+	for _, tc := range []struct {
+		name  string
+		event func()
+	}{
+		{"disconnect", func() { c.NoteDisconnect("a") }},
+		{"reconnect", func() { c.NoteDisconnect("a"); c.NoteConnect("a") }},
+		{"roam", func() { c.NoteRoamEnd("a") }},
+		{"adapter removed", func() { c.NoteAdapterRemoved("a") }},
+		{"watcher reset", func() { c.Reset() }},
+	} {
+		c.NoteConnect("a")
+		claim, ok := c.ClaimRefresh("a")
+		if !ok {
+			t.Fatalf("%s: claim", tc.name)
+		}
+		tc.event() // …arrives while the OS read is in flight
+		if c.ApplyRefresh(claim, connFacts("stale", "5", 44, -52, 96)) {
+			t.Fatalf("%s: overtaken refresh was applied", tc.name)
+		}
+		rows, _ := c.Snapshot([]wifiObs{connObs("a")}, true)
+		if rows[0].SSID != "" {
+			t.Fatalf("%s: stale SSID published: %+v", tc.name, rows[0])
+		}
+		clk.advance(10 * time.Second) // clear the rate limit for the next case
+		c.Reset()
+	}
+
+	// The uncontested case still applies.
+	c.NoteConnect("a")
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
+		t.Fatal("claim")
+	}
+	if !c.ApplyRefresh(claim, connFacts("home", "5", 44, -52, 96)) {
+		t.Fatal("uncontested refresh must apply")
+	}
+}
+
 func TestWiFiCacheReset(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(macCacheCfg(), clk.now)
 	c.Snapshot([]wifiObs{connObs("a")}, true)
-	c.ApplyRefresh("a", connFacts("home", "5", 44, -52, 96))
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
 
 	c.Reset()
 	rows, need := c.Snapshot([]wifiObs{connObs("a")}, true)

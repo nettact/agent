@@ -184,7 +184,14 @@ func startWinWatcher() (*winWiFiWatcher, bool) {
 		return nil, false
 	}
 	w := &winWiFiWatcher{
-		cache:        newWiFiCache(wifiCacheConfig{MinRefreshInterval: 5 * time.Second}, time.Now),
+		cache: newWiFiCache(wifiCacheConfig{
+			MinRefreshInterval: 5 * time.Second,
+			// The gated query returns the SSID bytes whether we want them or
+			// not, but the cache must not RETAIN a name no caller is entitled to
+			// read. 90s of slack keeps a brief gap in grants (a server
+			// reconnecting) from costing a re-read.
+			SSIDDemandWindow: 90 * time.Second,
+		}, time.Now),
 		events:       make(chan winWlanEvent, 64),
 		handle:       handle,
 		handleOK:     true,
@@ -257,18 +264,19 @@ func (w *winWiFiWatcher) pump() {
 // exactly one gated read plus at most one catch-up.
 func (w *winWiFiWatcher) eagerRefresh(guid windows.GUID) {
 	id := guidKey(guid)
-	if !w.cache.ClaimRefresh(id) {
+	claim, ok := w.cache.ClaimRefresh(id)
+	if !ok {
 		if w.cache.entryDirty(id) {
 			w.queueRetry(guid)
 		}
 		return
 	}
-	h, ok := w.currentHandle()
-	if !ok {
+	h, hok := w.currentHandle()
+	if !hok {
 		return // tick will rebuild; the entry stays dirty
 	}
-	if facts, ok := refreshWinAdapter(h, &guid); ok {
-		w.cache.ApplyRefresh(id, facts)
+	if facts, rok := refreshWinAdapter(h, &guid, w.cache.WantSSID()); rok {
+		w.cache.ApplyRefresh(claim, facts)
 	}
 }
 
@@ -397,15 +405,21 @@ func (w *winWiFiWatcher) tickWith(handle windows.Handle, includeSSID bool) (WiFi
 
 	rows, need := w.cache.Snapshot(obs, includeSSID)
 	if len(need) > 0 {
+		withSSID := w.cache.WantSSID()
 		applied := false
 		for _, id := range need {
-			guid, ok := guids[id]
-			if !ok || !w.cache.ClaimRefresh(id) {
+			guid, gok := guids[id]
+			if !gok {
 				continue
 			}
-			if facts, ok := refreshWinAdapter(handle, &guid); ok {
-				w.cache.ApplyRefresh(id, facts)
-				applied = true
+			claim, cok := w.cache.ClaimRefresh(id)
+			if !cok {
+				continue
+			}
+			if facts, rok := refreshWinAdapter(handle, &guid, withSSID); rok {
+				if w.cache.ApplyRefresh(claim, facts) {
+					applied = true
+				}
 			}
 		}
 		if applied {
