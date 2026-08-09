@@ -351,28 +351,38 @@ func clockOffset(c ClockSource, epoch string, mono int64, rev int) time.Duration
 
 // expiredAt reports whether a group is older than retention.
 //
-// Both operands are put in ONE clock domain before comparing, and which domain
-// is decided per group — that is the whole reason this is a function rather
-// than a subtraction at each call site.
+// For a group THIS process stamped there is one right answer: both sides move
+// into the corrected domain — its time by its own offset, the present by the
+// standing error. Moving only one is wrong in both directions and each direction
+// loses data (correct only the stored side and a clock running far AHEAD pulls
+// every group past an unmoved cutoff; correct only the present and a clock far
+// BEHIND pushes the cutoff past everything).
 //
-// A group this process stamped is correctable, so both sides move: its time by
-// its own offset, the present by the standing error. A group an EARLIER process
-// stamped is not correctable at all (see ClockSource.Epoch — that run's error is
-// not recoverable from this one's observations), so neither side moves. Its
-// stamp and a raw reading of now were both taken from the same machine's wall
-// clock, wrong in the same direction, which makes raw-versus-raw the only
-// self-consistent comparison available for it.
+// For a group an EARLIER process stamped there is no right answer, because that
+// run's error is not recoverable from this one's observations (see
+// ClockSource.Epoch) — and the two available readings disagree in the case that
+// matters:
 //
-// Mixing the two is what makes this dangerous in both directions, and each
-// direction deletes data. Correcting only the stored side lets a clock running
-// far AHEAD pull every group's time back past an unmoved cutoff. Correcting only
-// the present lets a clock running far BEHIND — then anchored forward on the
-// handshake, before the session's opening drain — push the cutoff past the raw
-// stamps of everything the previous process spilled, which is precisely the
-// backlog this whole feature exists to deliver.
+//   - Raw versus raw. The stamp and an uncorrected now came from the same
+//     machine's clock, wrong in the same direction, so this is self-consistent.
+//     But sysfixtime sets a no-RTC clock from the newest file mtime, which is the
+//     agent's own last write — so after a week powered off, raw now lands right
+//     back at those stamps and week-old backlog reads as brand new.
+//   - Corrected present versus raw stamp. This measures the true downtime, which
+//     is the honest age in that case. It is wrong when the clock is wrong for a
+//     reason OTHER than downtime, where it can discard a genuinely fresh backlog.
+//
+// It expires when EITHER says so, which resolves the disagreement towards the
+// server: replaying a group past the retention window is not a lost diagnostic,
+// it is telemetry re-ingested as if new, because server-core has already pruned
+// the (agent_id, sequence) row that would have recognised it as a duplicate (see
+// persistRetention in wal_lite.go). Losing an unknowable-age backlog is the
+// cheaper mistake, and it is only reachable when this machine's clock is wrong
+// by more than the whole retention window.
 func expiredAt(c ClockSource, at time.Time, epoch string, mono int64, now time.Time, retention time.Duration) bool {
 	if !correctable(c, epoch) {
-		return at.Before(now.Add(-retention))
+		return at.Before(now.Add(-retention)) ||
+			at.Before(correctedNow(c, now).Add(-retention))
 	}
 	return correctedAt(c, at, epoch, mono).Before(correctedNow(c, now).Add(-retention))
 }

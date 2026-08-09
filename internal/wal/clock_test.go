@@ -391,13 +391,17 @@ func TestALargeStandingClockErrorDoesNotExpireFreshBacklog(t *testing.T) {
 	}
 }
 
-// The other direction of the same hazard, and the one the router case actually
-// hits: a clock far BEHIND, anchored forward on the handshake before the
-// session's opening drain. Groups an EARLIER process spilled cannot be corrected
-// — that run's error is not recoverable — so moving only the present would push
-// the cutoff past their raw stamps and delete exactly the backlog this feature
-// exists to deliver.
-func TestAnAnchorDoesNotExpireAnEarlierProcessesBacklog(t *testing.T) {
+// A previous process's backlog has no knowable age — that run never learned its
+// own clock error — and the two available readings disagree exactly when it
+// matters. This pins the side the disagreement is resolved towards.
+//
+// sysfixtime sets a no-RTC clock from the newest file mtime, which is the
+// agent's own last write, so after a week powered off the RAW clock lands back
+// on those stamps and week-old backlog reads as brand new. The correction is the
+// only thing that knows about the missing week, and replaying past the retention
+// window is not a lost diagnostic — server-core has pruned the dedup row that
+// would have recognised the packet, so it is re-ingested as if new.
+func TestAnEarlierProcessesBacklogExpiresOnceTheCorrectionRevealsItsAge(t *testing.T) {
 	dir := tempWALDir(t)
 
 	old := &fakeClock{epoch: "proc-1"}
@@ -412,8 +416,8 @@ func TestAnAnchorDoesNotExpireAnEarlierProcessesBacklog(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	// The new process learns from the handshake that its clock is four days
-	// behind — more than the retention window.
+	// The machine was off for a week; sysfixtime put the clock back where the
+	// last write left it, and the handshake reveals the missing time.
 	fresh := &fakeClock{epoch: "proc-2"}
 	s2, err := Open(dir, []string{clockServer}, Options{Persist: true, Clock: fresh})
 	if err != nil {
@@ -421,19 +425,40 @@ func TestAnAnchorDoesNotExpireAnEarlierProcessesBacklog(t *testing.T) {
 	}
 	defer func() { _ = s2.Close() }()
 	fresh.advance(time.Second)
-	fresh.standingError(4 * 24 * time.Hour)
+	fresh.standingError(7 * 24 * time.Hour)
 
-	b, ok, err := s2.NextBatch(clockServer, 100)
+	if _, ok, err := s2.NextBatch(clockServer, 100); err != nil {
+		t.Fatalf("batch: %v", err)
+	} else if ok {
+		t.Fatal("week-old backlog was served: the raw clock says it is fresh only " +
+			"because sysfixtime reset the clock onto its own timestamps")
+	}
+}
+
+// The same machinery must NOT expire the current process's own backlog, which is
+// the case where both sides of the comparison are correctable and the answer is
+// unambiguous.
+func TestALargeStandingErrorDoesNotExpireThisProcessesBacklog(t *testing.T) {
+	c := &fakeClock{epoch: "proc-1"}
+	s := openClockStore(t, c)
+	if _, err := s.Append(metricAt(clockBase, "1.1.1.1"), clockServer); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	c.advance(time.Second)
+	c.standingError(7 * 24 * time.Hour)
+
+	b, ok, err := s.NextBatch(clockServer, 100)
 	if err != nil {
 		t.Fatalf("batch: %v", err)
 	}
 	if !ok {
-		t.Fatal("the previous process's backlog was expired away: retention " +
-			"compared its uncorrectable stamp against a corrected now")
+		t.Fatal("this process's own fresh backlog was expired: both its stamp and " +
+			"the present are correctable, so the comparison has one right answer")
 	}
-	// And it is still served exactly as stored — this process cannot know what
-	// error that one was running with.
-	if got := b.Metrics[0].TS.UTC(); !got.Equal(clockBase) {
-		t.Fatalf("sample sent at %s, want it untouched", got)
+	if got, want := b.Metrics[0].TS.UTC(), clockBase.Add(7*24*time.Hour); !got.Equal(want) {
+		t.Fatalf("sample sent at %s, want the corrected %s", got, want)
 	}
 }
