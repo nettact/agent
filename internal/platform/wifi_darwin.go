@@ -18,12 +18,19 @@ import (
 // macOS Wi-Fi status via a thin read-only CoreWLAN bridge over purego/objc
 // (CGO-free; no qualifying maintained Go binding exists — see
 // planning/library-evidence.md). We only READ current-connection state from
-// CWInterface: interfaceName, powerOn, ssid, rssiValue, transmitRate and the
-// current CWChannel (number + band). CoreWLAN exposes no RX link rate, so that
-// field is omitted on macOS. No scanning, no BSSID, no association/config APIs,
-// no keys. Runs under normal user privileges; when macOS location policy
-// withholds the SSID we report connected + reason=permission and keep every
-// other readable field.
+// CWInterface: interfaceName, powerOn, rssiValue, transmitRate and the current
+// CWChannel (number + band). CoreWLAN exposes no RX link rate, so that field is
+// omitted on macOS. No scanning, no BSSID, no association/config APIs, no keys.
+// Runs under normal user privileges.
+//
+// Of those reads exactly one is location-gated: -[CWInterface ssid], which
+// macOS both withholds without location permission and logs as a location
+// access when granted. The 30-second tick therefore never calls it — the SSID
+// lives in the shared wifiCache (wifi_cache.go) and is re-read only when the
+// network actually changes, signaled by CWWiFiClient delegate events
+// (wifi_darwin_watcher.go) with the cache's ungated-transition reconcile
+// (link state, channel, band) as the event-less fallback. Every other field
+// stays a fresh ungated per-tick read, exactly as before.
 
 func wifiPermissions() []permission.ID {
 	return []permission.ID{permission.NetWiFiStatusRead, permission.NetWiFiSSIDRead}
@@ -33,75 +40,121 @@ func wifiPermissions() []permission.ID {
 // adapter name matches it (the join in the collector), not via a per-name hook.
 func ifaceIsWireless(string) bool { return false }
 
-// cwAdapter is one CWInterface's raw readings, normalized into a WiFiStatus by
-// normalizeCW. Kept as a plain struct so tests can drive normalization with a
-// fake cwClient (no CoreWLAN required).
+// cwAdapter is one CWInterface's raw UNGATED readings; the gated SSID travels
+// separately through cwClient.ssid so a caller cannot fetch it by accident.
+// Kept as a plain struct so tests can drive the tick with a fake cwClient (no
+// CoreWLAN required).
 type cwAdapter struct {
 	Name       string
 	PoweredOn  bool
 	HasChannel bool   // -[CWInterface wlanChannel] != nil ⇒ associated
 	Band       string // "2.4" | "5" | "6" | ""
 	Channel    int
-	SSID       string
-	SSIDKnown  bool // false when -ssid returned nil (disconnected OR privacy withheld)
 	RSSI       int
 	HasRSSI    bool
 	TxRateMbps float64
 	HasTxRate  bool
 }
 
-// cwClient is the fake-able CoreWLAN seam.
+// cwClient is the fake-able CoreWLAN seam, split along the location-gating
+// line: adapters() performs only ungated reads and is safe every tick; ssid()
+// is THE gated call and is invoked solely by the cache-driven refresh.
 type cwClient interface {
-	adapters(includeSSID bool) ([]cwAdapter, error)
+	adapters() ([]cwAdapter, error)
+	// ssid returns the current SSID of the named interface. known=false with a
+	// nil error means CoreWLAN returned nil — disconnected, or the SSID withheld
+	// by the location privacy policy (indistinguishable at this API).
+	ssid(ifname string) (s string, known bool, err error)
 }
 
 // newCWClient is a package var so tests can substitute a fake without CoreWLAN.
 var newCWClient = func() (cwClient, error) { return openCoreWLAN() }
 
 func (darwinPlatform) WiFi(includeSSID bool) WiFiResult {
-	cl, err := newCWClient()
+	w, err := getDarwinWatcher()
 	if err != nil {
 		// dlopen / class-resolution / shared-client failure — the subsystem is
 		// unreadable; never misreported as "no adapter".
 		return WiFiResult{State: "unreadable", Reason: "driver"}
 	}
-	ads, err := cl.adapters(includeSSID)
+	return darwinWiFiTick(w.cl, w.cache, includeSSID)
+}
+
+// darwinWiFiTick is one WiFi() round: ungated observations for every adapter,
+// merged with the cached gated facts; a gated ssid() read runs only when the
+// cache demands a refresh. Free function so tests drive it with a fake client
+// and clock without the watcher singleton.
+func darwinWiFiTick(cl cwClient, cache *wifiCache, includeSSID bool) WiFiResult {
+	ads, err := cl.adapters()
 	if err != nil {
 		return WiFiResult{State: "unreadable", Reason: "driver"}
 	}
-	adapters := make([]WiFiStatus, 0, len(ads))
+	obs := make([]wifiObs, 0, len(ads))
 	for _, a := range ads {
-		adapters = append(adapters, normalizeCW(a))
+		obs = append(obs, cwObs(a))
 	}
-	return WiFiResult{State: "ok", Adapters: adapters}
+	rows, need := cache.Snapshot(obs, includeSSID)
+	if len(need) > 0 {
+		applied := false
+		for _, id := range need {
+			if !cache.ClaimRefresh(id) {
+				continue
+			}
+			if facts, ok := refreshDarwinAdapter(cl, cache, id); ok {
+				cache.ApplyRefresh(id, facts)
+				applied = true
+			}
+		}
+		if applied {
+			rows, _ = cache.Snapshot(obs, includeSSID)
+		}
+	}
+	return WiFiResult{State: "ok", Adapters: rows}
 }
 
-func normalizeCW(a cwAdapter) WiFiStatus {
-	st := WiFiStatus{ID: a.Name, Name: a.Name}
-	if !a.PoweredOn || !a.HasChannel {
-		st.State = "disconnected"
-		return st
+// cwObs converts one adapter's ungated readings into the tick observation.
+// The historical normalization rules carry over: powered-off or channel-less
+// means disconnected, RSSI 0 is "driver did not report" rather than a value,
+// and rates are never inferred zeros.
+func cwObs(a cwAdapter) wifiObs {
+	ob := wifiObs{ID: a.Name, Name: a.Name, Connected: a.PoweredOn && a.HasChannel}
+	if !ob.Connected {
+		return ob
 	}
-	st.State = "connected"
-	if a.SSIDKnown {
-		st.SSID = a.SSID
-	} else {
-		st.Reason = "permission" // connected but SSID withheld by privacy policy
-	}
-	st.Band = a.Band
-	st.Channel = a.Channel
+	ob.Band = a.Band
+	ob.Channel = a.Channel
 	if a.HasRSSI && a.RSSI != 0 {
 		dbm := a.RSSI
-		st.SignalDBm = &dbm
+		ob.SignalDBm = &dbm
 		q := qualityFromDBm(dbm)
-		st.Quality = &q
+		ob.Quality = &q
 	}
 	if a.HasTxRate && a.TxRateMbps > 0 {
 		tx := round1(a.TxRateMbps)
-		st.TxMbps = &tx
+		ob.TxMbps = &tx
 	}
-	// RX link rate is not exposed by CoreWLAN → omitted (allowed per-field absence).
-	return st
+	return ob
+}
+
+// refreshDarwinAdapter is the gated refresh executor. The SSID is read from
+// the OS only while some caller's ssid grant is live (cache.WantSSID) — on
+// macOS the read itself is the location access, so unlike Windows there is no
+// "fetch the struct, decode on demand" middle ground.
+func refreshDarwinAdapter(cl cwClient, cache *wifiCache, ifname string) (wifiGatedFacts, bool) {
+	if !cache.WantSSID() {
+		return wifiGatedFacts{Connected: true}, true
+	}
+	s, known, err := cl.ssid(ifname)
+	if err != nil {
+		return wifiGatedFacts{}, false // transient — stay dirty, retry later
+	}
+	if !known {
+		// Connected (the caller checked the ungated state) but CoreWLAN returned
+		// nil: the location privacy policy withheld the name. Permission verdicts
+		// retry on the slow clock only — never per tick.
+		return wifiGatedFacts{Connected: true, Permission: true}, true
+	}
+	return wifiGatedFacts{Connected: true, SSIDRaw: []byte(s), HasSSID: true}, true
 }
 
 // ---- real CoreWLAN implementation (objc messaging) ----
@@ -201,15 +254,16 @@ func openCoreWLAN() (cwClient, error) {
 	return &coreWLANClient{cw: cw}, nil
 }
 
-// adapters reads every CWInterface for one collection round. All CoreWLAN /
-// Foundation message sends run on a locked OS thread inside a pushed autorelease
-// pool: Cocoa convenience getters (-interfaces, -interfaceName, -ssid,
-// -wlanChannel) return autoreleased (+0) objects, and without a pool in place
-// the Objective-C runtime leaks them ("autoreleased with no pool in place").
-// Results are copied into Go-owned values before the pool is drained, so nothing
-// dangles. Thread pinning keeps the pool push/pop on the same thread (pools are
-// thread-local) and the pop/unlock run on every return path via defer.
-func (c *coreWLANClient) adapters(includeSSID bool) ([]cwAdapter, error) {
+// adapters reads every CWInterface's UNGATED fields for one collection round.
+// All CoreWLAN / Foundation message sends run on a locked OS thread inside a
+// pushed autorelease pool: Cocoa convenience getters (-interfaces,
+// -interfaceName, -wlanChannel) return autoreleased (+0) objects, and without a
+// pool in place the Objective-C runtime leaks them ("autoreleased with no pool
+// in place"). Results are copied into Go-owned values before the pool is
+// drained, so nothing dangles. Thread pinning keeps the pool push/pop on the
+// same thread (pools are thread-local) and the pop/unlock run on every return
+// path via defer. The -ssid selector is deliberately never sent here.
+func (c *coreWLANClient) adapters() ([]cwAdapter, error) {
 	cw := c.cw
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -231,15 +285,6 @@ func (c *coreWLANClient) adapters(includeSSID bool) ([]cwAdapter, error) {
 			Name:      nsStringToGo(iface.Send(cw.sel.name), cw.sel.utf8),
 			PoweredOn: objc.Send[bool](iface, cw.sel.powerOn),
 		}
-		// The SSID is read from the OS only when network.wifi.ssid.read is granted;
-		// otherwise it is never queried (no read-then-redact). SSIDKnown stays false,
-		// so normalizeCW reports the SSID as withheld.
-		if includeSSID {
-			if ssid := iface.Send(cw.sel.ssid); ssid != 0 {
-				a.SSID = nsStringToGo(ssid, cw.sel.utf8)
-				a.SSIDKnown = true
-			}
-		}
 		if ch := iface.Send(cw.sel.wlanChannel); ch != 0 {
 			a.HasChannel = true
 			a.Channel = objc.Send[int](ch, cw.sel.channelNumber)
@@ -252,6 +297,36 @@ func (c *coreWLANClient) adapters(includeSSID bool) ([]cwAdapter, error) {
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// ssid performs THE location-gated CoreWLAN read: -[CWInterface ssid] on the
+// named interface. Same thread/pool discipline as adapters. The interface is
+// found by walking -interfaces and matching the name locally, which avoids
+// having to construct an NSString for -interfaceWithName:.
+func (c *coreWLANClient) ssid(ifname string) (string, bool, error) {
+	cw := c.cw
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	pool := cw.poolPush()
+	defer cw.poolPop(pool)
+
+	arr := cw.shared.Send(cw.sel.interfaces)
+	if arr == 0 {
+		return "", false, nil
+	}
+	count := int(objc.Send[uint64](arr, cw.sel.count))
+	for i := 0; i < count; i++ {
+		iface := arr.Send(cw.sel.objectAtIndex, uint64(i))
+		if iface == 0 || nsStringToGo(iface.Send(cw.sel.name), cw.sel.utf8) != ifname {
+			continue
+		}
+		ssid := iface.Send(cw.sel.ssid)
+		if ssid == 0 {
+			return "", false, nil
+		}
+		return nsStringToGo(ssid, cw.sel.utf8), true, nil
+	}
+	return "", false, nil
 }
 
 // cwBand maps CWChannelBand to the band string. CWChannelBandUnknown=0,

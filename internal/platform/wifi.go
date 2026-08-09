@@ -52,7 +52,11 @@ func channelFromFrequencyMHz(mhz int) int {
 
 // qualityFromDBm converts a signal strength (dBm) to a 0-100 link-quality
 // percentage using the common linear approximation quality = 2×(dBm + 100),
-// clamped. Used only when the OS reports dBm but not a native quality percent.
+// clamped. Used when the OS exposes dBm but no native quality percent through
+// the path we read (on Windows the driver's own quality only comes with the
+// location-gated query, so the ungated tick derives it here instead — deriving
+// both numbers from one live reading also keeps the two series from ever
+// disagreeing, which a cached native quality beside a live dBm would).
 func qualityFromDBm(dbm int) int {
 	q := 2 * (dbm + 100)
 	if q < 0 {
