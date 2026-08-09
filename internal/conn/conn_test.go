@@ -247,8 +247,8 @@ func TestRunRejectsBadServerURL(t *testing.T) {
 }
 
 // TestHelloThenDrainAck covers the core uplink in both wire formats: Hello is
-// the first frame (with ReportedConfigVersion -1), a WAL batch goes out as a
-// Packet, and the server's Ack clears it from the WAL.
+// the first frame, a WAL batch goes out as a Packet, and the server's Ack
+// clears it from the WAL.
 func TestHelloThenDrainAck(t *testing.T) {
 	for name, format := range map[string]string{
 		"protobuf": wire.SubprotocolProtobuf,
@@ -298,9 +298,6 @@ func TestHelloThenDrainAck(t *testing.T) {
 			case got = <-gotCh:
 			case <-time.After(5 * time.Second):
 				t.Fatal("server never received hello+packet")
-			}
-			if got.hello.ReportedConfigVersion != -1 {
-				t.Errorf("hello ReportedConfigVersion = %d, want -1", got.hello.ReportedConfigVersion)
 			}
 			if got.hello.Hostname != "test-host" || got.hello.SchemaVersion != protocol.SchemaVersion {
 				t.Errorf("hello identity fields wrong: %+v", got.hello)
@@ -399,8 +396,9 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 }
 
 // TestDesiredStateApplied covers the config downlink: a pushed DesiredState
-// reaches every configurable and the scheduler, and the next packet reports
-// the new config version.
+// reaches every configurable and the scheduler, and the uplink keeps flowing
+// afterwards. (The applied version itself is confirmed to the server via
+// MonitorStatus frames, not the packet — packets carry no config watermark.)
 func TestDesiredStateApplied(t *testing.T) {
 	deps, outbox, fc, fs := newTestDeps(t)
 	pktCh := make(chan telemetry.Packet, 1)
@@ -439,7 +437,7 @@ func TestDesiredStateApplied(t *testing.T) {
 	if base, regular := fs.intervals(); base != 5*time.Second || regular != 60*time.Second {
 		t.Errorf("intervals = %v/%v, want 5s/60s", base, regular)
 	}
-	// A packet sent after the push must carry the applied version.
+	// A packet sent after the push still flows and is acked.
 	if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{
 		{TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 2, Unit: telemetry.UnitSec},
 	}}, testServer); err != nil {
@@ -447,8 +445,8 @@ func TestDesiredStateApplied(t *testing.T) {
 	}
 	select {
 	case pkt := <-pktCh:
-		if pkt.ReportedConfigVersion != 7 {
-			t.Errorf("packet ReportedConfigVersion = %d, want 7", pkt.ReportedConfigVersion)
+		if len(pkt.Metrics) != 1 {
+			t.Errorf("post-push packet = %+v, want 1 metric", pkt)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no packet after DesiredState push")

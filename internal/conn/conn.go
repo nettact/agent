@@ -108,8 +108,7 @@ type Options struct {
 	SiteID  string
 
 	// Hello carries the static identity fields sent as the first frame of every
-	// (re)connect. ReportedConfigVersion is overwritten per connect with the
-	// version applied in this process — the caller's value is ignored.
+	// (re)connect.
 	Hello wire.Hello
 
 	// OnSession, if non-nil, is called with up=true right after the Hello frame
@@ -500,10 +499,9 @@ func (r *runner) session(ctx context.Context) error {
 	}()
 
 	// Hello MUST be the first frame: it replaces the old per-request X-Agent-*
-	// headers and reports the config version applied in this process so the
-	// server knows its on-connect DesiredState push will land on fresh state.
+	// headers. (The server pushes DesiredState unconditionally on connect, so
+	// Hello carries no applied-config watermark; MonitorStatus is that signal.)
 	hello := r.opts.Hello
-	hello.ReportedConfigVersion = r.appliedConfigVersion
 	if err := r.writeFrame(sessionCtx, c, wire.Frame{Hello: &hello}); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
@@ -695,21 +693,20 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 			return nil
 		}
 		pkt := telemetry.Packet{
-			SchemaVersion:         protocol.SchemaVersion,
-			AgentID:               r.opts.AgentID,
-			SiteID:                r.opts.SiteID,
-			Sequence:              batch.Sequence,
-			SentAt:                time.Now().UTC(),
-			Metrics:               batch.Metrics,
-			Events:                batch.Events,
-			InventoryDelta:        batch.Inventory,
-			InterfaceSnapshots:    batch.Snapshots,
-			GameRuns:              batch.GameRuns,
-			GameBuckets:           batch.GameBuckets,
-			GameGaps:              batch.GameGaps,
-			GameHostSeconds:       batch.GameHostSeconds,
-			TraceResults:          batch.TraceResults,
-			ReportedConfigVersion: r.appliedConfigVersion,
+			SchemaVersion:      protocol.SchemaVersion,
+			AgentID:            r.opts.AgentID,
+			SiteID:             r.opts.SiteID,
+			Sequence:           batch.Sequence,
+			SentAt:             time.Now().UTC(),
+			Metrics:            batch.Metrics,
+			Events:             batch.Events,
+			InventoryDelta:     batch.Inventory,
+			InterfaceSnapshots: batch.Snapshots,
+			GameRuns:           batch.GameRuns,
+			GameBuckets:        batch.GameBuckets,
+			GameGaps:           batch.GameGaps,
+			GameHostSeconds:    batch.GameHostSeconds,
+			TraceResults:       batch.TraceResults,
 		}
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {
 			return fmt.Errorf("write packet seq=%d: %w", batch.Sequence, err)
