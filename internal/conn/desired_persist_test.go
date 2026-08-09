@@ -327,6 +327,26 @@ func TestQuiesceStopsGameCapture(t *testing.T) {
 	}
 }
 
+// …but a refusal that arrives before anything was ever captured must not START
+// the sensor. The applier is wired for the game owner whether or not it has been
+// configured, and its supervisor treats the first configuration as the signal to
+// spawn the child — so an unconditional stop would launch the process in order
+// to silence it, on an agent that had never been told to capture anything.
+func TestQuiesceDoesNotStartAnUnconfiguredSensor(t *testing.T) {
+	dir := persistTempDir(t)
+	game := &fakeGameApplier{}
+	r := persistRunner(dir, &fakeConfigurable{}, &fakeScheduler{}, newTracker(nil))
+	r.deps.Game = game
+
+	// The first dial is refused before any push or restore installed a config.
+	r.quiesce("credential refused before anything was configured")
+
+	if n := len(game.calls()); n != 0 {
+		t.Fatalf("game applier called %d times on an unconfigured agent; the "+
+			"supervisor's first SetConfig is what starts the sensor", n)
+	}
+}
+
 // The three configuration axes are guarded independently and can arrive out of
 // order, so the cache must store what is INSTALLED — not whatever game/diag
 // block happened to ride along with the last accepted probe push.

@@ -351,22 +351,36 @@ func clockOffset(c ClockSource, epoch string, mono int64, rev int) time.Duration
 
 // expiredAt reports whether a group is older than retention.
 //
-// Both operands are converted to the CORRECTED clock domain before comparing,
-// which is the whole reason this is a function rather than a subtraction at each
-// call site. Correcting only the group's arrival time — while the caller derives
-// its cutoff from the raw local clock — mixes domains, and the error shows up as
-// data loss in exactly one direction: when an anchor reports the local clock is
-// running AHEAD, every stored group's time is pulled back by the skew while the
-// cutoff is not, so a skew larger than the retention window makes freshly
-// spilled groups of the current process look expired and deletes them before
-// they can be uploaded.
+// Both operands are put in ONE clock domain before comparing, and which domain
+// is decided per group — that is the whole reason this is a function rather
+// than a subtraction at each call site.
 //
-// Correcting is still necessary in the other direction: a clock stepped FORWARD
-// leaves every group written before it looking abruptly older by the size of the
-// step, which against the lite build's half-hour persist window is enough to
-// close an outage's window early.
+// A group this process stamped is correctable, so both sides move: its time by
+// its own offset, the present by the standing error. A group an EARLIER process
+// stamped is not correctable at all (see ClockSource.Epoch — that run's error is
+// not recoverable from this one's observations), so neither side moves. Its
+// stamp and a raw reading of now were both taken from the same machine's wall
+// clock, wrong in the same direction, which makes raw-versus-raw the only
+// self-consistent comparison available for it.
+//
+// Mixing the two is what makes this dangerous in both directions, and each
+// direction deletes data. Correcting only the stored side lets a clock running
+// far AHEAD pull every group's time back past an unmoved cutoff. Correcting only
+// the present lets a clock running far BEHIND — then anchored forward on the
+// handshake, before the session's opening drain — push the cutoff past the raw
+// stamps of everything the previous process spilled, which is precisely the
+// backlog this whole feature exists to deliver.
 func expiredAt(c ClockSource, at time.Time, epoch string, mono int64, now time.Time, retention time.Duration) bool {
+	if !correctable(c, epoch) {
+		return at.Before(now.Add(-retention))
+	}
 	return correctedAt(c, at, epoch, mono).Before(correctedNow(c, now).Add(-retention))
+}
+
+// correctable reports whether this process's clock model has anything to say
+// about stamps carrying the given epoch.
+func correctable(c ClockSource, epoch string) bool {
+	return c != nil && epoch != "" && epoch == c.Epoch()
 }
 
 // correctedAt is a group's arrival time as the corrected clock would have

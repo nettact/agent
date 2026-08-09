@@ -390,3 +390,50 @@ func TestALargeStandingClockErrorDoesNotExpireFreshBacklog(t *testing.T) {
 		t.Fatalf("sample sent at %s, want the corrected %s", got, want)
 	}
 }
+
+// The other direction of the same hazard, and the one the router case actually
+// hits: a clock far BEHIND, anchored forward on the handshake before the
+// session's opening drain. Groups an EARLIER process spilled cannot be corrected
+// — that run's error is not recoverable — so moving only the present would push
+// the cutoff past their raw stamps and delete exactly the backlog this feature
+// exists to deliver.
+func TestAnAnchorDoesNotExpireAnEarlierProcessesBacklog(t *testing.T) {
+	dir := tempWALDir(t)
+
+	old := &fakeClock{epoch: "proc-1"}
+	s1, err := Open(dir, []string{clockServer}, Options{Persist: true, Clock: old})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := s1.Append(metricAt(clockBase, "1.1.1.1"), clockServer); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The new process learns from the handshake that its clock is four days
+	// behind — more than the retention window.
+	fresh := &fakeClock{epoch: "proc-2"}
+	s2, err := Open(dir, []string{clockServer}, Options{Persist: true, Clock: fresh})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+	fresh.advance(time.Second)
+	fresh.standingError(4 * 24 * time.Hour)
+
+	b, ok, err := s2.NextBatch(clockServer, 100)
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if !ok {
+		t.Fatal("the previous process's backlog was expired away: retention " +
+			"compared its uncorrectable stamp against a corrected now")
+	}
+	// And it is still served exactly as stored — this process cannot know what
+	// error that one was running with.
+	if got := b.Metrics[0].TS.UTC(); !got.Equal(clockBase) {
+		t.Fatalf("sample sent at %s, want it untouched", got)
+	}
+}

@@ -1062,17 +1062,17 @@ func (r *runner) restoreProbeConfig() {
 // zero: the server's on-connect push carries whatever version it likes, and none
 // of them should be judged stale against a generation that has been torn down.
 //
-// Game capture stops too. An earlier version of this left the sensor alone on
-// the theory that it is one process shared by every server, so silencing it here
-// would speak for servers that had not been refused — but that is not how it is
-// wired: only the game owner (Servers[0]) is given an applier at all, and only
-// its data is ever queued, so this runner having one means the refusal IS the
-// owner's. Leaving it running would be worse than untidy now that the cache
-// restores game configuration before the first dial: an agent deleted
-// server-side would resume capturing what people play, from disk, on every
-// reboot, forever. The stop is expressed in the configuration's own vocabulary —
-// no profiles and no unmatched recording is exactly "capture nothing" — rather
-// than as a new sensor verb.
+// Game capture stops too, when there was any. An earlier version of this left
+// the sensor alone on the theory that it is one process shared by every server,
+// so silencing it here would speak for servers that had not been refused — but
+// that is not how it is wired: only the game owner (Servers[0]) is given an
+// applier at all, and only its data is ever queued, so this runner having one
+// means the refusal IS the owner's. Leaving it running would be worse than
+// untidy now that the cache restores game configuration before the first dial:
+// an agent deleted server-side would resume capturing what people play, from
+// disk, on every reboot, forever. The stop is expressed in the configuration's
+// own vocabulary — no profiles and no unmatched recording is exactly "capture
+// nothing" — rather than as a new sensor verb.
 func (r *runner) quiesce(reason string) {
 	for _, cfg := range r.deps.Configurables {
 		cfg.SetTargets(nil)
@@ -1083,7 +1083,13 @@ func (r *runner) quiesce(reason string) {
 	if r.deps.Proxies != nil {
 		r.deps.Proxies.Apply(nil)
 	}
-	if r.deps.Game != nil {
+	if r.deps.Game != nil && r.appliedGame != nil {
+		// Only when capture was actually configured. The applier is wired for the
+		// game owner whether or not anything has been pushed or restored, and its
+		// supervisor treats the FIRST configuration as the signal to start — so an
+		// unconditional stop here would spawn the sensor in order to silence it,
+		// on an agent that had never been told to capture anything at all.
+		//
 		// Straight to the applier, not through applyGameConfig: its staleness
 		// guard is about ordering pushes from a server that is still talking to
 		// us, and this is the one case that has to win regardless of serial.
