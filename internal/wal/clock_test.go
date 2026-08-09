@@ -391,17 +391,16 @@ func TestALargeStandingClockErrorDoesNotExpireFreshBacklog(t *testing.T) {
 	}
 }
 
-// A previous process's backlog has no knowable age — that run never learned its
-// own clock error — and the two available readings disagree exactly when it
-// matters. This pins the side the disagreement is resolved towards.
+// A previous process's backlog is never deleted on the strength of a correction
+// that cannot be applied to its stamps.
 //
-// sysfixtime sets a no-RTC clock from the newest file mtime, which is the
-// agent's own last write, so after a week powered off the RAW clock lands back
-// on those stamps and week-old backlog reads as brand new. The correction is the
-// only thing that knows about the missing week, and replaying past the retention
-// window is not a lost diagnostic — server-core has pruned the dedup row that
-// would have recognised the packet, so it is re-ingested as if new.
-func TestAnEarlierProcessesBacklogExpiresOnceTheCorrectionRevealsItsAge(t *testing.T) {
+// The competing hazard is real — sysfixtime resets a no-RTC clock onto the
+// agent's own last write, so week-old backlog can read as fresh and be uploaded
+// past the window server-core prunes its dedup rows on — but the costs are not
+// equal. This deletion is permanent and takes exactly the outage evidence the
+// feature exists to preserve; the late replay is idempotent at the sample level
+// and rejected by the detector watermark.
+func TestAnEarlierProcessesBacklogIsNeverDeletedByThisProcessesCorrection(t *testing.T) {
 	dir := tempWALDir(t)
 
 	old := &fakeClock{epoch: "proc-1"}
@@ -416,8 +415,9 @@ func TestAnEarlierProcessesBacklogExpiresOnceTheCorrectionRevealsItsAge(t *testi
 		t.Fatalf("close: %v", err)
 	}
 
-	// The machine was off for a week; sysfixtime put the clock back where the
-	// last write left it, and the handshake reveals the missing time.
+	// The agent restarts seconds later on the same boot, and the handshake
+	// reveals that this machine's clock is a week out — for a reason that has
+	// nothing to do with downtime.
 	fresh := &fakeClock{epoch: "proc-2"}
 	s2, err := Open(dir, []string{clockServer}, Options{Persist: true, Clock: fresh})
 	if err != nil {
@@ -427,11 +427,16 @@ func TestAnEarlierProcessesBacklogExpiresOnceTheCorrectionRevealsItsAge(t *testi
 	fresh.advance(time.Second)
 	fresh.standingError(7 * 24 * time.Hour)
 
-	if _, ok, err := s2.NextBatch(clockServer, 100); err != nil {
+	b, ok, err := s2.NextBatch(clockServer, 100)
+	if err != nil {
 		t.Fatalf("batch: %v", err)
-	} else if ok {
-		t.Fatal("week-old backlog was served: the raw clock says it is fresh only " +
-			"because sysfixtime reset the clock onto its own timestamps")
+	}
+	if !ok {
+		t.Fatal("a seconds-old segment from the previous process was deleted by a " +
+			"correction that does not describe the clock that wrote it")
+	}
+	if got := b.Metrics[0].TS.UTC(); !got.Equal(clockBase) {
+		t.Fatalf("sample sent at %s, want it served exactly as stored", got)
 	}
 }
 

@@ -360,29 +360,33 @@ func clockOffset(c ClockSource, epoch string, mono int64, rev int) time.Duration
 //
 // For a group an EARLIER process stamped there is no right answer, because that
 // run's error is not recoverable from this one's observations (see
-// ClockSource.Epoch) — and the two available readings disagree in the case that
-// matters:
+// ClockSource.Epoch) — and the two available readings disagree:
 //
 //   - Raw versus raw. The stamp and an uncorrected now came from the same
 //     machine's clock, wrong in the same direction, so this is self-consistent.
-//     But sysfixtime sets a no-RTC clock from the newest file mtime, which is the
-//     agent's own last write — so after a week powered off, raw now lands right
-//     back at those stamps and week-old backlog reads as brand new.
-//   - Corrected present versus raw stamp. This measures the true downtime, which
-//     is the honest age in that case. It is wrong when the clock is wrong for a
-//     reason OTHER than downtime, where it can discard a genuinely fresh backlog.
+//     Its failure mode is retention: sysfixtime sets a no-RTC clock from the
+//     newest file mtime, which is the agent's own last write, so after a week
+//     powered off the raw clock lands back on those stamps and week-old backlog
+//     reads as brand new and is uploaded past the window server-core prunes its
+//     dedup rows on.
+//   - Corrected present versus raw stamp. This measures the true downtime in
+//     that case, but it is catastrophic in the other one: an agent that restarts
+//     on the SAME boot while its clock is wrong by more than the retention
+//     window — wrong for any reason other than downtime — deletes a
+//     seconds-old segment before it has been drained.
 //
-// It expires when EITHER says so, which resolves the disagreement towards the
-// server: replaying a group past the retention window is not a lost diagnostic,
-// it is telemetry re-ingested as if new, because server-core has already pruned
-// the (agent_id, sequence) row that would have recognised it as a duplicate (see
-// persistRetention in wal_lite.go). Losing an unknowable-age backlog is the
-// cheaper mistake, and it is only reachable when this machine's clock is wrong
-// by more than the whole retention window.
+// This uses the RAW comparison, and never deletes on the strength of a
+// correction it cannot apply to the stamp, because the two failure modes are not
+// remotely equal in cost. Deleting is permanent and destroys exactly the outage
+// evidence this whole feature exists to preserve. Replaying late is bounded and
+// self-healing: server-core stores samples with INSERT OR IGNORE on
+// (series_id, ts), so re-ingesting them changes nothing, and the availability
+// detector's watermark rejects every round at or below the newest it has already
+// folded — so a packet that outlives its dedup row costs some repeated work and
+// alters no history.
 func expiredAt(c ClockSource, at time.Time, epoch string, mono int64, now time.Time, retention time.Duration) bool {
 	if !correctable(c, epoch) {
-		return at.Before(now.Add(-retention)) ||
-			at.Before(correctedNow(c, now).Add(-retention))
+		return at.Before(now.Add(-retention))
 	}
 	return correctedAt(c, at, epoch, mono).Before(correctedNow(c, now).Add(-retention))
 }
