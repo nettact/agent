@@ -67,6 +67,17 @@ type segLine struct {
 	Gid   uint64    `json:"gid"`
 	Owner string    `json:"owner"`
 	R     Records   `json:"r"`
+	// Epoch/Mono identify the process that stamped this group's payload and when,
+	// on that process's monotonic clock. They travel with the group so a spill
+	// that happens before the clock is fixed can still be corrected when it is —
+	// which on a router is the ordinary case, since spilling is what an agent
+	// does precisely while it is offline with a clock nothing has set.
+	//
+	// A group written by an earlier run carries that run's epoch, which no later
+	// process matches, so it is served exactly as stored. Segments written before
+	// these fields existed decode to the empty epoch and behave the same way.
+	Epoch string `json:"epoch,omitempty"`
+	Mono  int64  `json:"mono,omitempty"`
 }
 
 // diskGroup locates one live group without holding its payload: the segment it
@@ -84,6 +95,11 @@ type diskGroup struct {
 	size  int
 	at    time.Time
 	n     int
+	// epoch/mono mirror the segLine fields, kept in the index so serving a claim
+	// can compute each group's clock correction without reading its payload back
+	// first.
+	epoch string
+	mono  int64
 }
 
 // cursorState is one server's persisted position. The claim fields are omitted
@@ -190,7 +206,7 @@ func writeSegmentTemp(dir string, groups []memGroup) (tmpPath string, index []di
 	var off int64
 	for _, g := range groups {
 		var line []byte
-		line, err = json.Marshal(segLine{At: g.at, Gid: g.gid, Owner: g.owner, R: g.rec})
+		line, err = json.Marshal(segLine{At: g.at, Gid: g.gid, Owner: g.owner, R: g.rec, Epoch: g.epoch, Mono: g.mono})
 		if err != nil {
 			return "", nil, err
 		}
@@ -200,6 +216,7 @@ func writeSegmentTemp(dir string, groups []memGroup) (tmpPath string, index []di
 		}
 		index = append(index, diskGroup{
 			gid: g.gid, owner: g.owner, line: len(index), off: off, size: len(line), at: g.at, n: g.n,
+			epoch: g.epoch, mono: g.mono,
 		})
 		off += int64(len(line))
 	}
@@ -244,6 +261,7 @@ func scanSegment(path string, seg uint64) ([]diskGroup, error) {
 			out = append(out, diskGroup{
 				gid: sl.Gid, owner: sl.Owner, seg: seg, line: len(out),
 				off: off, size: len(line), at: sl.At, n: rowsOf(sl.R),
+				epoch: sl.Epoch, mono: sl.Mono,
 			})
 			off += int64(len(line))
 		}

@@ -53,6 +53,10 @@ type Store struct {
 	maxRows   int
 	retention time.Duration
 
+	// clock supplies the correction for telemetry stamped while this machine's
+	// wall clock was wrong. Nil disables correction; see ClockSource.
+	clock ClockSource
+
 	mem     []memGroup // buffered, gid-ascending; includes groups under a claim
 	memRows int
 
@@ -81,12 +85,14 @@ type Store struct {
 // pinning its backlog until the retention window expires. Renaming a server
 // entry therefore discards its backlog, the same as removing it.
 //
-// Options is accepted and ignored. Everything in it tunes the lite build's
-// conditional durable tier, and this store's tier is unconditional: it always
-// spills, so "persist while disconnected" is already what it does and a window
-// bounding flash wear has nothing to bound. Taking the argument anyway keeps one
-// call site in agentrt for both builds.
-func Open(dir string, servers []string, _ Options) (*Store, error) {
+// Options.Persist and Options.PersistWindow are accepted and ignored: both tune
+// the lite build's conditional durable tier, and this store's tier is
+// unconditional — it always spills, so "persist while disconnected" is already
+// what it does and a window bounding flash wear has nothing to bound. Taking the
+// argument anyway keeps one call site in agentrt for both builds. Options.Clock
+// IS honoured here, because a workstation's clock can be wrong for the same
+// reasons a router's can and the correction is not a flash-wear question.
+func Open(dir string, servers []string, opt Options) (*Store, error) {
 	if len(servers) == 0 {
 		return nil, errors.New("wal: Open needs at least one server name")
 	}
@@ -102,6 +108,7 @@ func Open(dir string, servers []string, _ Options) (*Store, error) {
 		durableSeq: 1,
 		nextSeg:    1,
 		nextGid:    1,
+		clock:      opt.Clock,
 		cursors:    make(map[string]*cursor, len(servers)),
 	}
 	for _, name := range servers {
@@ -294,7 +301,8 @@ func (s *Store) Append(r Records, server string) (dropped int, err error) {
 		return 0, fmt.Errorf("wal: append for unknown server %q", server)
 	}
 	now := time.Now().UTC()
-	s.mem = append(s.mem, memGroup{gid: s.nextGid, owner: server, at: now, rec: r, n: n})
+	epoch, mono := clockTag(s.clock)
+	s.mem = append(s.mem, memGroup{gid: s.nextGid, owner: server, at: now, rec: r, n: n, epoch: epoch, mono: mono})
 	s.nextGid++
 	s.memRows += n
 
@@ -390,7 +398,7 @@ func (s *Store) spillLocked(now time.Time) (dropped int, err error) {
 	index = append(index, lines...)
 
 	claims := s.copyClaimsLocked()
-	index = expireIndex(index, now.Add(-s.retention))
+	index = expireIndex(index, now.Add(-s.retention), s.clock)
 	// Everything live now lives in index (the buffer is being emptied into it),
 	// so counting against index alone is the whole picture.
 	reconcileClaims(claims, index, nil)
@@ -454,9 +462,9 @@ func (s *Store) applyClaimsLocked(claims map[string]*claim) {
 // Only the durable tier expires. The memory tier cannot: memBufferAge forces a
 // spill long before the retention window, so nothing buffered is ever old
 // enough.
-func expireIndex(index []diskGroup, cutoff time.Time) []diskGroup {
+func expireIndex(index []diskGroup, cutoff time.Time, clock ClockSource) []diskGroup {
 	drop := 0
-	for drop < len(index) && index[drop].at.Before(cutoff) {
+	for drop < len(index) && correctedAt(clock, index[drop].at, index[drop].epoch, index[drop].mono).Before(cutoff) {
 		drop++
 	}
 	if drop == 0 {
@@ -682,7 +690,7 @@ func (s *Store) nextDiskBatchLocked(server string, c *cursor, maxItems int) (Bat
 	if err != nil {
 		return Batch{}, false, err
 	}
-	c.claim = &claim{seq: seq, from: first, to: last, n: take}
+	c.claim = &claim{seq: seq, from: first, to: last, n: take, clockRev: clockRevOf(s.clock)}
 	if err := s.saveStateLocked(); err != nil {
 		// The claim never became durable, so nothing may be sent under it: a
 		// crash would leave those groups unclaimed and they would go out again
@@ -706,6 +714,8 @@ func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batc
 	rows := 0
 	var first, last uint64
 	recs := make([]Records, 0, 8)
+	offs := make([]time.Duration, 0, 8)
+	rev := clockRevOf(s.clock)
 	for _, g := range s.mem {
 		if g.owner != server || g.gid <= c.acked {
 			continue
@@ -719,6 +729,7 @@ func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batc
 		last = g.gid
 		rows += g.n
 		recs = append(recs, g.rec)
+		offs = append(offs, clockOffset(s.clock, g.epoch, g.mono, rev))
 	}
 	if len(recs) == 0 {
 		return Batch{}, false, nil
@@ -727,14 +738,14 @@ func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batc
 	if err != nil {
 		return Batch{}, false, err
 	}
-	c.claim = &claim{seq: seq, from: first, to: last, n: len(recs)}
-	return flatten(seq, recs), true, nil
+	c.claim = &claim{seq: seq, from: first, to: last, n: len(recs), clockRev: rev}
+	return flatten(seq, recs, offs), true, nil
 }
 
 // expireLocked drops backlog past the retention window and makes the removal
 // durable. Caller holds mu.
 func (s *Store) expireLocked(now time.Time) error {
-	index := expireIndex(s.disk, now.Add(-s.retention))
+	index := expireIndex(s.disk, now.Add(-s.retention), s.clock)
 	if len(index) == len(s.disk) {
 		return nil
 	}
@@ -761,19 +772,24 @@ func (s *Store) loadClaimLocked(server string, cl *claim) (Batch, error) {
 		}
 	}
 	recs := make([]Records, 0, cl.n)
+	offs := make([]time.Duration, 0, cl.n)
 	if len(dg) > 0 {
 		loaded, err := readGroups(s.dir, dg)
 		if err != nil {
 			return Batch{}, err
 		}
 		recs = append(recs, loaded...)
+		for _, g := range dg {
+			offs = append(offs, clockOffset(s.clock, g.epoch, g.mono, cl.clockRev))
+		}
 	}
 	for _, g := range s.mem {
 		if g.owner == server && cl.covers(g.gid) {
 			recs = append(recs, g.rec)
+			offs = append(offs, clockOffset(s.clock, g.epoch, g.mono, cl.clockRev))
 		}
 	}
-	return flatten(cl.seq, recs), nil
+	return flatten(cl.seq, recs, offs), nil
 }
 
 // allocSeqLocked hands out the next packet sequence, reserving a fresh block

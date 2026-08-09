@@ -33,6 +33,8 @@ import (
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/enroll"
 	"github.com/nettact/agent/internal/gamesense"
+	"github.com/nettact/agent/internal/clockmon"
+	"github.com/nettact/agent/internal/desiredstate"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
@@ -357,6 +359,13 @@ type Config struct {
 // be a hand-edited subset, and forgetting the omitted servers would cost an
 // operator-issued token to recover.
 func PruneCredentials(dataDir string, keep []string) (int, error) {
+	// The cached target lists are pruned alongside the credentials they are bound
+	// to. Leaving one behind would be harmless — its binding names a credential
+	// that no longer exists, so a restore refuses it — but it would also sit there
+	// forever describing monitors nobody is running.
+	if _, err := desiredstate.Prune(dataDir, keep); err != nil {
+		log.Printf("could not prune cached configs: %v", err)
+	}
 	return identity.PruneCredentials(dataDir, keep)
 }
 
@@ -484,9 +493,17 @@ func Run(ctx context.Context, cfg Config) error {
 	for i, sc := range cfg.Servers {
 		names[i] = sc.Name
 	}
+	// One clock monitor per process. Clock error is a fact about the machine, not
+	// about any one server, and every server's telemetry rides the same outbox —
+	// so the correction has to be established once and applied uniformly. The
+	// epoch is per PROCESS rather than per boot on purpose: a later agent process
+	// shares the machine's boot but not this one's clock observations, and must
+	// not have this one's corrections applied to stamps it never took.
+	clock := clockmon.New(uuid.NewString())
 	outbox, err := wal.Open(filepath.Join(cfg.DataDir, "wal"), names, wal.Options{
 		Persist:       cfg.Persist,
 		PersistWindow: cfg.PersistWindow,
+		Clock:         clock,
 	})
 	if err != nil {
 		cancel()
@@ -543,7 +560,7 @@ func Run(ctx context.Context, cfg Config) error {
 	runtimes := make([]*serverRuntime, len(cfg.Servers))
 	for i, sc := range cfg.Servers {
 		runtimes[i] = buildServer(sc, views[i], reports[i], outbox, p,
-			cfg.Limits, cfg.UploadInterval, traceLimit, probeGate, hostname)
+			cfg.Limits, cfg.UploadInterval, traceLimit, probeGate, hostname, clock)
 	}
 
 	// The game sensor is a child process streaming a line per second, so unlike
@@ -667,6 +684,21 @@ func Run(ctx context.Context, cfg Config) error {
 		// feed it and be joined in the same phase.
 		rt.trigger.Start(runCtx)
 	}
+
+	// Watch this machine's clock for the rest of the run. It joins hbWG so it is
+	// stopped before the outbox closes: the store asks it for a correction on
+	// every claim, and a monitor still recording steps into a closing store would
+	// be answering questions nobody can act on.
+	clockStop := make(chan struct{})
+	hbWG.Add(1)
+	go func() {
+		defer hbWG.Done()
+		go func() {
+			<-runCtx.Done()
+			close(clockStop)
+		}()
+		clock.Run(clockStop)
+	}()
 
 	// Status heartbeat: uptime + WAL depth over the same WAL→WS path. Emitted per
 	// server, because the backlog depth is per server — one server being
@@ -901,7 +933,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 					s.LastError = &statusError{Code: string(conn.Classify(err)), Detail: err.Error()}
 				})
 			},
-		}, rt.connDeps(cred.AgentID))
+		}, rt.connDeps(cred, env.cfg.DataDir))
 
 		if ctx.Err() != nil {
 			return nil
@@ -920,6 +952,15 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 			// The stale credential is still on disk (permissions, antivirus lock,
 			// read-only FS), so looping would reload it and be revoked again.
 			return fmt.Errorf("delete revoked credential: %w", derr)
+		}
+		// The cached target list goes with it. The session has already stopped
+		// probing (conn quiesces on the revoke close code); this is what stops a
+		// restart from resurrecting the list. Best-effort on purpose: a cache the
+		// agent cannot delete is still bound to the credential just deleted, so the
+		// binding check refuses to restore it anyway — this only keeps the file
+		// from lingering.
+		if derr := desiredstate.Delete(env.cfg.DataDir, rt.cfg.Name); derr != nil {
+			log.Printf("[%s] could not drop the cached config of the revoked credential: %v", rt.cfg.Name, derr)
 		}
 		cred, enrolled = identity.Credential{}, false
 		log.Printf("[%s] agent was deleted on the server; re-enrolling", rt.cfg.Name)

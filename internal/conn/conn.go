@@ -17,6 +17,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/nettact/agent/internal/desiredstate"
 	"github.com/nettact/agent/internal/hostsnapshot"
 	"github.com/nettact/agent/internal/monitoreval"
 	"github.com/nettact/agent/internal/proxydial"
@@ -164,8 +165,7 @@ type DiagApplier interface {
 	ApplyDiagPolicy(p *pcfg.DiagPolicy)
 }
 
-// GameApplier receives the site's game-capture configuration from DesiredState
-// pushes. It is a second, independent configuration axis: game profiles and
+// GameApplier receives the site's game-capture configuration from DesiredState// pushes. It is a second, independent configuration axis: game profiles and
 // probe targets change at unrelated times and carry their own version numbers,
 // so they are applied through separate hooks rather than one "here is the new
 // state" call (see applyPush).
@@ -175,6 +175,26 @@ type DiagApplier interface {
 // sensor process.
 type GameApplier interface {
 	ApplyGameConfig(cfg pcfg.GameConfig)
+}
+
+// ClockAnchor is told what the server thinks the time is, so telemetry stamped
+// by a wall clock nothing has set can still be uploaded under the times it
+// actually happened at. Implemented by internal/clockmon.
+type ClockAnchor interface {
+	// Anchor states that the server's clock read serverTime at the instant this
+	// agent's read localTime.
+	Anchor(serverTime, localTime time.Time)
+}
+
+// serverClock is the optional half of a transport: a link that learned the
+// server's clock during its own handshake.
+//
+// It is an interface satisfied by the WebSocket adapter rather than a method on
+// wire.Conn because only that transport has an answer. The desktop's in-process
+// pipe connects a server running on this very machine, reading this very clock —
+// there is no skew to measure and nothing to report.
+type serverClock interface {
+	ServerDate() (time.Time, bool)
 }
 
 // Deps are the agent-side components the session drives.
@@ -203,6 +223,16 @@ type Deps struct {
 	// Diag applies the pushed path-diagnostic policy to this server's traceroute
 	// trigger. Nil in tests and in builds with no trigger wired.
 	Diag DiagApplier
+
+	// Desired persists the probe half of this server's applied DesiredState, so a
+	// restart while the server is unreachable restores the targets instead of
+	// leaving the agent with nothing to probe. Nil (tests) simply disables the
+	// restore: the session then learns its targets the way it always did.
+	Desired *desiredstate.Binding
+
+	// Clock learns how wrong this machine's wall clock is, from the server's own
+	// time. Nil disables the anchor; step detection is independent of it.
+	Clock ClockAnchor
 
 	// Effective/Granted/Supported are the agent's permission views, used to
 	// classify each requested snapshot scope (collected/denied/unsupported).
@@ -272,9 +302,20 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// on-connect DesiredState push is always applied, even after an agent
 		// restart where the server thinks we are current. Both axes start there
 		// for the same reason.
+		//
+		// restoreProbeConfig below may lift these to a cached generation. That does
+		// not weaken the guarantee: the guard ignores versions strictly LOWER than
+		// the applied one, so the on-connect push — carrying the same version when
+		// nothing changed — still installs, and with it the proxies the cache
+		// deliberately never stored.
 		appliedConfigVersion: -1,
 		appliedGameVersion:   -1,
 	}
+	// Resume monitoring before the first dial. Everything downstream of the
+	// collectors already survives an unreachable server; the target list was the
+	// one thing that did not, which is why a router rebooted mid-outage used to
+	// observe nothing at all until it reconnected.
+	r.restoreProbeConfig()
 
 	bo := &backoff{base: opts.backoffBase, cap: opts.backoffCap}
 	for {
@@ -295,13 +336,35 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// harmful — a superseded session redialing would kick its replacement in
 		// an endless loop). CloseStatus sees through the %w wrapping and works
 		// for both the WebSocket adapter and the in-memory pipe.
+		//
+		// Each one is also an identity verdict, so each stops this server's
+		// monitoring before returning. Run returns here but the pipeline behind it
+		// does not stop: the collectors and the scheduler live on the process
+		// context, so without quiesce they would keep executing the last target
+		// list — indefinitely, and after a restart too now that the list is cached
+		// on disk.
 		switch wire.CloseStatus(err) {
 		case wire.CloseSuperseded:
+			r.quiesce("another instance took over this credential")
 			return fmt.Errorf("another agent instance connected with this credential: %w", ErrSuperseded)
 		case wire.CloseUnsupportedSchema:
+			r.quiesce("the server rejected this agent's schema version")
 			return fmt.Errorf("server rejected schema version %d; upgrade the agent or server: %w", protocol.SchemaVersion, ErrUnsupportedSchema)
 		case wire.CloseRevoked:
+			r.quiesce("this agent was deleted on the server")
 			return fmt.Errorf("agent was deleted on the server; re-enroll to continue: %w", ErrRevoked)
+		}
+		// A refused credential is not terminal — the fix is at the server end and
+		// needs no restart here — but it is still the server saying it does not
+		// accept this identity, so the targets that identity was issued stop
+		// running until it does. Quiescing on the FIRST rejection rather than after
+		// some number of them is deliberate: the cost of being wrong about a
+		// transient refusal is a pause in probing that the next successful session
+		// undoes by itself (the on-connect push reinstalls everything), while the
+		// cost of the opposite mistake is an agent that was deleted server-side
+		// probing third parties on its behalf forever.
+		if errors.Is(err, ErrAuthRejected) {
+			r.quiesce("the server refused this agent's credential")
 		}
 		if time.Since(start) > stableSession {
 			bo.reset()
@@ -349,6 +412,13 @@ type runner struct {
 	appliedDiagSerial uint64
 	haveDiagSerial    bool
 	lastSnapshotAt    time.Time
+
+	// persistedDigest is the desiredstate.Digest of the configuration currently
+	// on disk, or "" when nothing is (which includes a save that failed). It —
+	// not the version counter — decides whether an applied configuration needs
+	// persisting; see desiredstate.Digest for why a version test is wrong twice
+	// over. A failed save leaves it unchanged, so the next push retries.
+	persistedDigest string
 }
 
 // logf writes a session log line tagged with the server it belongs to. Every
@@ -368,6 +438,17 @@ func (r *runner) session(ctx context.Context) error {
 	cancel()
 	if err != nil {
 		return err
+	}
+	// Take the clock anchor before anything is sent. The session's first act is
+	// to drain whatever accumulated while this server was unreachable, and on a
+	// router that backlog IS the outage — collected under a clock a power cut
+	// reset. Anchoring off the first acknowledgement would arrive strictly after
+	// that drain had already gone out with the wrong times on it, so the only
+	// useful moment is the handshake that has just completed.
+	if sc, ok := c.(serverClock); ok && r.deps.Clock != nil {
+		if st, have := sc.ServerDate(); have {
+			r.deps.Clock.Anchor(st, time.Now())
+		}
 	}
 
 	// sessionCtx is deliberately detached from the parent ctx: the WebSocket
@@ -626,6 +707,13 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 			// sequence by the next session, so nothing is lost or double-counted.
 			return err
 		}
+		// Every ack restates the server's clock. The handshake already anchored
+		// this session, so in the ordinary case this only confirms it — but a
+		// session that outlives an NTP failure, or one whose handshake carried no
+		// Date header, learns it here instead.
+		if r.deps.Clock != nil {
+			r.deps.Clock.Anchor(ack.ServerTime, time.Now())
+		}
 		// Reconcile the local sequence allocator to the server's watermark BEFORE
 		// deleting the acked batch. If this WAL's next_seq was reset below the
 		// server's retained watermark (e.g. the WAL db was recreated while the
@@ -768,13 +856,39 @@ func (r *runner) applyGameConfig(game *pcfg.GameConfig) {
 // probe targets and tier intervals, followed by the full-state MonitorStatus
 // frame attesting the generation now running.
 func (r *runner) applyProbeConfig(sessionCtx context.Context, c wire.Conn, ds *pcfg.DesiredState) error {
+	frame, ok := r.installProbeConfig(ds)
+	if !ok {
+		return nil
+	}
+	// Emit the full-state MonitorStatus only after applying config (covers the
+	// reconnect/restart reevaluation for free). A write failure here is reported
+	// after the generation is fully installed, so a reconnect re-attests state
+	// consistent with what the agent is running.
+	if frame != nil {
+		if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: frame}); werr != nil {
+			return fmt.Errorf("write monitor status: %w", werr)
+		}
+	}
+	return nil
+}
+
+// installProbeConfig puts one probe configuration into the collectors, the
+// scheduler and the disk cache, and returns the MonitorStatus frame attesting it
+// (nil when no tracker is wired). ok=false means the push was stale and nothing
+// was touched.
+//
+// It writes nothing to the socket, which is what lets the boot-time restore
+// (restoreProbeConfig) reuse the exact install sequence — ordering included —
+// with no session in existence. The attestation is the session's business and
+// stays in applyProbeConfig.
+func (r *runner) installProbeConfig(ds *pcfg.DesiredState) (*wire.MonitorStatus, bool) {
 	// Guard against out-of-order delivery: the server's fan-out builds
 	// DesiredState on independent goroutines, so a push carrying version N
 	// can arrive after N+1 was already applied. Applying it would silently
 	// regress targets/intervals; equal versions re-apply harmlessly.
 	if ds.ConfigVersion < r.appliedConfigVersion {
 		r.logf("ignoring stale config v%d (v%d already applied)", ds.ConfigVersion, r.appliedConfigVersion)
-		return nil
+		return nil, false
 	}
 	// Reconcile the egress proxies FIRST. Two reasons for the ordering: monitor
 	// evaluation below needs the live proxy set to decide whether each pinned
@@ -809,17 +923,148 @@ func (r *runner) applyProbeConfig(sessionCtx context.Context, c wire.Conn, ds *p
 		time.Duration(ds.Intervals.RegularSeconds)*time.Second,
 	)
 	r.appliedConfigVersion = ds.ConfigVersion
-	// Emit the full-state MonitorStatus only after applying config (covers the
-	// reconnect/restart reevaluation for free). A write failure here is reported
-	// after the generation is fully installed, so a reconnect re-attests state
-	// consistent with what the agent is running.
+	// Persist between installing and attesting. Ordering matters in one
+	// direction only: what reaches the disk must already be running, so a restart
+	// restores a configuration this agent actually applied rather than one it was
+	// merely offered. Persisting before the attestation (rather than after) also
+	// means a MonitorStatus write failure — which ends the session — cannot lose a
+	// configuration the agent has already installed.
+	r.persistProbeConfig(ds)
+	r.logf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
+	return frame, true
+}
+
+// persistProbeConfig caches the applied configuration for the next boot, unless
+// an identical one is already on disk.
+//
+// A save failure is logged and otherwise ignored: the cache is an availability
+// optimization for a server that is unreachable later, never a correctness
+// requirement, and an agent that cannot write it still monitors exactly as it
+// did before this cache existed. persistedDigest is left untouched on failure,
+// so the next push — or the on-connect re-push after any reconnect — retries.
+func (r *runner) persistProbeConfig(ds *pcfg.DesiredState) {
+	if r.deps.Desired == nil {
+		return
+	}
+	cfg := desiredstate.Config{
+		ConfigVersion: ds.ConfigVersion,
+		ProbeTargets:  ds.ProbeTargets,
+		Intervals:     ds.Intervals,
+		Game:          ds.Game,
+		Diag:          ds.Diag,
+	}
+	digest := desiredstate.Digest(cfg)
+	if digest != "" && digest == r.persistedDigest {
+		return
+	}
+	if err := r.deps.Desired.Save(cfg); err != nil {
+		r.logf("could not cache config v%d for the next restart: %v", ds.ConfigVersion, err)
+		return
+	}
+	r.persistedDigest = digest
+}
+
+// restoreProbeConfig installs the configuration cached by a previous run, before// any session exists. It is called once per process, from Run.
+//
+// This is what keeps a rebooted agent monitoring through the rest of an outage.
+// The collectors and the scheduler already run independently of any session and
+// queue into the WAL regardless of reachability; the target list was the only
+// thing that needed a live server, so restoring it is the whole fix.
+//
+// Restoring does NOT make the agent believe it is configured for good: the
+// stale-version guard ignores versions strictly lower than the applied one, so
+// the server's unconditional on-connect push — which carries the same version
+// when nothing changed — still installs, and with it everything the cache
+// deliberately omits (the proxies). Targets pinned to a proxy therefore sit out
+// the offline window as proxy-missing and start on the first cycle after the
+// session returns, which is exactly what they would do on a first-ever boot.
+func (r *runner) restoreProbeConfig() {
+	if r.deps.Desired == nil {
+		return
+	}
+	cfg, ok := r.deps.Desired.Load()
+	if !ok {
+		return
+	}
+	ds := &pcfg.DesiredState{
+		ConfigVersion: cfg.ConfigVersion,
+		ProbeTargets:  cfg.ProbeTargets,
+		Intervals:     cfg.Intervals,
+		Game:          cfg.Game,
+		Diag:          cfg.Diag,
+	}
+	// Seed the digest from what was just read, so a restore that changes nothing
+	// does not immediately rewrite the same bytes back to flash.
+	r.persistedDigest = desiredstate.Digest(cfg)
+	// The game and diagnostic axes are restored through the same appliers a push
+	// uses, so their own serial guards advance identically.
+	r.applyGameConfig(ds.Game)
+	if r.deps.Diag != nil && ds.Diag != nil {
+		r.deps.Diag.ApplyDiagPolicy(ds.Diag)
+		r.appliedDiagSerial, r.haveDiagSerial = ds.Diag.Serial, true
+	}
+	frame, ok := r.installProbeConfig(ds)
+	if !ok {
+		return
+	}
+	runnable := 0
 	if frame != nil {
-		if werr := r.writeFrame(sessionCtx, c, wire.Frame{MonitorStatus: frame}); werr != nil {
-			return fmt.Errorf("write monitor status: %w", werr)
+		for _, e := range frame.Statuses {
+			if e.Status == wire.MonitorStatusActive {
+				runnable++
+			}
 		}
 	}
-	r.logf("applied config v%d: %d probe targets (%d runnable)", ds.ConfigVersion, len(ds.ProbeTargets), len(runnable))
-	return nil
+	r.logf("restored cached config v%d from disk: %d probe targets (%d runnable); probing resumes before the server is reachable",
+		ds.ConfigVersion, len(ds.ProbeTargets), runnable)
+}
+
+// quiesce stops this server's monitoring after the server has said, in one way
+// or another, that it does not accept this agent's identity.
+//
+// It exists because returning from Run does not stop anything. The collectors,
+// the scheduler and the traceroute trigger belong to the process, not to the
+// session, and they keep executing whatever target list was last installed. That
+// was survivable while the list died with the process; once it is cached on
+// disk, an agent deleted server-side would come back after every reboot and
+// probe third parties on behalf of a server that has disowned it.
+//
+// It clears three things, in the order that leaves nothing running at any point:
+// the collectors' targets (so no new cycle starts), the tracker's evaluation
+// state (so a later push is evaluated from scratch rather than diffed against a
+// generation nobody is running), and the proxies (which hold real OS resources —
+// tunnels, sockets — that no longer have anything to carry). Then it forgets the
+// disk cache, so a restart does not undo all of it.
+//
+// The version counters are wound back so the next accepted session installs from
+// zero: the server's on-connect push carries whatever version it likes, and none
+// of them should be judged stale against a generation that has been torn down.
+//
+// The game sensor is deliberately left alone. It is one process shared by the
+// whole agent and owned by the first server alone, so stopping it here would let
+// any one server's verdict silence capture the others still have every right to.
+func (r *runner) quiesce(reason string) {
+	for _, cfg := range r.deps.Configurables {
+		cfg.SetTargets(nil)
+	}
+	if r.deps.Tracker != nil {
+		r.deps.Tracker.ApplyDesired(r.appliedConfigVersion, nil)
+	}
+	if r.deps.Proxies != nil {
+		r.deps.Proxies.Apply(nil)
+	}
+	if r.deps.Desired != nil {
+		if err := r.deps.Desired.Forget(); err != nil {
+			// The cache outlives this process, so a failure here is the one part of
+			// quiesce that a restart would undo. Say so plainly rather than leaving
+			// a returning agent's probing unexplained.
+			r.logf("could not drop the cached config after %s: %v; a restart may resume the old targets", reason, err)
+		}
+	}
+	r.appliedConfigVersion, r.appliedGameVersion = -1, -1
+	r.appliedDiagSerial, r.haveDiagSerial = 0, false
+	r.persistedDigest = ""
+	r.logf("stopped monitoring for this server: %s", reason)
 }
 
 // dispatchIncidentSnapshot starts the asynchronous incident-scene collection for

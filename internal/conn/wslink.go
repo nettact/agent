@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/coder/websocket"
 
@@ -33,6 +34,26 @@ const (
 type wsConn struct {
 	c           *websocket.Conn
 	contentType string
+	// serverDate is the Date header of the upgrade response — the server's wall
+	// clock at the instant of the handshake. See ServerDate.
+	serverDate time.Time
+}
+
+// ServerDate reports the server's clock as of the handshake, satisfying the
+// serverClock interface in conn.go.
+//
+// It exists because of WHEN it is available. The session's first act is to drain
+// whatever accumulated while the server was unreachable, and on a router that
+// backlog is the entire outage — collected under a clock that a power cut reset
+// and that NTP may not have fixed yet. An anchor derived from the first
+// acknowledgement arrives strictly after that drain has already gone out with
+// the wrong times on it. This one is in hand before the session loop starts.
+//
+// One second of resolution is all HTTP-date carries, which is ample: the error
+// being hunted is minutes wide, and anything smaller is inside the round-trip
+// noise the anchor is thresholded against anyway.
+func (w *wsConn) ServerDate() (time.Time, bool) {
+	return w.serverDate, !w.serverDate.IsZero()
 }
 
 func (w *wsConn) ReadFrame(ctx context.Context) (wire.Frame, error) {
@@ -118,7 +139,16 @@ func wsDialer(opts Options) (wire.Dialer, error) {
 			return nil, fmt.Errorf("dial: %w", err)
 		}
 		c.SetReadLimit(readLimit)
-		return &wsConn{c: c, contentType: contentType}, nil
+		// The handshake response is the earliest the server's clock is knowable,
+		// and the only point that precedes the session's opening drain. A missing
+		// or unparsable header simply leaves the anchor to the first ack.
+		var serverDate time.Time
+		if resp != nil {
+			if d, perr := http.ParseTime(resp.Header.Get("Date")); perr == nil {
+				serverDate = d.UTC()
+			}
+		}
+		return &wsConn{c: c, contentType: contentType, serverDate: serverDate}, nil
 	}, nil
 }
 

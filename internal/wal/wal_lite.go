@@ -139,6 +139,12 @@ type Store struct {
 	persist bool
 	window  time.Duration
 
+	// clock supplies the correction for telemetry stamped while this machine's
+	// wall clock was wrong. On this build that is not a corner case: a router
+	// with no RTC comes back from a power cut with sysfixtime's guess, and the
+	// samples this store is spilling are exactly the ones taken under it.
+	clock ClockSource
+
 	// now is the clock. A field rather than a direct time.Now call so the window
 	// and the spill interval are testable without sleeping through them.
 	now func() time.Time
@@ -223,6 +229,7 @@ func Open(dir string, servers []string, opt Options) (*Store, error) {
 		dir:     dir,
 		persist: opt.Persist,
 		window:  opt.PersistWindow,
+		clock:   opt.Clock,
 		now:     func() time.Time { return time.Now().UTC() },
 		cursors: make(map[string]*cursor, len(servers)),
 		links:   make(map[string]*link, len(servers)),
@@ -309,7 +316,7 @@ func (s *Store) recover(now time.Time) error {
 			if g.gid >= s.nextGid {
 				s.nextGid = g.gid + 1
 			}
-			if !s.liveLocked(g.gid, g.owner) || g.at.Before(cutoff) {
+			if !s.liveLocked(g.gid, g.owner) || correctedAt(s.clock, g.at, g.epoch, g.mono).Before(cutoff) {
 				continue
 			}
 			s.disk = append(s.disk, g)
@@ -512,7 +519,8 @@ func (s *Store) Append(r Records, server string) (dropped int, err error) {
 		return 0, fmt.Errorf("wal: append for unknown server %q", server)
 	}
 	now := s.now()
-	s.mem = append(s.mem, memGroup{gid: s.nextGid, owner: server, at: now, rec: r, n: n})
+	epoch, mono := clockTag(s.clock)
+	s.mem = append(s.mem, memGroup{gid: s.nextGid, owner: server, at: now, rec: r, n: n, epoch: epoch, mono: mono})
 	s.nextGid++
 	s.memRows += n
 	if s.memRows <= memMaxRows {
@@ -809,7 +817,7 @@ func (s *Store) expireLocked(now time.Time) error {
 	cutoff := now.Add(-persistRetention)
 	kept := make([]diskGroup, 0, len(s.disk))
 	for _, g := range s.disk {
-		if g.at.Before(cutoff) {
+		if correctedAt(s.clock, g.at, g.epoch, g.mono).Before(cutoff) {
 			continue
 		}
 		kept = append(kept, g)
@@ -866,7 +874,7 @@ func (s *Store) nextDiskBatchLocked(server string, c *cursor, maxItems int) (Bat
 
 	seq := s.seqNext
 	s.seqNext++
-	c.claim = &claim{seq: seq, from: first, to: last, n: take}
+	c.claim = &claim{seq: seq, from: first, to: last, n: take, clockRev: clockRevOf(s.clock)}
 	if err := s.saveStateLocked(); err != nil {
 		// The claim never became durable, so nothing may be sent under it: a crash
 		// would leave those groups unclaimed and they would go out again under a
@@ -891,6 +899,8 @@ func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batc
 	rows := 0
 	var first, last uint64
 	recs := make([]Records, 0, 8)
+	offs := make([]time.Duration, 0, 8)
+	rev := clockRevOf(s.clock)
 	for _, g := range s.mem {
 		if g.owner != server || g.gid <= c.acked {
 			continue
@@ -904,14 +914,15 @@ func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batc
 		last = g.gid
 		rows += g.n
 		recs = append(recs, g.rec)
+		offs = append(offs, clockOffset(s.clock, g.epoch, g.mono, rev))
 	}
 	if len(recs) == 0 {
 		return Batch{}, false, nil
 	}
 	seq := s.seqNext
 	s.seqNext++
-	c.claim = &claim{seq: seq, from: first, to: last, n: len(recs)}
-	return flatten(seq, recs), true, nil
+	c.claim = &claim{seq: seq, from: first, to: last, n: len(recs), clockRev: rev}
+	return flatten(seq, recs, offs), true, nil
 }
 
 // loadClaimLocked re-serves a claim's groups under their original sequence. It
@@ -926,19 +937,24 @@ func (s *Store) loadClaimLocked(server string, cl *claim) (Batch, error) {
 		}
 	}
 	recs := make([]Records, 0, cl.n)
+	offs := make([]time.Duration, 0, cl.n)
 	if len(dg) > 0 {
 		loaded, err := readGroups(s.dir, dg)
 		if err != nil {
 			return Batch{}, err
 		}
 		recs = append(recs, loaded...)
+		for _, g := range dg {
+			offs = append(offs, clockOffset(s.clock, g.epoch, g.mono, cl.clockRev))
+		}
 	}
 	for _, g := range s.mem {
 		if g.owner == server && cl.covers(g.gid) {
 			recs = append(recs, g.rec)
+			offs = append(offs, clockOffset(s.clock, g.epoch, g.mono, cl.clockRev))
 		}
 	}
-	return flatten(cl.seq, recs), nil
+	return flatten(cl.seq, recs, offs), nil
 }
 
 // Ack releases one server's acknowledged packet. A stale ack — for a sequence

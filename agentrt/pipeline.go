@@ -8,6 +8,8 @@ import (
 
 	"github.com/nettact/agent/internal/collector"
 	"github.com/nettact/agent/internal/conn"
+	"github.com/nettact/agent/internal/desiredstate"
+	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/incidentscene"
 	"github.com/nettact/agent/internal/monitoreval"
 	"github.com/nettact/agent/internal/netguard"
@@ -66,7 +68,11 @@ type serverRuntime struct {
 	tracker       *monitoreval.Tracker
 	sched         *scheduler.Scheduler
 	configurables []conn.Configurable
-	trace         *traceroute.Engine
+	// clock is the process-wide clock monitor, shared by every server. Clock error
+	// is a fact about the machine, so every session anchors the same one: whichever
+	// server answers first establishes the correction for all of their telemetry.
+	clock conn.ClockAnchor
+	trace *traceroute.Engine
 	// trigger owns the decision to traceroute. It is per server because every
 	// input to that decision is: this server's targets produce the rounds, this
 	// server's permissions gate the mode, this server's proxy generation pins the
@@ -98,12 +104,14 @@ func buildServer(
 	traceLimit traceroute.Limiter,
 	probeGate *collector.ProbeGate,
 	hostname string,
+	clock conn.ClockAnchor,
 ) *serverRuntime {
 	rt := &serverRuntime{
 		cfg:    sc,
 		views:  v,
 		report: report,
 		outbox: outbox,
+		clock:  clock,
 		limits: limits,
 		drain:  drain,
 	}
@@ -273,18 +281,25 @@ func (rt *serverRuntime) sink(res collector.Result) {
 // per session rather than once because agentID changes: a revoked server
 // re-enrolls under a new identity, and the incident scene stamps that id into
 // every snapshot it collects.
-func (rt *serverRuntime) connDeps(agentID string) conn.Deps {
+func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string) conn.Deps {
 	scene := rt.scene
-	scene.Identity.AgentID = agentID
+	scene.Identity.AgentID = cred.AgentID
 	return conn.Deps{
-		Outbox:              rt.outbox,
-		Configurables:       rt.configurables,
-		Scheduler:           rt.sched,
-		DrainInterval:       rt.drain,
-		Tracker:             rt.tracker,
-		Proxies:             rt.proxies,
-		Game:                rt.game,
-		Diag:                rt.trigger,
+		Outbox:        rt.outbox,
+		Configurables: rt.configurables,
+		Scheduler:     rt.sched,
+		DrainInterval: rt.drain,
+		Tracker:       rt.tracker,
+		Proxies:       rt.proxies,
+		Game:          rt.game,
+		Diag:          rt.trigger,
+		Clock:         rt.clock,
+		// Bound to the credential in hand, not merely to the server name: a name
+		// or URL can be re-pointed at a different server, and restoring that
+		// server's targets under this one would both run the wrong monitors and —
+		// because the staleness guard only ignores strictly lower versions —
+		// permanently suppress the new server's pushes.
+		Desired:             desiredstate.Bind(dataDir, rt.cfg.Name, cred.AgentToken, cred.AgentID, cred.SiteID),
 		Effective:           rt.views.effective,
 		Granted:             rt.views.granted,
 		Supported:           rt.views.supported,

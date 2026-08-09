@@ -61,7 +61,7 @@ func TestEveryProbeCollectorSharesOneBudget(t *testing.T) {
 	var probes []budgeted
 	for _, name := range []string{"alpha", "beta"} {
 		rt := buildServer(ServerConfig{Name: name}, probeViews(), report(), outbox, p,
-			limits, 30*time.Second, traceLimit, gate, "test-host")
+			limits, 30*time.Second, traceLimit, gate, "test-host", nil)
 		for _, c := range rt.configurables {
 			b, ok := c.(budgeted)
 			if !ok {

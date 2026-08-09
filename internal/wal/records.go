@@ -77,6 +77,37 @@ type Options struct {
 	// by the default build. See Store in wal_lite.go for why the window is
 	// anchored at the disconnect rather than being a size or a rate.
 	PersistWindow time.Duration
+
+	// Clock supplies the correction for telemetry stamped while this machine's
+	// wall clock was wrong — the ordinary state of a router with no RTC that has
+	// just been power-cycled during an outage. Nil disables correction entirely
+	// and is the historical behaviour; both builds honour it identically.
+	Clock ClockSource
+}
+
+// ClockSource is what the outbox needs from a clock monitor (implemented by
+// internal/clockmon). It is an interface rather than a direct dependency so the
+// WAL's tests can state a correction outright instead of simulating a machine
+// whose clock is wrong.
+//
+// The revision parameter is what makes an in-flight packet safe. A batch that is
+// re-sent after a session drops must carry the timestamps it carried the first
+// time: the server dedups on (agent_id, sequence), so a retry whose content
+// differs is swallowed rather than replacing what was stored. A claim therefore
+// freezes the revision it was built under and asks for the correction as of
+// then, no matter how much the model has learned since.
+type ClockSource interface {
+	// Epoch identifies the process instance. Groups tagged with another epoch are
+	// never corrected — a previous run's clock error is not recoverable from this
+	// one's observations.
+	Epoch() string
+	// Mono is the monotonic reading to stamp on a group being appended now.
+	Mono() int64
+	// Revision is the number of clock observations so far, frozen into a claim.
+	Revision() int
+	// OffsetAt is how much to add to a wall stamp taken at mono during epoch, as
+	// the model stood at rev (rev <= 0 meaning "as it stands now").
+	OffsetAt(epoch string, mono int64, rev int) time.Duration
 }
 
 // Records is one Append's worth of telemetry. A struct rather than a parameter
@@ -140,6 +171,13 @@ type memGroup struct {
 	at    time.Time
 	rec   Records
 	n     int
+	// epoch/mono say which process stamped this group's payload and when, on the
+	// monotonic clock of that process. They are what lets a clock correction be
+	// applied to exactly the groups it describes: the ones this process stamped
+	// before it found out its wall clock was wrong. A group from an earlier
+	// process carries that run's epoch and is never corrected.
+	epoch string
+	mono  int64
 }
 
 // claim is one server's in-flight packet: the sequence it went out under and the
@@ -158,6 +196,23 @@ type claim struct {
 	from uint64
 	to   uint64
 	n    int
+	// clockRev is the clock model's revision when this claim was taken. Every
+	// re-serve asks for the correction as of it, so the packet's timestamps are a
+	// pure function of (stored stamps, frozen revision) and a retry reproduces
+	// the first attempt byte for byte. Without it, a clock step landing between
+	// the send and the ack would re-send different content under a sequence the
+	// server dedups on — and the corrected version would be silently discarded.
+	//
+	// It is in memory only, not in state.json, because the case it would cover
+	// resolves itself: a claim recovered after a restart addresses groups stamped
+	// by the PREVIOUS process, which this one never corrects at all (see
+	// ClockSource.Epoch). The retry then carries the stored stamps — the same
+	// bytes as the original if that original was itself uncorrected, and
+	// otherwise a packet the server either already holds (dedup keeps the
+	// corrected one) or never received (it ingests the uncorrected one, minutes
+	// out at worst). Persisting the revision would not improve either outcome,
+	// since the model it indexes into died with the process.
+	clockRev int
 }
 
 // covers reports whether a group belongs to this claim.
@@ -202,9 +257,22 @@ type cursor struct {
 
 // flatten concatenates the claimed groups into the packet to send, preserving
 // arrival order across groups and payload order within each.
-func flatten(seq uint64, recs []Records) Batch {
+//
+// offsets, when non-nil, is one clock correction per group, applied as each
+// group's payload is copied in. Applying it HERE rather than to the stored
+// groups is what keeps the correction safe to redo: append copies every record
+// by value into the batch's own arrays, so the shift lands on the copy and the
+// stored timestamps are never touched. A re-served claim re-reads pristine
+// stamps and re-derives the same result from its frozen revision.
+func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 	b := Batch{Sequence: seq}
-	for _, r := range recs {
+	for i, r := range recs {
+		var d time.Duration
+		if i < len(offsets) {
+			d = offsets[i]
+		}
+		mStart, eStart := len(b.Metrics), len(b.Events)
+		iStart, sStart := len(b.Inventory), len(b.Snapshots)
 		b.Metrics = append(b.Metrics, r.Metrics...)
 		b.Events = append(b.Events, r.Events...)
 		b.Inventory = append(b.Inventory, r.Inventory...)
@@ -214,6 +282,36 @@ func flatten(seq uint64, recs []Records) Batch {
 		b.GameGaps = append(b.GameGaps, r.GameGaps...)
 		b.GameHostSeconds = append(b.GameHostSeconds, r.GameHostSeconds...)
 		b.TraceResults = append(b.TraceResults, r.TraceResults...)
+		if d == 0 {
+			continue
+		}
+		// Only the payloads whose timestamps all belong to ONE collection cycle
+		// are corrected, because the group carries one monotonic reading — taken
+		// when it was appended, which is the end of that cycle. That reading
+		// describes a probe round or a tier sweep, both of which are stamped
+		// seconds before it.
+		//
+		// It does NOT describe a game run spanning minutes of play, or a
+		// traceroute carrying a start, a completion and a per-hop time. A clock
+		// step landing inside one of those would correct part of it and not the
+		// rest, which is worse than leaving it alone: a run whose end precedes its
+		// start is a corrupt record, while one stamped consistently early is
+		// merely early. Those payloads are therefore left as collected, and the
+		// residual is stated in clockmon's package comment.
+		for j := mStart; j < len(b.Metrics); j++ {
+			b.Metrics[j].TS = b.Metrics[j].TS.Add(d)
+		}
+		for j := eStart; j < len(b.Events); j++ {
+			b.Events[j].TS = b.Events[j].TS.Add(d)
+		}
+		for j := iStart; j < len(b.Inventory); j++ {
+			if !b.Inventory[j].LastSeen.IsZero() {
+				b.Inventory[j].LastSeen = b.Inventory[j].LastSeen.Add(d)
+			}
+		}
+		for j := sStart; j < len(b.Snapshots); j++ {
+			b.Snapshots[j].SampledAt = b.Snapshots[j].SampledAt.Add(d)
+		}
 	}
 	return b
 }
@@ -223,4 +321,46 @@ func rowsOf(r Records) int {
 	return len(r.Metrics) + len(r.Events) + len(r.Inventory) + len(r.Snapshots) +
 		len(r.GameRuns) + len(r.GameBuckets) + len(r.GameGaps) + len(r.GameHostSeconds) +
 		len(r.TraceResults)
+}
+
+// clockTag returns the epoch and monotonic reading to stamp on a group being
+// appended now. A nil source yields the zero tag, which never matches a live
+// epoch and therefore never attracts a correction.
+func clockTag(c ClockSource) (string, int64) {
+	if c == nil {
+		return "", 0
+	}
+	return c.Epoch(), c.Mono()
+}
+
+// clockRevOf is the model revision to freeze into a claim being taken now.
+func clockRevOf(c ClockSource) int {
+	if c == nil {
+		return 0
+	}
+	return c.Revision()
+}
+
+// clockOffset is one group's correction under a frozen revision.
+func clockOffset(c ClockSource, epoch string, mono int64, rev int) time.Duration {
+	if c == nil || epoch == "" {
+		return 0
+	}
+	return c.OffsetAt(epoch, mono, rev)
+}
+
+// correctedAt is a group's arrival time as the corrected clock would have
+// recorded it.
+//
+// Retention and the lite build's persist window are measured against it rather
+// than against the raw stamp, because both compare a stored time to time.Now():
+// after the clock jumps forward, every group written before the jump looks
+// abruptly older by the size of the jump. A big enough correction would age
+// telemetry collected minutes ago past a retention window measured in days and
+// delete it — the very backlog the correction exists to deliver.
+func correctedAt(c ClockSource, at time.Time, epoch string, mono int64) time.Time {
+	if d := clockOffset(c, epoch, mono, 0); d != 0 {
+		return at.Add(d)
+	}
+	return at
 }
