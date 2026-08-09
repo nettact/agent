@@ -406,12 +406,19 @@ func (c *wifiCache) reconcileLocked(e *wifiCacheEntry, ob wifiObs, now time.Time
 		// fold it in as if the disconnect event had arrived, without a refresh.
 		// dirty always clears — whatever suspicion was raised, a down link never
 		// justifies a gated read (it re-arms via the facts mismatch on reconnect).
-		if !e.haveFacts || e.facts.Connected {
+		//
+		// e.dirty is part of the condition, not just the facts: an entry whose
+		// cached facts ALREADY said disconnected can still have a refresh in
+		// flight (a reconnect observed one tick, gone again the next). Skipping
+		// the bump there let that refresh land and be marked clean, so the cache
+		// would hold the departed network's identity — and a later same-channel
+		// reconnect gives the tick nothing to notice.
+		if !e.haveFacts || e.facts.Connected || e.dirty {
 			e.facts = wifiGatedFacts{}
 			e.haveFacts = true
 			e.liveQuality = nil
 			e.dbmStale = false
-			e.gen++ // an in-flight refresh describes the association that just ended
+			e.gen++ // an in-flight refresh describes an association that has ended
 		}
 		e.dirty = false
 		e.lastObsBand, e.lastObsChannel = "", 0

@@ -529,6 +529,44 @@ func TestWiFiCacheSnapshotPruneRetiresInFlightClaim(t *testing.T) {
 	}
 }
 
+func TestWiFiCacheDownRetiresPendingReconnectClaim(t *testing.T) {
+	clk := newWiFiClock()
+	c := newWiFiCache(winCacheCfg(), clk.now)
+	// Cached facts already say disconnected…
+	c.Snapshot([]wifiObs{{ID: "a", Name: "a"}}, true)
+
+	// …a tick observes the link back up and a refresh is claimed…
+	clk.advance(30 * time.Second)
+	c.Snapshot([]wifiObs{connObs("a")}, true)
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
+		t.Fatal("reconnect must open a refresh")
+	}
+
+	// …and it is gone again before the read returns. The facts were already
+	// "disconnected", so nothing about them changes here — but the claim is
+	// still answering about the association that just ended.
+	clk.advance(30 * time.Second)
+	c.Snapshot([]wifiObs{{ID: "a", Name: "a"}}, true)
+	if c.ApplyRefresh(claim, connFacts("home", "5", 44, -52, 96)) {
+		t.Fatal("a refresh overtaken by a disconnect must not apply")
+	}
+	rows, _ := c.Snapshot([]wifiObs{{ID: "a", Name: "a"}}, true)
+	if rows[0].State != "disconnected" || rows[0].SSID != "" {
+		t.Fatalf("row=%+v", rows[0])
+	}
+	// And the departed identity must not resurface on a same-channel reconnect,
+	// which the tick has no way to distinguish from a link that never left.
+	clk.advance(30 * time.Second)
+	rows, need := c.Snapshot([]wifiObs{connObs("a")}, true)
+	if rows[0].SSID != "" {
+		t.Fatalf("departed identity resurfaced: %+v", rows[0])
+	}
+	if len(need) != 1 {
+		t.Fatalf("reconnect must ask for a fresh read: %v", need)
+	}
+}
+
 func TestWiFiCacheReset(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(macCacheCfg(), clk.now)
