@@ -349,18 +349,44 @@ func clockOffset(c ClockSource, epoch string, mono int64, rev int) time.Duration
 	return c.OffsetAt(epoch, mono, rev)
 }
 
+// expiredAt reports whether a group is older than retention.
+//
+// Both operands are converted to the CORRECTED clock domain before comparing,
+// which is the whole reason this is a function rather than a subtraction at each
+// call site. Correcting only the group's arrival time — while the caller derives
+// its cutoff from the raw local clock — mixes domains, and the error shows up as
+// data loss in exactly one direction: when an anchor reports the local clock is
+// running AHEAD, every stored group's time is pulled back by the skew while the
+// cutoff is not, so a skew larger than the retention window makes freshly
+// spilled groups of the current process look expired and deletes them before
+// they can be uploaded.
+//
+// Correcting is still necessary in the other direction: a clock stepped FORWARD
+// leaves every group written before it looking abruptly older by the size of the
+// step, which against the lite build's half-hour persist window is enough to
+// close an outage's window early.
+func expiredAt(c ClockSource, at time.Time, epoch string, mono int64, now time.Time, retention time.Duration) bool {
+	return correctedAt(c, at, epoch, mono).Before(correctedNow(c, now).Add(-retention))
+}
+
 // correctedAt is a group's arrival time as the corrected clock would have
 // recorded it.
-//
-// Retention and the lite build's persist window are measured against it rather
-// than against the raw stamp, because both compare a stored time to time.Now():
-// after the clock jumps forward, every group written before the jump looks
-// abruptly older by the size of the jump. A big enough correction would age
-// telemetry collected minutes ago past a retention window measured in days and
-// delete it — the very backlog the correction exists to deliver.
 func correctedAt(c ClockSource, at time.Time, epoch string, mono int64) time.Time {
 	if d := clockOffset(c, epoch, mono, 0); d != 0 {
 		return at.Add(d)
 	}
 	return at
+}
+
+// correctedNow is a wall-clock reading of THIS instant in the corrected domain.
+// It asks the model about the present rather than about a stored group, which is
+// what "now" means: the standing error, with no step left to apply.
+func correctedNow(c ClockSource, now time.Time) time.Time {
+	if c == nil {
+		return now
+	}
+	if d := c.OffsetAt(c.Epoch(), c.Mono(), 0); d != 0 {
+		return now.Add(d)
+	}
+	return now
 }

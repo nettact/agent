@@ -56,6 +56,29 @@ func newTracker(proxies monitoreval.ProxySet) *monitoreval.Tracker {
 		netguard.New(probepolicy.Policy{}, true), proxies, "policy", 0, 5*time.Second)
 }
 
+// persistTempDir returns a directory for one test's cache, removed on a
+// best-effort basis. t.TempDir is the wrong owner on Windows: its cleanup fails
+// the test if RemoveAll errors, and a just-closed file can stay held a moment
+// longer than Close suggests — so a test that asserted everything correctly
+// still reports a failure on the unlink. internal/wal and internal/desiredstate
+// carry the same helper for the same reason.
+func persistTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "nettact-conn-desired-")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 20; i++ {
+			if os.RemoveAll(dir) == nil {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
 // persistRunner builds a runner wired to a real on-disk cache in dir.
 func persistRunner(dir string, cfgable *fakeConfigurable, sched *fakeScheduler, tracker *monitoreval.Tracker) *runner {
 	return &runner{
@@ -86,7 +109,7 @@ func icmpTarget(id string) pcfg.ProbeTarget {
 // The whole point of the cache: a process that starts while the server is
 // unreachable must install targets and start probing anyway.
 func TestRestoreInstallsCachedConfigWithoutASession(t *testing.T) {
-	dir := t.TempDir()
+	dir := persistTempDir(t)
 
 	// First process: a push arrives and is applied.
 	first := persistRunner(dir, &fakeConfigurable{}, &fakeScheduler{}, newTracker(nil))
@@ -118,7 +141,7 @@ func TestRestoreInstallsCachedConfigWithoutASession(t *testing.T) {
 // strictly LOWER versions, and the equal-version on-connect push is what
 // re-supplies the proxies the cache never stored.
 func TestEqualVersionPushAfterRestoreStillApplies(t *testing.T) {
-	dir := t.TempDir()
+	dir := persistTempDir(t)
 	// HTTP rather than ICMP: a SOCKS5 proxy can carry TCP but not raw echo, so an
 	// ICMP monitor pinned to one is un-runnable for a reason that has nothing to
 	// do with the cache.
@@ -158,7 +181,7 @@ func TestEqualVersionPushAfterRestoreStillApplies(t *testing.T) {
 // ConfigVersion can carry different targets for different agents, and a save
 // that failed once must be retried rather than assumed done.
 func TestCacheWritesTrackPayloadAndRetryAfterFailure(t *testing.T) {
-	dir := t.TempDir()
+	dir := persistTempDir(t)
 	r := persistRunner(dir, &fakeConfigurable{}, &fakeScheduler{}, newTracker(nil))
 	file := filepath.Join(dir, "desired.json")
 
@@ -217,7 +240,7 @@ func TestCacheWritesTrackPayloadAndRetryAfterFailure(t *testing.T) {
 // staleness guard would let an old high version permanently suppress the new
 // server's pushes.
 func TestRestoreRefusesAForeignCredential(t *testing.T) {
-	dir := t.TempDir()
+	dir := persistTempDir(t)
 	seed := persistRunner(dir, &fakeConfigurable{}, &fakeScheduler{}, newTracker(nil))
 	if _, ok := seed.installProbeConfig(push(50, icmpTarget("mon-old"))); !ok {
 		t.Fatal("seed install rejected")
@@ -243,7 +266,7 @@ func TestRestoreRefusesAForeignCredential(t *testing.T) {
 // An identity verdict must stop this server's monitoring — and must not let a
 // restart bring it back.
 func TestQuiesceStopsProbingAndForgetsTheCache(t *testing.T) {
-	dir := t.TempDir()
+	dir := persistTempDir(t)
 	cfgable := &fakeConfigurable{}
 	r := persistRunner(dir, cfgable, &fakeScheduler{}, newTracker(nil))
 	if _, ok := r.installProbeConfig(push(9, icmpTarget("mon-a"))); !ok {
@@ -269,6 +292,88 @@ func TestQuiesceStopsProbingAndForgetsTheCache(t *testing.T) {
 	restarted.restoreProbeConfig()
 	if restarted.appliedConfigVersion != -1 {
 		t.Fatalf("restart restored v%d after a quiesce", restarted.appliedConfigVersion)
+	}
+}
+
+// An identity verdict must stop game capture too. Only the game owner is given
+// an applier at all, so a runner that has one IS the owner — and with the cache
+// restoring game configuration before the first dial, leaving the sensor running
+// would have a server-side-deleted agent resume capturing what people play after
+// every reboot.
+func TestQuiesceStopsGameCapture(t *testing.T) {
+	dir := persistTempDir(t)
+	game := &fakeGameApplier{}
+	r := persistRunner(dir, &fakeConfigurable{}, &fakeScheduler{}, newTracker(nil))
+	r.deps.Game = game
+	r.applyGameConfig(&pcfg.GameConfig{Version: 3, RecordUnmatched: true, Profiles: []pcfg.GameProfile{{ID: "p1"}}})
+	if len(game.calls()) != 1 {
+		t.Fatalf("setup did not install a game config: %+v", game.calls())
+	}
+
+	r.quiesce("test")
+
+	calls := game.calls()
+	if len(calls) != 2 {
+		t.Fatalf("game applier called %d times, want a stop after the verdict", len(calls))
+	}
+	stop := calls[len(calls)-1]
+	// "No profiles and no unmatched recording" is how this configuration says
+	// capture nothing; a stop expressed any other way would be a new sensor verb.
+	if stop.RecordUnmatched || len(stop.Profiles) != 0 {
+		t.Fatalf("stop config = %+v, want no profiles and no unmatched recording", stop)
+	}
+	if r.appliedGame != nil {
+		t.Fatal("quiesce left an applied game config behind")
+	}
+}
+
+// The three configuration axes are guarded independently and can arrive out of
+// order, so the cache must store what is INSTALLED — not whatever game/diag
+// block happened to ride along with the last accepted probe push.
+func TestCacheStoresAppliedAxesNotThePushThatCarriedThem(t *testing.T) {
+	dir := persistTempDir(t)
+	game, diag := &fakeGameApplier{}, &fakeDiagApplier{}
+	r := persistRunner(dir, &fakeConfigurable{}, &fakeScheduler{}, newTracker(nil))
+	r.deps.Game, r.deps.Diag = game, diag
+
+	// A push installs game v5 and diag serial 9 alongside probe v1.
+	fresh := push(1, icmpTarget("mon-a"))
+	fresh.Game = &pcfg.GameConfig{Version: 5}
+	fresh.Diag = &pcfg.DiagPolicy{Serial: 9}
+	r.applyGameConfig(fresh.Game)
+	r.deps.Diag.ApplyDiagPolicy(fresh.Diag)
+	r.appliedDiagSerial, r.haveDiagSerial, r.appliedDiag = 9, true, fresh.Diag
+	if _, ok := r.installProbeConfig(fresh); !ok {
+		t.Fatal("first install rejected")
+	}
+
+	// A LATER probe generation arrives carrying stale game/diag blocks — routine,
+	// since the axes are built and pushed independently.
+	stale := push(2, icmpTarget("mon-b"))
+	stale.Game = &pcfg.GameConfig{Version: 2}
+	stale.Diag = &pcfg.DiagPolicy{Serial: 3}
+	r.applyGameConfig(stale.Game)            // rejected by the game guard
+	if r.deps.Diag != nil && stale.Diag != nil { // rejected by the diag guard
+		if stale.Diag.Serial > r.appliedDiagSerial {
+			t.Fatal("test setup: the diag block should be stale")
+		}
+	}
+	if _, ok := r.installProbeConfig(stale); !ok {
+		t.Fatal("the fresh probe generation was rejected")
+	}
+
+	cached, ok := r.deps.Desired.Load()
+	if !ok {
+		t.Fatal("nothing cached")
+	}
+	if cached.ConfigVersion != 2 {
+		t.Fatalf("cached probe version = %d, want the fresh 2", cached.ConfigVersion)
+	}
+	if cached.Game == nil || cached.Game.Version != 5 {
+		t.Fatalf("cached game = %+v, want the applied v5 — not the stale v2 that rode along", cached.Game)
+	}
+	if cached.Diag == nil || cached.Diag.Serial != 9 {
+		t.Fatalf("cached diag = %+v, want the applied serial 9", cached.Diag)
 	}
 }
 
@@ -298,7 +403,7 @@ func TestNoCacheWiredIsUnchangedBehaviour(t *testing.T) {
 // install that turned diagnostics down does not come back up with the agent's
 // built-in defaults after a reboot.
 func TestRestoreCarriesGameAndDiagSerials(t *testing.T) {
-	dir := t.TempDir()
+	dir := persistTempDir(t)
 	game := &fakeGameApplier{}
 	diag := &fakeDiagApplier{}
 
@@ -310,6 +415,7 @@ func TestRestoreCarriesGameAndDiagSerials(t *testing.T) {
 	seed.applyGameConfig(ds.Game)
 	seed.deps.Diag.ApplyDiagPolicy(ds.Diag)
 	seed.appliedDiagSerial, seed.haveDiagSerial = ds.Diag.Serial, true
+	seed.appliedDiag = ds.Diag // what applyPush records when the guard accepts
 	if _, ok := seed.installProbeConfig(ds); !ok {
 		t.Fatal("seed install rejected")
 	}

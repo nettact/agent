@@ -398,7 +398,7 @@ func (s *Store) spillLocked(now time.Time) (dropped int, err error) {
 	index = append(index, lines...)
 
 	claims := s.copyClaimsLocked()
-	index = expireIndex(index, now.Add(-s.retention), s.clock)
+	index = expireIndex(index, now, s.retention, s.clock)
 	// Everything live now lives in index (the buffer is being emptied into it),
 	// so counting against index alone is the whole picture.
 	reconcileClaims(claims, index, nil)
@@ -462,9 +462,9 @@ func (s *Store) applyClaimsLocked(claims map[string]*claim) {
 // Only the durable tier expires. The memory tier cannot: memBufferAge forces a
 // spill long before the retention window, so nothing buffered is ever old
 // enough.
-func expireIndex(index []diskGroup, cutoff time.Time, clock ClockSource) []diskGroup {
+func expireIndex(index []diskGroup, now time.Time, retention time.Duration, clock ClockSource) []diskGroup {
 	drop := 0
-	for drop < len(index) && correctedAt(clock, index[drop].at, index[drop].epoch, index[drop].mono).Before(cutoff) {
+	for drop < len(index) && expiredAt(clock, index[drop].at, index[drop].epoch, index[drop].mono, now, retention) {
 		drop++
 	}
 	if drop == 0 {
@@ -745,7 +745,7 @@ func (s *Store) nextMemBatchLocked(server string, c *cursor, maxItems int) (Batc
 // expireLocked drops backlog past the retention window and makes the removal
 // durable. Caller holds mu.
 func (s *Store) expireLocked(now time.Time) error {
-	index := expireIndex(s.disk, now.Add(-s.retention), s.clock)
+	index := expireIndex(s.disk, now, s.retention, s.clock)
 	if len(index) == len(s.disk) {
 		return nil
 	}

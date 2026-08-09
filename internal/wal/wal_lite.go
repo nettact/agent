@@ -305,7 +305,6 @@ func (s *Store) recover(now time.Time) error {
 	if err != nil {
 		return err
 	}
-	cutoff := now.Add(-persistRetention)
 	for _, n := range segs {
 		groups, err := scanSegment(segPath(s.dir, n), n)
 		if err != nil {
@@ -316,7 +315,7 @@ func (s *Store) recover(now time.Time) error {
 			if g.gid >= s.nextGid {
 				s.nextGid = g.gid + 1
 			}
-			if !s.liveLocked(g.gid, g.owner) || correctedAt(s.clock, g.at, g.epoch, g.mono).Before(cutoff) {
+			if !s.liveLocked(g.gid, g.owner) || expiredAt(s.clock, g.at, g.epoch, g.mono, now, persistRetention) {
 				continue
 			}
 			s.disk = append(s.disk, g)
@@ -814,10 +813,9 @@ func (s *Store) NextBatch(server string, maxItems int) (Batch, bool, error) {
 // ones another server's earlier outage already wrote. Nothing expired means no
 // write at all, so the common case is free. Caller holds mu.
 func (s *Store) expireLocked(now time.Time) error {
-	cutoff := now.Add(-persistRetention)
 	kept := make([]diskGroup, 0, len(s.disk))
 	for _, g := range s.disk {
-		if correctedAt(s.clock, g.at, g.epoch, g.mono).Before(cutoff) {
+		if expiredAt(s.clock, g.at, g.epoch, g.mono, now, persistRetention) {
 			continue
 		}
 		kept = append(kept, g)

@@ -19,6 +19,11 @@ type fakeClock struct {
 	epoch string
 	now   int64
 	steps []fakeStep
+	// standing is the clock's residual error, the way an anchor reports it: it
+	// applies to every stamp this process has taken AND to every one it is about
+	// to take, because nothing has corrected the clock. clockmon calls this
+	// curErr; the offset is standing plus the steps recorded after a stamp.
+	standing time.Duration
 }
 
 type fakeStep struct {
@@ -44,7 +49,7 @@ func (c *fakeClock) OffsetAt(epoch string, mono int64, rev int) time.Duration {
 			d += c.steps[i].delta
 		}
 	}
-	return d
+	return c.standing + d
 }
 
 // advance moves the monotonic clock without any correction, as an untroubled
@@ -56,6 +61,11 @@ func (c *fakeClock) advance(d time.Duration) { c.now += int64(d) }
 func (c *fakeClock) step(d time.Duration) {
 	c.steps = append(c.steps, fakeStep{at: c.now, delta: d})
 }
+
+// standingError models an anchor: the clock is wrong by d for everything this
+// process has stamped and everything it is about to stamp, because nothing has
+// corrected it.
+func (c *fakeClock) standingError(d time.Duration) { c.standing = d }
 
 const clockServer = "srv"
 
@@ -339,5 +349,44 @@ func TestNoClockMeansNoCorrection(t *testing.T) {
 	}
 	if got := b.Metrics[0].TS.UTC(); !got.Equal(clockBase) {
 		t.Fatalf("timestamp = %s, want it untouched", got)
+	}
+}
+
+// Retention compares a stored time against the present, so BOTH have to be in
+// the same clock domain. Correcting only the stored side turns a large standing
+// error into silent data loss: a clock running days ahead pulls every group's
+// time back past a cutoff that was not moved with it, and the backlog the
+// correction exists to deliver is deleted instead.
+func TestALargeStandingClockErrorDoesNotExpireFreshBacklog(t *testing.T) {
+	c := &fakeClock{epoch: "proc-1"}
+	s := openClockStore(t, c)
+
+	if _, err := s.Append(metricAt(clockBase, "1.1.1.1"), clockServer); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// Retention only governs the durable tier, so the group has to reach it.
+	// Both builds spill on Flush while the server is disconnected, which every
+	// store is at Open.
+	if err := s.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// The server tells us this machine's clock is a week ahead — far more than
+	// the retention window, and nothing has stepped it.
+	c.advance(time.Second)
+	c.standingError(-7 * 24 * time.Hour)
+
+	b, ok, err := s.NextBatch(clockServer, 100)
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if !ok {
+		t.Fatal("the backlog was expired away: retention compared a corrected " +
+			"stored time against an uncorrected now")
+	}
+	if len(b.Metrics) != 1 {
+		t.Fatalf("metrics = %d, want the one appended row", len(b.Metrics))
+	}
+	if got, want := b.Metrics[0].TS.UTC(), clockBase.Add(-7*24*time.Hour); !got.Equal(want) {
+		t.Fatalf("sample sent at %s, want the corrected %s", got, want)
 	}
 }

@@ -131,6 +131,18 @@ type Monitor struct {
 	// without waiting one out, since a step IS the two clocks disagreeing.
 	mono func() int64
 
+	// wall reads this machine's wall clock, WITHOUT a monotonic reading.
+	//
+	// The strip is the detector, not a detail. A time.Time from time.Now()
+	// carries both clocks, and Time.Sub silently prefers the monotonic one
+	// whenever both operands have it — so comparing two raw time.Now() values
+	// measures elapsed time and is blind by construction to the wall clock being
+	// SET, which is the only event this package exists to notice. It is a field
+	// so the property can be asserted at this seam; a unit test cannot forge a
+	// Time whose wall and monotonic readings disagree, because every public way
+	// to build one (Add, Truncate) moves them together.
+	wall func() time.Time
+
 	mu     sync.Mutex
 	events []event
 	// haveAnchor records whether a server has ever told this process what the
@@ -153,12 +165,16 @@ type Monitor struct {
 func New(epoch string) *Monitor {
 	now := time.Now()
 	m := &Monitor{
-		epoch:    epoch,
-		start:    now,
-		lastWall: now,
+		epoch: epoch,
+		start: now,
+		// Stored stripped for the reason the wall field explains: wall arithmetic
+		// against a value that still carries a monotonic reading measures the
+		// monotonic clock instead, and the detector would never fire.
+		lastWall: now.Round(0),
 		lastMono: 0,
 	}
 	m.mono = func() int64 { return int64(time.Since(m.start)) }
+	m.wall = func() time.Time { return time.Now().Round(0) }
 	return m
 }
 
@@ -229,7 +245,7 @@ func (m *Monitor) Run(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
-			m.sample(time.Now())
+			m.sample(m.wall())
 		}
 	}
 }
@@ -237,7 +253,15 @@ func (m *Monitor) Run(stop <-chan struct{}) {
 // sample folds one (wall, monotonic) observation into the model. Split from Run
 // so tests can drive it without waiting out real intervals.
 func (m *Monitor) sample(wall time.Time) {
-	mono := m.Mono()
+	mono := m.mono()
+	// Strip the monotonic reading before doing any wall arithmetic. This is the
+	// whole detector in one line: time.Time from time.Now() carries BOTH clocks,
+	// and Sub silently prefers the monotonic one whenever both operands have it —
+	// so wallDelta would equal monoDelta by construction, jump would be zero, and
+	// no clock step would ever be seen. Round(0) drops the monotonic reading and
+	// leaves the wall clock, which is the only thing that moves when the clock is
+	// set.
+	wall = wall.Round(0)
 
 	m.mu.Lock()
 	// The monotonic elapsed time is what SHOULD have passed; the wall difference

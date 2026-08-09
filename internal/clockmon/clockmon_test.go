@@ -121,6 +121,47 @@ func TestSubThresholdDriftIsIgnored(t *testing.T) {
 	}
 }
 
+// The single most load-bearing property in this package, asserted at the seam
+// where it is checkable.
+//
+// Every value the sampler compares must carry NO monotonic reading. A time.Time
+// from time.Now() carries both clocks, and Time.Sub prefers the monotonic one
+// whenever both operands have it — so two raw time.Now() values always differ by
+// exactly the elapsed time, and an NTP correction between them is invisible.
+// The detector would silently never fire in production.
+//
+// This cannot be tested by simulation: no public API builds a time.Time whose
+// wall and monotonic readings disagree (Add and Truncate move them together),
+// so a forged pair always looks consistent however the comparison is done. What
+// IS checkable is that the production readers hand out stripped values, and that
+// is exactly what breaks if the Round(0) calls are dropped.
+func TestProductionClockReadersCarryNoMonotonicReading(t *testing.T) {
+	m := New("proc-1")
+
+	if got := m.wall(); got.Round(0) != got {
+		t.Fatal("the wall reader returns a monotonic-carrying Time: Sub would " +
+			"measure elapsed time and no clock step would ever be detected")
+	}
+	m.mu.Lock()
+	last := m.lastWall
+	m.mu.Unlock()
+	if last.Round(0) != last {
+		t.Fatal("the seeded lastWall carries a monotonic reading: the first " +
+			"comparison after startup would measure the monotonic clock")
+	}
+
+	// sample strips defensively too, so a caller handing it a raw reading cannot
+	// reintroduce the blindness.
+	m.mono = func() int64 { return int64(time.Minute) }
+	m.sample(time.Now().Add(30 * time.Minute)) // deliberately monotonic-carrying
+	m.mu.Lock()
+	seen := m.lastWall
+	m.mu.Unlock()
+	if seen.Round(0) != seen {
+		t.Fatal("sample stored a monotonic-carrying Time")
+	}
+}
+
 // A clock nobody steps stays wrong, so an anchor has to correct stamps not yet
 // taken as well as those already taken.
 func TestAnchorAppliesToPastAndFuture(t *testing.T) {

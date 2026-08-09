@@ -413,6 +413,19 @@ type runner struct {
 	haveDiagSerial    bool
 	lastSnapshotAt    time.Time
 
+	// appliedGame/appliedDiag are the blocks currently INSTALLED on their own
+	// axes, kept so the cache stores what this agent is running rather than
+	// whatever rode along with the last accepted probe push.
+	//
+	// The three axes are guarded independently and can arrive out of order, so a
+	// fresh probe generation routinely carries a game or diag block that its own
+	// guard rejected as stale. Persisting the incoming push would write that
+	// rejected block to disk — and a restart during an outage would then restore
+	// configuration the runner had explicitly refused — while a fresh game block
+	// arriving on a stale probe push would never be persisted at all.
+	appliedGame *pcfg.GameConfig
+	appliedDiag *pcfg.DiagPolicy
+
 	// persistedDigest is the desiredstate.Digest of the configuration currently
 	// on disk, or "" when nothing is (which includes a save that failed). It —
 	// not the version counter — decides whether an applied configuration needs
@@ -803,6 +816,7 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 			case !r.haveDiagSerial || ds.Diag.Serial > r.appliedDiagSerial:
 				r.deps.Diag.ApplyDiagPolicy(ds.Diag)
 				r.appliedDiagSerial, r.haveDiagSerial = ds.Diag.Serial, true
+				r.appliedDiag = ds.Diag
 			case ds.Diag.Serial < r.appliedDiagSerial:
 				r.logf("ignoring stale diag policy serial %d (serial %d already applied)",
 					ds.Diag.Serial, r.appliedDiagSerial)
@@ -848,6 +862,7 @@ func (r *runner) applyGameConfig(game *pcfg.GameConfig) {
 	}
 	r.deps.Game.ApplyGameConfig(*game)
 	r.appliedGameVersion = game.Version
+	r.appliedGame = game
 	r.logf("applied game config v%d: %d profiles (record unmatched=%v)",
 		game.Version, len(game.Profiles), game.RecordUnmatched)
 }
@@ -950,8 +965,12 @@ func (r *runner) persistProbeConfig(ds *pcfg.DesiredState) {
 		ConfigVersion: ds.ConfigVersion,
 		ProbeTargets:  ds.ProbeTargets,
 		Intervals:     ds.Intervals,
-		Game:          ds.Game,
-		Diag:          ds.Diag,
+		// The APPLIED blocks, not this push's. See the runner fields: the three
+		// axes are guarded independently, so the game and diag blocks riding along
+		// with an accepted probe generation are routinely ones their own guards
+		// rejected.
+		Game: r.appliedGame,
+		Diag: r.appliedDiag,
 	}
 	digest := desiredstate.Digest(cfg)
 	if digest != "" && digest == r.persistedDigest {
@@ -997,11 +1016,14 @@ func (r *runner) restoreProbeConfig() {
 	// does not immediately rewrite the same bytes back to flash.
 	r.persistedDigest = desiredstate.Digest(cfg)
 	// The game and diagnostic axes are restored through the same appliers a push
-	// uses, so their own serial guards advance identically.
+	// uses, so their own serial guards advance identically — and the applied
+	// blocks are recorded, so the next probe push re-persists what is running
+	// rather than dropping them.
 	r.applyGameConfig(ds.Game)
 	if r.deps.Diag != nil && ds.Diag != nil {
 		r.deps.Diag.ApplyDiagPolicy(ds.Diag)
 		r.appliedDiagSerial, r.haveDiagSerial = ds.Diag.Serial, true
+		r.appliedDiag = ds.Diag
 	}
 	frame, ok := r.installProbeConfig(ds)
 	if !ok {
@@ -1040,9 +1062,17 @@ func (r *runner) restoreProbeConfig() {
 // zero: the server's on-connect push carries whatever version it likes, and none
 // of them should be judged stale against a generation that has been torn down.
 //
-// The game sensor is deliberately left alone. It is one process shared by the
-// whole agent and owned by the first server alone, so stopping it here would let
-// any one server's verdict silence capture the others still have every right to.
+// Game capture stops too. An earlier version of this left the sensor alone on
+// the theory that it is one process shared by every server, so silencing it here
+// would speak for servers that had not been refused — but that is not how it is
+// wired: only the game owner (Servers[0]) is given an applier at all, and only
+// its data is ever queued, so this runner having one means the refusal IS the
+// owner's. Leaving it running would be worse than untidy now that the cache
+// restores game configuration before the first dial: an agent deleted
+// server-side would resume capturing what people play, from disk, on every
+// reboot, forever. The stop is expressed in the configuration's own vocabulary —
+// no profiles and no unmatched recording is exactly "capture nothing" — rather
+// than as a new sensor verb.
 func (r *runner) quiesce(reason string) {
 	for _, cfg := range r.deps.Configurables {
 		cfg.SetTargets(nil)
@@ -1052,6 +1082,12 @@ func (r *runner) quiesce(reason string) {
 	}
 	if r.deps.Proxies != nil {
 		r.deps.Proxies.Apply(nil)
+	}
+	if r.deps.Game != nil {
+		// Straight to the applier, not through applyGameConfig: its staleness
+		// guard is about ordering pushes from a server that is still talking to
+		// us, and this is the one case that has to win regardless of serial.
+		r.deps.Game.ApplyGameConfig(pcfg.GameConfig{})
 	}
 	if r.deps.Desired != nil {
 		if err := r.deps.Desired.Forget(); err != nil {
@@ -1063,6 +1099,7 @@ func (r *runner) quiesce(reason string) {
 	}
 	r.appliedConfigVersion, r.appliedGameVersion = -1, -1
 	r.appliedDiagSerial, r.haveDiagSerial = 0, false
+	r.appliedGame, r.appliedDiag = nil, nil
 	r.persistedDigest = ""
 	r.logf("stopped monitoring for this server: %s", reason)
 }
