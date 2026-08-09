@@ -154,6 +154,17 @@ if [ -n "$TOKEN_FILE" ] && [ ! -r "$TOKEN_FILE" ]; then
 	die "token file not readable: $TOKEN_FILE"
 fi
 
+# The console shows this command with a placeholder token until one is
+# generated, and it is copied and run in that state often enough to be worth
+# naming: the router would install two packages, write its config and then sit
+# in a retry loop against a server that answers 401. Say what actually went
+# wrong, before anything on the router is touched.
+case "$TOKEN" in
+	'<enrollment-token>')
+		die "the --token value is still the console's placeholder, so no enrollment token was ever generated.
+In the NetTact console open Agents -> Add agent, click \"Generate token\", then copy this command again from that page." ;;
+esac
+
 case "$SERVER_URL$TOKEN" in
 	*'
 '*) die "server URL and token must each be a single line" ;;

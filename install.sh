@@ -164,6 +164,17 @@ $UPDATE_ONLY || {
       die "--token is required (Docker also accepts --token-file)"
     fi
   fi
+  # The console shows this command with a placeholder token until one is
+  # generated, and it is copied and run in that state often enough to be worth
+  # naming: the enrollment would answer 401 several steps from here, after the
+  # download, the service install and the identity wipe, and the machine would
+  # be left with an agent that enrolls nowhere. Say what actually went wrong,
+  # before anything on this host is touched.
+  case "$TOKEN" in
+    '<enrollment-token>')
+      die "the --token value is still the console's placeholder, so no enrollment token was ever generated.
+  In the NetTact console open Agents -> Add agent, click \"Generate token\", then copy this command again from that page." ;;
+  esac
   case "$SERVER_URL$TOKEN" in *'
 '*) die "server URL and token must each be a single line" ;; esac
 }
