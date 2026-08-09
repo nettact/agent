@@ -455,6 +455,80 @@ func TestWiFiCacheApplyRejectsOvertakenClaim(t *testing.T) {
 	}
 }
 
+func TestWiFiCacheReconcileRetiresInFlightClaim(t *testing.T) {
+	clk := newWiFiClock()
+	c := newWiFiCache(winCacheCfg(), clk.now)
+	applyNow(t, c, "a", connFacts("home", "5", 44, -52, 96))
+	ob := connObs("a")
+	ob.Channel = 44
+	c.Snapshot([]wifiObs{ob}, true) // establish lastObsChannel
+
+	// A roam is noticed by the tick, not by an event: the claim is taken, and
+	// while the OS read is in flight the NEXT tick observes the new channel.
+	clk.advance(30 * time.Second)
+	c.NoteRoamEnd("a")
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
+		t.Fatal("claim")
+	}
+	ob.Channel = 149
+	c.Snapshot([]wifiObs{ob}, true)
+
+	// The in-flight read describes the PRE-roam association. Applying it would
+	// clear dirty, and the channel detector has already moved lastObsChannel to
+	// 149 — it will not fire again, so the stale SSID would never be corrected.
+	if c.ApplyRefresh(claim, connFacts("home", "5", 44, -52, 96)) {
+		t.Fatal("a refresh overtaken by reconcile must not apply")
+	}
+	rows, _ := c.Snapshot([]wifiObs{ob}, true)
+	if rows[0].SSID != "" {
+		t.Fatalf("stale identity survived: %+v", rows[0])
+	}
+	clk.advance(30 * time.Second) // next tick, past the claim rate limit
+	_, need := c.Snapshot([]wifiObs{ob}, true)
+	if len(need) != 1 {
+		t.Fatalf("entry must still want a refresh: %v", need)
+	}
+
+	// A pending refresh that nothing overtakes still lands — the invalidation
+	// must fire on transitions only, or the entry could never go clean.
+	claim, ok = c.ClaimRefresh("a")
+	if !ok {
+		t.Fatal("reclaim")
+	}
+	c.Snapshot([]wifiObs{ob}, true) // same observation: no new information
+	if !c.ApplyRefresh(claim, connFacts("attic", "5", 149, -50, 90)) {
+		t.Fatal("an unchallenged refresh must apply")
+	}
+	rows, _ = c.Snapshot([]wifiObs{ob}, true)
+	if rows[0].SSID != "attic" {
+		t.Fatalf("row=%+v", rows[0])
+	}
+}
+
+func TestWiFiCacheSnapshotPruneRetiresInFlightClaim(t *testing.T) {
+	clk := newWiFiClock()
+	c := newWiFiCache(winCacheCfg(), clk.now)
+	c.NoteConnect("a")
+	claim, ok := c.ClaimRefresh("a")
+	if !ok {
+		t.Fatal("claim")
+	}
+
+	// The adapter vanishes from the enumeration and comes back before the read
+	// returns. Both entries are generation zero, so only the cache epoch can
+	// tell the claim it is answering about a different association.
+	c.Snapshot(nil, true)
+	c.Snapshot([]wifiObs{connObs("a")}, true)
+	if c.ApplyRefresh(claim, connFacts("home", "5", 44, -52, 96)) {
+		t.Fatal("a claim from a pruned entry must not apply to its replacement")
+	}
+	rows, _ := c.Snapshot([]wifiObs{connObs("a")}, true)
+	if rows[0].SSID != "" {
+		t.Fatalf("facts from the departed adapter published: %+v", rows[0])
+	}
+}
+
 func TestWiFiCacheReset(t *testing.T) {
 	clk := newWiFiClock()
 	c := newWiFiCache(macCacheCfg(), clk.now)

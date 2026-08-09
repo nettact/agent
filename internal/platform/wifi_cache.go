@@ -168,6 +168,20 @@ func (c *wifiCache) entry(id string) *wifiCacheEntry {
 	return e
 }
 
+// invalidate marks the entry as needing a gated refresh AND retires any claim
+// already in flight. Every path that learns the cached association may no
+// longer be current must go through here, not just set dirty: a claim taken
+// before the change would otherwise still apply, clearing dirty with facts
+// describing the association the adapter has already left.
+//
+// Callers must only invoke it on an actual TRANSITION. Calling it on every tick
+// an entry happens to be dirty would retire the in-flight claim each round and
+// the refresh could never land.
+func (e *wifiCacheEntry) invalidate() {
+	e.dirty = true
+	e.gen++
+}
+
 // NoteConnect marks an adapter as newly connected: its gated facts are unknown
 // until a refresh runs.
 func (c *wifiCache) NoteConnect(id string) {
@@ -371,7 +385,12 @@ func (c *wifiCache) Snapshot(obs []wifiObs, includeSSID bool) ([]WiFiStatus, []s
 	}
 	for id := range c.entries {
 		if !seen[id] {
+			// Same invalidation as NoteAdapterRemoved: an outstanding claim on
+			// this entry must not be able to match a later recreation of it (both
+			// would be generation zero), or a refresh from the departed
+			// association would land on the new one as clean state.
 			delete(c.entries, id)
+			c.epoch++
 		}
 	}
 	return rows, need
@@ -392,6 +411,7 @@ func (c *wifiCache) reconcileLocked(e *wifiCacheEntry, ob wifiObs, now time.Time
 			e.haveFacts = true
 			e.liveQuality = nil
 			e.dbmStale = false
+			e.gen++ // an in-flight refresh describes the association that just ended
 		}
 		e.dirty = false
 		e.lastObsBand, e.lastObsChannel = "", 0
@@ -399,15 +419,25 @@ func (c *wifiCache) reconcileLocked(e *wifiCacheEntry, ob wifiObs, now time.Time
 	}
 
 	if !e.haveFacts || !e.facts.Connected {
-		e.dirty = true // connected but facts missing or describing a down link
+		// Connected but facts missing or describing a down link. Only a
+		// transition invalidates: while this stays true round after round the
+		// pending refresh is fetching exactly what is missing, and retiring its
+		// claim every tick would mean it could never land.
+		if !e.dirty {
+			e.invalidate()
+		}
 	}
 	// An ungated channel/band change is the observable signature of a roam or
-	// channel switch that produced no (or a lost) notification.
+	// channel switch that produced no (or a lost) notification. This fires only
+	// on an actual change of the observed value, so it cannot repeat while the
+	// refresh is pending — and it must retire any in-flight claim, because
+	// lastObs* below moves to the new values and this detector will not fire a
+	// second time for the same roam.
 	if ob.Channel != 0 && e.lastObsChannel != 0 && ob.Channel != e.lastObsChannel {
-		e.dirty = true
+		e.invalidate()
 	}
 	if ob.Band != "" && e.lastObsBand != "" && ob.Band != e.lastObsBand {
-		e.dirty = true
+		e.invalidate()
 	}
 	if ob.Channel != 0 {
 		e.lastObsChannel = ob.Channel
@@ -419,14 +449,14 @@ func (c *wifiCache) reconcileLocked(e *wifiCacheEntry, ob wifiObs, now time.Time
 	// platforms only). Permission facts are excluded — retrying those every tick
 	// would be a hot loop against a policy denial (they retry slowly below).
 	if c.cfg.SSIDDemandWindow > 0 && c.wantSSIDLocked() &&
-		e.haveFacts && e.facts.Connected && !e.facts.HasSSID && !e.facts.Permission {
-		e.dirty = true
+		e.haveFacts && e.facts.Connected && !e.facts.HasSSID && !e.facts.Permission && !e.dirty {
+		e.invalidate()
 	}
 	// A Permission verdict never clears itself: no OS event fires when the user
 	// re-enables location access, so retry on a slow clock.
-	if e.haveFacts && e.facts.Permission &&
+	if e.haveFacts && e.facts.Permission && !e.dirty &&
 		!e.lastAttempt.IsZero() && now.Sub(e.lastAttempt) >= wifiPermissionRetryInterval {
-		e.dirty = true
+		e.invalidate()
 	}
 }
 
