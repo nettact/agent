@@ -283,10 +283,6 @@ func (rt *serverRuntime) sink(res collector.Result) {
 			rt.tracker.RuntimeOK(m.MonitorID, m.ConfigSerial)
 		}
 	}
-	// The trigger sees the round before it is queued, not after it is delivered:
-	// the whole point of the local trigger is that it keeps working while the
-	// outbox is backing up behind an unreachable server.
-	rt.trigger.Observe(res.Metrics)
 	var snaps []telemetry.InterfaceSnapshot
 	if res.InterfaceSnapshot != nil {
 		snaps = []telemetry.InterfaceSnapshot{*res.InterfaceSnapshot}
@@ -304,6 +300,16 @@ func (rt *serverRuntime) sink(res collector.Result) {
 	if dropped > 0 {
 		log.Printf("[%s] WAL over capacity: dropped %d oldest samples (data gap)", rt.cfg.Name, dropped)
 	}
+	// The trigger sees the round after it is QUEUED but long before it is
+	// DELIVERED, and the difference matters twice over. Delivery is what the
+	// local trigger must not wait on — the whole point is that it keeps working
+	// while the outbox backs up behind an unreachable server — but queueing must
+	// come first: a scene collected on this round can finish and force a spill of
+	// its own, and if the confirming sample were still only in the memory tier at
+	// that moment, a reboot during the outage would leave a durable scene whose
+	// fault signal no longer has the round that would have created it. Appending
+	// first puts the sample in the same durability order as the evidence about it.
+	rt.trigger.Observe(res.Metrics)
 }
 
 // connDeps assembles the session's dependencies for one enrollment.

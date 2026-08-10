@@ -265,6 +265,60 @@ func TestDisarmSpendsTheEdgeWithoutCollecting(t *testing.T) {
 	}
 }
 
+// A target that fails, recovers and fails again inside one cooldown produces two
+// legitimate edges: the tracker clears its fired bit on the healthy round. They
+// share a monitor and a generation, so folding them together is tempting — and
+// wrong, because the server picks the owning outage by the streak's start, and
+// the merged entry would carry the FIRST outage's. The second incident could
+// then never claim the scene it appears in.
+func TestSuccessiveOutagesOfOneMonitorStayDistinct(t *testing.T) {
+	base := time.Now().Add(-10 * time.Minute)
+	set := []telemetry.SceneTrigger{}
+	add := func(firstFailedAt time.Time, streak int) {
+		set = mergeTrigger(set, telemetry.SceneTrigger{
+			Kind: telemetry.SceneTriggerProbeFault, MonitorID: "mon_1",
+			ConfigSerial: 4, TriggerStreak: streak, FirstFailedAt: firstFailedAt,
+		})
+	}
+	add(base, 3)
+	add(base.Add(3*time.Minute), 3) // a new outage of the same monitor
+	add(base, 5)                    // the first edge re-presented
+
+	if len(set) != 2 {
+		t.Fatalf("merged to %d triggers, want one per outage: %+v", len(set), set)
+	}
+	if !set[0].FirstFailedAt.Equal(base) || !set[1].FirstFailedAt.Equal(base.Add(3*time.Minute)) {
+		t.Fatalf("outage start times were not preserved: %+v", set)
+	}
+	if set[0].TriggerStreak != 5 {
+		t.Errorf("streak = %d, want the longer observed run 5", set[0].TriggerStreak)
+	}
+}
+
+// Two outages of one monitor are two claim identities but still one thing to
+// resolve, so the target is queued once.
+func TestOneTargetRefPerMonitorAcrossOutages(t *testing.T) {
+	h := newHarness(t)
+	h.trg.OnFaultEdge(probeEdge("mon_1", 1))
+	h.trg.wg.Wait()
+
+	first := probeEdge("mon_2", 1)
+	second := probeEdge("mon_2", 1)
+	second.FirstFailedAt = first.FirstFailedAt.Add(2 * time.Minute)
+	h.trg.OnFaultEdge(first)
+	h.trg.OnFaultEdge(second)
+
+	h.trg.mu.Lock()
+	triggers, refs := len(h.trg.pending), len(h.trg.pendingRefs)
+	h.trg.mu.Unlock()
+	if triggers != 2 {
+		t.Fatalf("held %d triggers, want both outages", triggers)
+	}
+	if refs != 1 {
+		t.Fatalf("queued %d target refs, want one per monitor", refs)
+	}
+}
+
 // Nothing is collected before Start or after Wait: both would append to an
 // outbox outside the runtime's lifetime.
 func TestNoCollectionOutsideTheRuntimeLifetime(t *testing.T) {

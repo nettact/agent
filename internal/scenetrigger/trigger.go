@@ -282,7 +282,10 @@ func (t *Trigger) hold(trig telemetry.SceneTrigger, ref incidentscene.TargetRef)
 	before := len(t.pending)
 	t.pending = mergeTrigger(t.pending, trig)
 	added := len(t.pending) > before
-	if added && ref.MonitorID != "" {
+	if added && ref.MonitorID != "" && !t.holdsRef(ref.MonitorID) {
+		// One ref per monitor even when it contributes two triggers: a target that
+		// failed, recovered and failed again inside the cooldown is two outages but
+		// still one thing to resolve.
 		t.pendingRefs = append(t.pendingRefs, ref)
 	}
 	if len(t.pending) <= pendingCap {
@@ -304,6 +307,16 @@ func (t *Trigger) hold(trig telemetry.SceneTrigger, ref incidentscene.TargetRef)
 			}
 		}
 	}
+}
+
+// holdsRef reports whether a target is already queued for resolution.
+func (t *Trigger) holdsRef(monitorID string) bool {
+	for _, r := range t.pendingRefs {
+		if r.MonitorID == monitorID {
+			return true
+		}
+	}
+	return false
 }
 
 // drainPending starts the collection the cooldown deferred.
@@ -373,13 +386,19 @@ func (t *Trigger) collect(ctx context.Context, deps incidentscene.Deps, trigs []
 
 // mergeTrigger folds one trigger into a set, keeping each fault edge once.
 //
-// Probe edges are identified by (monitor, generation): the same monitor failing
-// again under the same generation is the same fault, and a target edited
-// mid-outage is a different one the server must be able to tell apart. Disconnect
-// edges collapse into a single entry counting them, because a flapping link
-// produces edges faster than a scene is worth collecting and the server's
-// connectivity signal is per agent anyway — but the count travels, so the merge
-// does not read as one clean drop.
+// A probe edge is identified by (monitor, generation, streak start). The streak
+// start is what makes two OUTAGES of one monitor distinct, and leaving it out is
+// a quiet way to lose one: the tracker clears its fired bit on a healthy round,
+// so a target that fails, recovers and fails again inside the cooldown produces
+// a second legitimate edge with the same monitor and generation. Folding that
+// into the first entry would keep the FIRST outage's start time — and the server
+// picks the owning outage by exactly that timestamp, so the later incident could
+// never claim the scene it appears in.
+//
+// Disconnect edges DO collapse into a single entry counting them, because the
+// server's connectivity signal is per agent and a flapping link produces edges
+// faster than a scene is worth collecting. The count travels so the merge does
+// not read as one clean drop.
 func mergeTrigger(set []telemetry.SceneTrigger, add telemetry.SceneTrigger) []telemetry.SceneTrigger {
 	for i := range set {
 		s := &set[i]
@@ -391,10 +410,10 @@ func mergeTrigger(set []telemetry.SceneTrigger, add telemetry.SceneTrigger) []te
 			s.Reason = add.Reason // the latest classification describes the current outage
 			return set
 		}
-		if s.MonitorID == add.MonitorID && s.ConfigSerial == add.ConfigSerial {
-			// Keep the streak's own beginning and its longest observed run: both
-			// describe the one fault, and the later report is the better witness to
-			// how long it has been going.
+		if s.MonitorID == add.MonitorID && s.ConfigSerial == add.ConfigSerial &&
+			s.FirstFailedAt.Equal(add.FirstFailedAt) {
+			// The same edge re-presented. One streak fires once, so this is
+			// defensive rather than expected; keep the longer observed run.
 			if add.TriggerStreak > s.TriggerStreak {
 				s.TriggerStreak = add.TriggerStreak
 			}
