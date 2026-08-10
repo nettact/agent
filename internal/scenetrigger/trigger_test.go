@@ -319,6 +319,37 @@ func TestOneTargetRefPerMonitorAcrossOutages(t *testing.T) {
 	}
 }
 
+// An agent that starts while its server is already unreachable never
+// establishes a session, so a session-only arm left the restart-during-outage
+// case with no scene — exactly while the server's connectivity sweeper keeps an
+// incident open over it. The first failed dial of an already-enrolled agent is
+// an edge; the fiftieth still is not.
+func TestFirstFailedDialAfterStartCollectsOnce(t *testing.T) {
+	h := newHarness(t)
+	h.trg.SetAgentID("agent_1") // enrolled before this process started
+
+	h.trg.SessionLost("refused", time.Now())
+	if got := h.collected(); len(got) != 1 {
+		t.Fatalf("collected %d scenes for the first failed dial, want 1", len(got))
+	}
+
+	h.trg.SessionLost("refused", time.Now())
+	h.trg.SessionLost("refused", time.Now())
+	if got := h.collected(); len(got) != 1 {
+		t.Fatalf("collected %d scenes, want the later dials to add nothing", len(got))
+	}
+
+	// A session that really came up re-arms it. The edge lands inside the cooldown
+	// that the first collection started, so it is held rather than collected at
+	// once — draining is what the timer would have done.
+	h.trg.SessionUp()
+	h.trg.SessionLost("timeout", time.Now())
+	h.trg.drainPending()
+	if got := h.collected(); len(got) != 2 {
+		t.Fatalf("collected %d scenes, want a real disconnect to raise one", len(got))
+	}
+}
+
 // Nothing is collected before Start or after Wait: both would append to an
 // outbox outside the runtime's lifetime.
 func TestNoCollectionOutsideTheRuntimeLifetime(t *testing.T) {

@@ -95,7 +95,7 @@ type Trigger struct {
 	// pending holds the triggers crossed during a cooldown, with the target refs
 	// their probe edges want resolved. timer fires when the cooldown expires.
 	pending     []telemetry.SceneTrigger
-	pendingRefs []incidentscene.TargetRef
+	pendingRefs []heldRef
 	lastDone    time.Time
 	timer       *time.Timer
 
@@ -105,6 +105,13 @@ type Trigger struct {
 	// simply gone) find it unarmed and collect nothing: there is no new fact in
 	// the fiftieth failed dial that the first one did not already carry.
 	sessionUp bool
+	// armedOnce records that the process-start arm has been spent. An agent that
+	// STARTS while its server is already unreachable never establishes a session,
+	// so a session-only arm would leave the restart-during-outage case with no
+	// scene at all — while the server's connectivity sweeper happily keeps an
+	// incident open over it. The first failed dial of an already-enrolled agent
+	// therefore counts as an edge; every later one still does not.
+	armedOnce bool
 }
 
 // New builds a trigger. deps carries the same platform HAL, target-access guard
@@ -161,6 +168,12 @@ func (t *Trigger) Wait() {
 func (t *Trigger) SetAgentID(id string) {
 	t.mu.Lock()
 	t.deps.Identity.AgentID = id
+	// A credential in hand means this agent was enrolled before now, so its first
+	// failed dial describes a machine that lost a server it used to reach. Arm
+	// once for that; a session established later re-arms through SessionUp.
+	if id != "" && !t.armedOnce {
+		t.armedOnce, t.sessionUp = true, true
+	}
 	t.mu.Unlock()
 }
 
@@ -273,20 +286,18 @@ func (t *Trigger) enqueue(trig telemetry.SceneTrigger, ref incidentscene.TargetR
 
 // hold adds an edge to the cooldown's held set, shedding the oldest at the cap.
 //
-// The two lists are trimmed together even though only probe edges contribute a
-// ref: a disconnect edge occupies a trigger slot without one, so trimming them
-// independently would leave a resolved target in the report whose trigger had
-// already been shed — a targets row explaining a fault the scene no longer
-// claims.
+// Refs are kept per (monitor, generation) rather than per monitor. Two outages
+// of one unedited monitor share a ref — same endpoint, one thing to resolve —
+// but a monitor materially edited during the cooldown keeps both triggers, and
+// its new generation can name a different host, port or NIC. Collapsing those
+// onto the monitor id would resolve the OLD endpoint and file it as the new
+// generation's evidence.
 func (t *Trigger) hold(trig telemetry.SceneTrigger, ref incidentscene.TargetRef) {
 	before := len(t.pending)
 	t.pending = mergeTrigger(t.pending, trig)
 	added := len(t.pending) > before
-	if added && ref.MonitorID != "" && !t.holdsRef(ref.MonitorID) {
-		// One ref per monitor even when it contributes two triggers: a target that
-		// failed, recovered and failed again inside the cooldown is two outages but
-		// still one thing to resolve.
-		t.pendingRefs = append(t.pendingRefs, ref)
+	if added && ref.MonitorID != "" && !t.holdsRef(ref.MonitorID, trig.ConfigSerial) {
+		t.pendingRefs = append(t.pendingRefs, heldRef{serial: trig.ConfigSerial, ref: ref})
 	}
 	if len(t.pending) <= pendingCap {
 		return
@@ -294,29 +305,57 @@ func (t *Trigger) hold(trig telemetry.SceneTrigger, ref incidentscene.TargetRef)
 	drop := len(t.pending) - pendingCap
 	log.Printf("[%s] incident scene: %d held triggers over the cap, dropping the oldest %d",
 		t.name, len(t.pending), drop)
-	shed := t.pending[:drop]
 	t.pending = t.pending[drop:]
-	for _, s := range shed {
-		if s.Kind != telemetry.SceneTriggerProbeFault {
-			continue
-		}
-		for i, r := range t.pendingRefs {
-			if r.MonitorID == s.MonitorID {
-				t.pendingRefs = append(t.pendingRefs[:i], t.pendingRefs[i+1:]...)
-				break
-			}
+	// Rebuild from what SURVIVED rather than deleting per shed trigger. Two
+	// outages of one monitor share a ref, so removing it because the older one was
+	// shed would strip the target evidence off a trigger that is still held.
+	kept := t.pendingRefs[:0]
+	for _, h := range t.pendingRefs {
+		if t.retains(h) {
+			kept = append(kept, h)
 		}
 	}
+	t.pendingRefs = kept
 }
 
-// holdsRef reports whether a target is already queued for resolution.
-func (t *Trigger) holdsRef(monitorID string) bool {
-	for _, r := range t.pendingRefs {
-		if r.MonitorID == monitorID {
+// retains reports whether any still-held trigger wants this ref resolved.
+func (t *Trigger) retains(h heldRef) bool {
+	for _, p := range t.pending {
+		if p.Kind == telemetry.SceneTriggerProbeFault &&
+			p.MonitorID == h.ref.MonitorID && p.ConfigSerial == h.serial {
 			return true
 		}
 	}
 	return false
+}
+
+// heldRef is one queued target resolution, tagged with the generation that asked
+// for it so an edit mid-cooldown does not silently reuse the old endpoint.
+type heldRef struct {
+	serial int
+	ref    incidentscene.TargetRef
+}
+
+// holdsRef reports whether this generation of a target is already queued.
+func (t *Trigger) holdsRef(monitorID string, serial int) bool {
+	for _, h := range t.pendingRefs {
+		if h.ref.MonitorID == monitorID && h.serial == serial {
+			return true
+		}
+	}
+	return false
+}
+
+// targetRefs is the held set as the collector wants it.
+func targetRefs(held []heldRef) []incidentscene.TargetRef {
+	if len(held) == 0 {
+		return nil
+	}
+	out := make([]incidentscene.TargetRef, 0, len(held))
+	for _, h := range held {
+		out = append(out, h.ref)
+	}
+	return out
 }
 
 // drainPending starts the collection the cooldown deferred.
@@ -327,7 +366,7 @@ func (t *Trigger) drainPending() {
 	if len(t.pending) == 0 || t.inflight {
 		return
 	}
-	trigs, refs := t.pending, t.pendingRefs
+	trigs, refs := t.pending, targetRefs(t.pendingRefs)
 	t.pending, t.pendingRefs = nil, nil
 	t.startLocked(trigs, refs)
 }
