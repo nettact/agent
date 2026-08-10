@@ -21,6 +21,7 @@ type harness struct {
 	mu      sync.Mutex
 	reqs    []traceroute.Request
 	results []telemetry.TraceResult
+	edges   []FaultEdge
 }
 
 func newHarness(t *testing.T, targets []pcfg.ProbeTarget, perms ...permission.ID) *harness {
@@ -53,6 +54,11 @@ func newProxyHarness(t *testing.T, targets []pcfg.ProbeTarget, proxies ProxyLook
 			h.mu.Lock()
 			h.results = append(h.results, res)
 			h.mu.Unlock()
+		},
+		func(e FaultEdge) {
+			h.mu.Lock()
+			h.edges = append(h.edges, e)
+			h.mu.Unlock()
 		})
 	h.trk.SetTargets(targets)
 	h.trk.Start(context.Background())
@@ -76,6 +82,16 @@ func (h *harness) sunk() []telemetry.TraceResult {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]telemetry.TraceResult(nil), h.results...)
+}
+
+// faultEdges is what the scene collector was handed. Edges are delivered inline
+// on Observe, so no settling is needed — but it shares the recording mutex with
+// the trace goroutines.
+func (h *harness) faultEdges() []FaultEdge {
+	h.settle()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]FaultEdge(nil), h.edges...)
 }
 
 // icmpRound is one ICMP cycle's metrics at loss percentage pct, complete for a
@@ -489,12 +505,14 @@ func TestResolvePolicyFillsUnsetFields(t *testing.T) {
 	}
 }
 
-// Gateway and host monitors have no diagnosable network path, so they are never
-// counted at all.
-func TestIneligibleKindsAreNeverCounted(t *testing.T) {
+// A gateway monitor is one hop away, so there is no path worth walking and it
+// never produces a trace. It DOES produce a scene edge: an unreachable default
+// gateway is the fault whose local network context is worth the most, and the
+// server watching it has most likely lost this agent too.
+func TestGatewayFaultRaisesASceneEdgeButNoTrace(t *testing.T) {
 	h := newHarness(t, []pcfg.ProbeTarget{{
 		MonitorID: "gw", Kind: "gateway", Target: "gateway",
-		Params: pcfg.ProbeParams{PacketCount: 3},
+		Params: pcfg.ProbeParams{PacketCount: 3, Interface: "eth0"},
 	}})
 	now := time.Now()
 	for i := 0; i < 10; i++ {
@@ -502,6 +520,51 @@ func TestIneligibleKindsAreNeverCounted(t *testing.T) {
 	}
 	if got := len(h.requests()); got != 0 {
 		t.Fatalf("a gateway monitor triggered %d traces", got)
+	}
+	edges := h.faultEdges()
+	if len(edges) != 1 {
+		t.Fatalf("gateway fault raised %d scene edges, want exactly one (it is an edge, not a per-round event)", len(edges))
+	}
+	if edges[0].MonitorID != "gw" || edges[0].Kind != "gateway" || edges[0].Iface != "eth0" {
+		t.Fatalf("scene edge = %+v, want the failing gateway monitor with its NIC", edges[0])
+	}
+	if edges[0].Streak != defaultConsecutiveFailures {
+		t.Fatalf("scene edge streak = %d, want the confirmation threshold %d", edges[0].Streak, defaultConsecutiveFailures)
+	}
+}
+
+// A host monitor names a metric series, not a network destination: neither
+// diagnostic has anything to say about it.
+func TestHostKindIsNeverCounted(t *testing.T) {
+	h := newHarness(t, []pcfg.ProbeTarget{{
+		MonitorID: "hst", Kind: "host", Target: "host",
+		Params: pcfg.ProbeParams{PacketCount: 3},
+	}})
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		h.trk.Observe(icmpRound("hst", now.Add(time.Duration(i)*time.Second), 100))
+	}
+	if got := len(h.requests()); got != 0 {
+		t.Fatalf("a host monitor triggered %d traces", got)
+	}
+	if got := len(h.faultEdges()); got != 0 {
+		t.Fatalf("a host monitor raised %d scene edges", got)
+	}
+}
+
+// A scene edge is owed even where the trace is not: an agent with no traceroute
+// permission still describes the machine that found the fault.
+func TestSceneEdgeSurvivesADeniedTrace(t *testing.T) {
+	h := newHarness(t, []pcfg.ProbeTarget{icmpTarget("m1", "1.1.1.1")}, permission.DiagnosticTracerouteTCP)
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		h.trk.Observe(icmpRound("m1", now.Add(time.Duration(i)*time.Second), 100))
+	}
+	if got := len(h.requests()); got != 0 {
+		t.Fatalf("a denied ICMP traceroute still ran %d sweeps", got)
+	}
+	if got := len(h.faultEdges()); got != 1 {
+		t.Fatalf("denied trace raised %d scene edges, want one", got)
 	}
 }
 

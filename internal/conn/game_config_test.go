@@ -78,7 +78,7 @@ func gamePush(configVersion int, game *pcfg.GameConfig, target string) wire.Fram
 
 func applyOrFail(t *testing.T, r *runner, f wire.Frame) {
 	t.Helper()
-	if err := r.applyPush(context.Background(), context.Background(), &silentConn{t}, f, nil); err != nil {
+	if err := r.applyPush(context.Background(), context.Background(), &silentConn{t}, f); err != nil {
 		t.Fatalf("applyPush: %v", err)
 	}
 }

@@ -248,13 +248,6 @@ type Deps struct {
 	// selects hostsnapshot.Collect; tests inject a stub to avoid the CPU sample
 	// window.
 	CollectSnapshot func(ctx context.Context, requestID string, collect permission.Set) telemetry.HostSnapshot
-
-	// CollectIncidentSnapshot answers one config.IncidentSnapshotRequest with an
-	// immutable incident-scene snapshot (INCIDENT-002). It runs OFF the session
-	// goroutine (applyPush returns immediately) and its result Frame is written
-	// back by the single session writer. Nil disables the feature: the request is
-	// acknowledged as handled and dropped (tests that never push it).
-	CollectIncidentSnapshot func(ctx context.Context, req pcfg.IncidentSnapshotRequest) telemetry.IncidentSnapshot
 }
 
 // Run dials the server and keeps a session alive until ctx is cancelled,
@@ -524,43 +517,11 @@ func (r *runner) session(ctx context.Context) error {
 	ackCh := make(chan wire.Ack, 1)
 	pushCh := make(chan wire.Frame, 4)
 
-	// aw carries the async request machinery: an incident-snapshot push is handled
-	// OFF this goroutine (applyPush returns immediately) but its result Frame is
-	// funneled back through resultCh so the single session writer stays the only
-	// thing touching the socket. The in-flight set is touched only on the session
-	// goroutine (applyPush inserts, sessionLoop clears), so it needs no locking.
-	// resultCh is bounded; a background worker drops its result if the session
-	// ends first.
-	aw := &asyncWork{
-		resultCh:     make(chan wire.Frame, asyncResultBuffer),
-		inflightSnap: map[string]struct{}{},
-	}
-
 	go r.readLoop(sessionCtx, c, ackCh, pushCh, errCh)
 	go r.pingLoop(sessionCtx, c, errCh)
 
-	return r.sessionLoop(ctx, sessionCtx, c, ackCh, pushCh, errCh, aw)
+	return r.sessionLoop(ctx, sessionCtx, c, ackCh, pushCh, errCh)
 }
-
-// asyncWork is one session's machinery for the asynchronous server->Agent
-// incident-snapshot request. A background worker computes the result and pushes
-// its Frame onto resultCh; the session goroutine drains resultCh, does the actual
-// socket write, and clears the matching in-flight id. Duplicate in-flight request
-// ids are ignored, so a server re-push while work is running is idempotent.
-//
-// Traceroute used to share this machinery and no longer does: the agent triggers
-// its own traces and their results ride the WAL, so nothing about them belongs on
-// the socket's critical path.
-type asyncWork struct {
-	resultCh     chan wire.Frame
-	inflightSnap map[string]struct{} // keyed by IncidentSnapshotRequest.RequestID
-}
-
-// asyncResultBuffer bounds the per-session result channel. A handful of
-// concurrent incident snapshots never makes the session goroutine the
-// bottleneck; a full channel only briefly parks a finished worker until the next
-// drain.
-const asyncResultBuffer = 16
 
 // readLoop is the session's sole reader: it decodes each frame and routes it
 // to the session goroutine. Any read/decode failure ends the session (via
@@ -579,8 +540,7 @@ func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- 
 			case <-sessionCtx.Done():
 				return
 			}
-		case f.DesiredState != nil, f.SnapshotRequest != nil,
-			f.IncidentSnapshotRequest != nil:
+		case f.DesiredState != nil, f.SnapshotRequest != nil:
 			select {
 			case pushCh <- f:
 			case <-sessionCtx.Done():
@@ -620,11 +580,11 @@ func (r *runner) pingLoop(sessionCtx context.Context, c wire.Conn, errCh chan<- 
 
 // sessionLoop is the session goroutine's main loop: drain the WAL on a ticker
 // (plus once immediately) and apply server pushes as they arrive.
-func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, aw *asyncWork) error {
+func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	// Immediate first drain: a freshly-(re)connected session should flush
 	// whatever accumulated while offline without waiting a full tick —
 	// preserves the old loop's fast-startup behavior.
-	if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh, aw); err != nil {
+	if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(r.deps.DrainInterval)
@@ -642,16 +602,8 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 		case err := <-errCh:
 			return err
 		case f := <-pushCh:
-			if err := r.applyPush(ctx, sessionCtx, c, f, aw); err != nil {
+			if err := r.applyPush(ctx, sessionCtx, c, f); err != nil {
 				return err
-			}
-		case f := <-aw.resultCh:
-			// A background incident-snapshot worker finished: write its result on the
-			// session goroutine (single-writer invariant) and clear the in-flight id so
-			// a later request with the same id can run again.
-			r.clearInflight(aw, f)
-			if err := r.writeFrame(sessionCtx, c, f); err != nil {
-				return fmt.Errorf("write async result: %w", err)
 			}
 		case ms := <-trackerUpdates:
 			// Runtime target-policy transition — write the full-state frame on the
@@ -660,18 +612,10 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 				return fmt.Errorf("write monitor status: %w", err)
 			}
 		case <-ticker.C:
-			if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh, aw); err != nil {
+			if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh); err != nil {
 				return err
 			}
 		}
-	}
-}
-
-// clearInflight removes the in-flight id a finished async result Frame answers,
-// so a subsequent server re-push of the same request executes again.
-func (r *runner) clearInflight(aw *asyncWork, f wire.Frame) {
-	if f.IncidentSnapshot != nil {
-		delete(aw.inflightSnap, f.IncidentSnapshot.RequestID)
 	}
 }
 
@@ -680,7 +624,7 @@ func (r *runner) clearInflight(aw *asyncWork, f wire.Frame) {
 // tick, same-sequence retry on failure, server dedups on agent_id+sequence).
 // All WAL access happens here, on the session goroutine, so the store never
 // sees concurrent claims.
-func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, aw *asyncWork) error {
+func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	for i := 0; i < maxBatchesPerDrain; i++ {
 		batch, ok, err := r.deps.Outbox.NextBatch(r.opts.ServerName, batchItems)
 		if err != nil {
@@ -707,11 +651,12 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 			GameGaps:           batch.GameGaps,
 			GameHostSeconds:    batch.GameHostSeconds,
 			TraceResults:       batch.TraceResults,
+			SceneReports:       batch.SceneReports,
 		}
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {
 			return fmt.Errorf("write packet seq=%d: %w", batch.Sequence, err)
 		}
-		ack, err := r.awaitAck(ctx, sessionCtx, c, ackCh, pushCh, errCh, aw, batch.Sequence)
+		ack, err := r.awaitAck(ctx, sessionCtx, c, ackCh, pushCh, errCh, batch.Sequence)
 		if err != nil {
 			// The batch stays tagged in the WAL and is re-sent under the SAME
 			// sequence by the next session, so nothing is lost or double-counted.
@@ -752,7 +697,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 // consuming pushCh while it waits — the deadlock guard: if pushes queued up
 // unconsumed, the reader would block sending to pushCh and the ack could never
 // be read off the wire.
-func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, aw *asyncWork, seq uint64) (wire.Ack, error) {
+func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
 	timer := time.NewTimer(r.opts.ackTimeout)
 	defer timer.Stop()
 	for {
@@ -762,15 +707,8 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-
 		case err := <-errCh:
 			return wire.Ack{}, err
 		case f := <-pushCh:
-			if err := r.applyPush(ctx, sessionCtx, c, f, aw); err != nil {
+			if err := r.applyPush(ctx, sessionCtx, c, f); err != nil {
 				return wire.Ack{}, err
-			}
-		case f := <-aw.resultCh:
-			// Keep the single-writer result path flowing while a packet ack is
-			// outstanding, so a finished worker never wedges behind a full channel.
-			r.clearInflight(aw, f)
-			if err := r.writeFrame(sessionCtx, c, f); err != nil {
-				return wire.Ack{}, fmt.Errorf("write async result: %w", err)
 			}
 		case ack := <-ackCh:
 			return ack, nil
@@ -783,12 +721,17 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-
 }
 
 // applyPush handles one server push. Runs only on the session goroutine, so
-// config application and the applied-version guards stay race-free. DesiredState
-// and the host SnapshotRequest are served inline (unchanged); the incident-snapshot
-// and traceroute requests are dispatched to a background worker and answered
-// asynchronously via aw.resultCh, so this call returns immediately and the WAL
-// drain/ack/config/monitor-status flow is never blocked by diagnostic work.
-func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.Frame, aw *asyncWork) error {
+// config application and the applied-version guards stay race-free.
+//
+// Every push is served inline, and there is deliberately no machinery here for
+// serving one anywhere else. There used to be: the incident-snapshot request was
+// computed on a background worker and its answer funnelled back through a result
+// channel so the single session writer stayed the only thing touching the socket.
+// Both of the pushes that needed that are gone — the agent triggers its own
+// traceroutes and its own incident scenes, and both ride the WAL — so the
+// machinery went with them. Anything added here that cannot answer promptly needs
+// that path rebuilt rather than blocking the drain/ack/config flow.
+func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.Frame) error {
 	switch {
 	case f.DesiredState != nil:
 		ds := f.DesiredState
@@ -834,8 +777,6 @@ func (r *runner) applyPush(ctx, sessionCtx context.Context, c wire.Conn, f wire.
 		r.logf("sent host snapshot req=%s scopes=%d procs=%d conns=%d",
 			req.RequestID, len(snap.Scopes), len(snap.Processes), len(snap.Connections))
 
-	case f.IncidentSnapshotRequest != nil:
-		r.dispatchIncidentSnapshot(sessionCtx, aw, *f.IncidentSnapshotRequest)
 	}
 	return nil
 }
@@ -1105,70 +1046,6 @@ func (r *runner) quiesce(reason string) {
 	r.appliedGame, r.appliedDiag = nil, nil
 	r.persistedDigest = ""
 	r.logf("stopped monitoring for this server: %s", reason)
-}
-
-// dispatchIncidentSnapshot starts the asynchronous incident-scene collection for
-// one request (INCIDENT-002). It is a no-op-with-dedupe on the session goroutine:
-// a duplicate in-flight RequestID is ignored (the server re-push is idempotent),
-// and the actual collection runs on a background goroutine bounded by the request
-// budget and canceled with the session. The collector always answers within the
-// budget, so the worker always produces exactly one result Frame.
-func (r *runner) dispatchIncidentSnapshot(sessionCtx context.Context, aw *asyncWork, req pcfg.IncidentSnapshotRequest) {
-	if r.deps.CollectIncidentSnapshot == nil {
-		r.logf("ignoring incident snapshot req=%s: collector not wired", req.RequestID)
-		return
-	}
-	if _, dup := aw.inflightSnap[req.RequestID]; dup {
-		r.logf("ignoring duplicate in-flight incident snapshot req=%s", req.RequestID)
-		return
-	}
-	aw.inflightSnap[req.RequestID] = struct{}{}
-	// Anchor the budget here, on the session goroutine, rather than inside the
-	// worker: the budget is defined as running from the request's arrival, and
-	// scheduling the goroutine first would silently hand back whatever the delay
-	// was. The collector answers every group within it; a worker that finishes
-	// after the session ended drops its result (server reconnect re-push retries).
-	ctx := budgetCtx(sessionCtx, req.BudgetMs)
-	go func() {
-		snap := r.deps.CollectIncidentSnapshot(ctx.ctx, req)
-		ctx.cancel()
-		r.deliver(sessionCtx, aw, wire.Frame{IncidentSnapshot: &snap})
-	}()
-}
-
-// deliver hands a finished result Frame to the session writer, or drops it if the
-// session ended first (its in-flight id dies with the session; a server re-push
-// on the next connection retries). It never writes to the socket itself — that
-// stays the sole province of the session goroutine.
-func (r *runner) deliver(sessionCtx context.Context, aw *asyncWork, f wire.Frame) {
-	select {
-	case aw.resultCh <- f:
-	case <-sessionCtx.Done():
-	}
-}
-
-// boundedCtx pairs a derived context with its cancel so a worker can release
-// timer resources deterministically once its result is in hand.
-type boundedCtx struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-}
-
-// budgetCtx derives a worker context from the session context, bounded by the
-// request's own budget measured from this agent's clock (config.BudgetWindow — a
-// duration precisely so server/agent clock skew cannot eat the window). Callers
-// invoke it at the request's arrival, so arrival and evaluation are the same
-// instant. Session cancellation (reconnect/shutdown) still cancels the work; a
-// spent budget yields an already-expired context, so the worker reports its
-// terminal timed-out state instead of collecting.
-func budgetCtx(sessionCtx context.Context, budgetMs int) boundedCtx {
-	now := time.Now()
-	deadline, ok := pcfg.BudgetWindow(budgetMs, now, now)
-	if !ok {
-		deadline = now
-	}
-	ctx, cancel := context.WithDeadline(sessionCtx, deadline)
-	return boundedCtx{ctx: ctx, cancel: cancel}
 }
 
 // collectSnapshot classifies each requested scope (collected/denied/unsupported/

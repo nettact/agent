@@ -1,5 +1,8 @@
 // Package tracetrigger decides, locally, when this agent should traceroute a
-// target it has just found unreachable — and runs it.
+// target it has just found unreachable — and runs it. The same edge also feeds
+// the incident-scene collector (see SceneSink), because "this target just became
+// confirmed-down" is one observation and both diagnostics hang off it; keeping
+// two copies of this streak machine would only give them somewhere to diverge.
 //
 // # Why the agent decides
 //
@@ -129,6 +132,34 @@ type Runner func(ctx context.Context, req traceroute.Request, decidedAt time.Tim
 // the agent it appends to this server's slice of the outbox.
 type Sink func(res telemetry.TraceResult)
 
+// FaultEdge is one target crossing the confirmation threshold, handed to the
+// scene collector. Everything in it is read from the round that confirmed the
+// streak and the target as it was pushed — frozen at the edge, never re-read
+// from live configuration afterwards, so a scene collected seconds later still
+// describes the fault that caused it.
+type FaultEdge struct {
+	MonitorID    string
+	ConfigSerial int // the target's material generation; half of the server's claim key
+	Kind         string
+	Target       string
+	Port         int
+	Iface        string // gateway only: the NIC whose gateway failed
+
+	Streak        int
+	FirstFailedAt time.Time
+}
+
+// SceneSink receives each fault edge so the agent can collect its surroundings.
+// Like Observe itself it runs on the collector's goroutine, so an implementation
+// must return promptly and do its collecting elsewhere.
+//
+// It is a separate sink rather than a second Runner because the two diagnostics
+// are owed at different times: a trace is owed only where there is a path worth
+// walking and a permission to walk it, while a scene is owed to the EDGE — a
+// fault whose path is undiagnosable is still a fault whose surroundings are
+// worth having, and is often the one where they are worth the most.
+type SceneSink func(e FaultEdge)
+
 // ProxyLookup returns the egress specs currently pushed to this server, so a
 // pinned target's fault can be diagnosed on the leg that actually carried it.
 // Satisfied by (*proxydial.Manager).Specs.
@@ -166,6 +197,7 @@ type streak struct {
 type Tracker struct {
 	runner    Runner
 	sink      Sink
+	scene     SceneSink
 	proxies   ProxyLookup
 	effective permission.Set
 	granted   permission.Set
@@ -187,10 +219,13 @@ type Tracker struct {
 // New builds a tracker. proxies may be nil (no egress support), in which case a
 // pinned target's fault plans as an unnameable proxy path rather than as a
 // direct trace — the same fail-closed rule the engine applies to the pin itself.
-func New(name string, effective, granted, supported permission.Set, proxies ProxyLookup, runner Runner, sink Sink) *Tracker {
+// scene may be nil, which is how the lite build (no scene collection at all)
+// keeps the trigger otherwise intact.
+func New(name string, effective, granted, supported permission.Set, proxies ProxyLookup, runner Runner, sink Sink, scene SceneSink) *Tracker {
 	return &Tracker{
 		runner:    runner,
 		sink:      sink,
+		scene:     scene,
 		proxies:   proxies,
 		effective: effective,
 		granted:   granted,
@@ -263,6 +298,12 @@ func (t *Tracker) SetTargets(targets []pcfg.ProbeTarget) {
 // three consecutive OBSERVED rounds ever supported; symmetrically, a preserved
 // fired bit would suppress the first trace of a genuinely fresh outage. A
 // disabled interval has no failure count to carry, so it carries none.
+//
+// Disabling stops incident scenes on this edge too, since the streaks they ride
+// stop advancing. That is deliberate rather than incidental: the policy is the
+// install's answer to "how eager is this agent about diagnostics", and an
+// operator who turned that off has not asked to keep paying for half of it. The
+// disconnect edge is unaffected — it never passes through here.
 //
 // The cooldowns deliberately survive: they bound what this machine spends on
 // tracing a path, which an operator toggling a policy has not undone.
@@ -363,13 +404,46 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 	}
 	st.fired = true
 	streakLen, firstFailedAt := st.fails, st.firstFailedAt
+	evd := t.evidenceFor(tg, r)
+	scene := t.scene
+	t.mu.Unlock()
 
-	p, ok := derivePlan(t.evidenceFor(tg, r), t.effective, t.granted, t.supported)
+	// The scene goes first and is unconditional. It is owed to the EDGE, not to
+	// the trace: the kinds with no diagnosable path (gateway) and the faults with
+	// no permission to walk one still deserve a description of the machine that
+	// found them. Handing it over outside the lock keeps a slow collector from
+	// stalling every other monitor's streak, and the sink's own contract is to
+	// return promptly and collect elsewhere.
+	if scene != nil {
+		scene(FaultEdge{
+			MonitorID: tg.MonitorID, ConfigSerial: tg.ConfigSerial,
+			Kind: tg.Kind, Target: tg.Target, Port: tg.Params.Port, Iface: tg.Params.Interface,
+			Streak: streakLen, FirstFailedAt: firstFailedAt,
+		})
+	}
+	// Tracing stays gated on its own eligibility, so widening what produces rounds
+	// (for scenes) cannot quietly widen what gets traced.
+	if !TraceEligibleKind(tg.Kind) {
+		return
+	}
+	t.planAndTrace(evd, pol, streakLen, firstFailedAt, now)
+}
+
+// planAndTrace derives the path diagnostic for a confirmed edge and runs it,
+// subject to the per-cohort in-flight slot and cooldown. Split out of
+// observeRound so the streak bookkeeping and the scene handoff read as one
+// thing and the trace spending as another.
+//
+// pol travels as an argument rather than being re-read: it is the policy the
+// edge was judged under, and a push landing between the two would otherwise let
+// a trace run under a threshold its own streak never met.
+func (t *Tracker) planAndTrace(evd evidence, pol Policy, streakLen int, firstFailedAt, now time.Time) {
+	p, ok := derivePlan(evd, t.effective, t.granted, t.supported)
 	if !ok {
-		t.mu.Unlock()
 		return
 	}
 
+	t.mu.Lock()
 	// Path-level dedupe and cooldown. Both are keyed by the plan's cohort — the
 	// probe, destination and path — rather than by the monitor, because what is
 	// being spared is the path: three monitors on one host going down together
@@ -401,12 +475,16 @@ func (t *Tracker) observeRound(r round, now time.Time) {
 	}
 	t.inflight[cohort] = struct{}{}
 	ctx := t.ctx
+	// Counted while the lock is still held, so it cannot race Wait. Wait sets stop
+	// under this same mutex and only then calls wg.Wait; adding after the unlock
+	// leaves a window in which Wait observes a zero counter, returns, and lets the
+	// outbox close under a trace goroutine that has not started yet.
+	t.wg.Add(1)
 	t.mu.Unlock()
 
 	req := p.request(reportID, pol, streakLen, firstFailedAt)
 	log.Printf("[%s] traceroute %s %s after %d consecutive failures (%s)",
 		t.name, p.mode, p.destHost, streakLen, p.subjectKind)
-	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
 		res := t.runner(ctx, req, now)
@@ -533,7 +611,7 @@ func (t *Tracker) buildRounds(ms []telemetry.Metric) []round {
 			continue // system/host series carry no availability verdict
 		}
 		tg, ok := targets[m.MonitorID]
-		if !ok || !TraceEligibleKind(tg.Kind) {
+		if !ok || !SceneEligibleKind(tg.Kind) {
 			continue
 		}
 		// The sample must belong to the generation currently installed. A v1
@@ -554,7 +632,7 @@ func (t *Tracker) buildRounds(ms []telemetry.Metric) []round {
 		reason, hasReason := reasonMetricKind(tg.Kind)
 		isPrimary := kind == primary
 		isReason := hasReason && kind == reason
-		isSent := tg.Kind == "icmp" && kind == string(telemetry.ICMPSent)
+		isSent := icmpShaped(tg.Kind) && kind == string(telemetry.ICMPSent)
 		if !isPrimary && !isReason && !isSent {
 			continue
 		}
@@ -592,7 +670,7 @@ func (t *Tracker) buildRounds(ms []telemetry.Metric) []round {
 		// the echoes it managed — figures indistinguishable from a healthy or a dead
 		// target on exactly the metric this reads. It is not a verdict, so it neither
 		// starts nor breaks a streak.
-		if tg.Kind == "icmp" && !icmpRoundComplete(a.hasSent, a.sent, pcfg.PingCount(tg.Params)) {
+		if icmpShaped(tg.Kind) && !icmpRoundComplete(a.hasSent, a.sent, pcfg.PingCount(tg.Params)) {
 			continue
 		}
 		cls, ok := classify(tg.Kind, a.value)
@@ -606,14 +684,24 @@ func (t *Tracker) buildRounds(ms []telemetry.Metric) []round {
 	return out
 }
 
+// icmpShaped reports whether a probe kind emits the shared ICMP metric set
+// (loss + sent + error_class). Gateway monitors ping their first hop through the
+// same code path as an ICMP monitor, so everything that reads those metrics has
+// to treat the two kinds alike — the difference between them is which
+// destination was chosen, not what was measured.
+func icmpShaped(probeKind string) bool {
+	return probeKind == "icmp" || probeKind == "gateway"
+}
+
 // successMetricKind maps a probe kind to the metric whose value decides whether
-// a round succeeded, matching the server's definition of "up" exactly. ICMP has
-// no boolean: a cycle's health is its loss percentage. Everything else emits an
-// explicit probe.<kind>.ok, whose semantics (expected status codes, body
-// keyword, TLS) the probe already decided from the target's configuration.
+// a round succeeded, matching the server's definition of "up" exactly. ICMP and
+// gateway have no boolean: a cycle's health is its loss percentage. Everything
+// else emits an explicit probe.<kind>.ok, whose semantics (expected status
+// codes, body keyword, TLS) the probe already decided from the target's
+// configuration.
 func successMetricKind(probeKind string) string {
 	switch probeKind {
-	case "icmp":
+	case "icmp", "gateway":
 		return string(telemetry.ICMPLoss)
 	case "tcp":
 		return string(telemetry.TCPOK)
@@ -631,7 +719,7 @@ func successMetricKind(probeKind string) string {
 // code, or ("", false) for a kind with no reason concept (nat).
 func reasonMetricKind(probeKind string) (string, bool) {
 	switch probeKind {
-	case "icmp":
+	case "icmp", "gateway":
 		return string(telemetry.ICMPErrorClass), true
 	case "dns":
 		return string(telemetry.DNSErrorClass), true
@@ -657,7 +745,7 @@ func classify(probeKind string, value float64) (failed bool, ok bool) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return false, false
 	}
-	if probeKind == "icmp" {
+	if icmpShaped(probeKind) {
 		return value >= 100, true
 	}
 	return value < 0.5, true

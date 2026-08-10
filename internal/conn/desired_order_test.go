@@ -66,7 +66,7 @@ func TestDesiredStateIsAppliedBeforeGenerationIsAttested(t *testing.T) {
 		Intervals: pcfg.Intervals{BaseSeconds: 5, RegularSeconds: 60},
 	}}
 
-	err := r.applyPush(context.Background(), context.Background(), conn, push, nil)
+	err := r.applyPush(context.Background(), context.Background(), conn, push)
 	if !errors.Is(err, errStatusWrite) {
 		t.Fatalf("applyPush error = %v, want status write failure", err)
 	}

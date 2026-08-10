@@ -1,7 +1,6 @@
 package agentrt
 
 import (
-	"context"
 	"log"
 	"runtime"
 	"time"
@@ -10,17 +9,16 @@ import (
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/desiredstate"
 	"github.com/nettact/agent/internal/identity"
-	"github.com/nettact/agent/internal/incidentscene"
 	"github.com/nettact/agent/internal/monitoreval"
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/internal/proxydial"
+	"github.com/nettact/agent/internal/scenetrigger"
 	"github.com/nettact/agent/internal/scheduler"
 	"github.com/nettact/agent/internal/traceegress"
 	"github.com/nettact/agent/internal/traceroute"
 	"github.com/nettact/agent/internal/tracetrigger"
 	"github.com/nettact/agent/internal/wal"
-	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -78,7 +76,11 @@ type serverRuntime struct {
 	// server's permissions gate the mode, this server's proxy generation pins the
 	// egress, and the report belongs in this server's slice of the outbox.
 	trigger *tracetrigger.Tracker
-	scene   incidentscene.Deps
+	// scene owns the decision to collect an incident scene, on either of the two
+	// edges this server can observe: one of its targets crossing the fault
+	// threshold, and its own session dropping. Per server for the same reasons the
+	// trace trigger is.
+	scene *scenetrigger.Trigger
 
 	// game is nil for every server but the owner (see gameOwner). A nil applier
 	// makes the session ignore a pushed GameConfig outright, which is exactly the
@@ -186,23 +188,20 @@ func buildServer(
 	}
 	rt.sched = scheduler.New(tiered, selfSched, rt.sink)
 
-	// Incident-scene collector and traceroute engine (INCIDENT-002 / DIAG-001).
-	// Both reuse this server's permission views, platform HAL, and target-access
-	// guard. They are invoked off the session goroutine and their result Frames
-	// written by the single session writer, so normal collector cadence is
-	// untouched.
-	rt.scene = incidentscene.Deps{
+	// Incident-scene trigger and traceroute engine (INCIDENT-005 / DIAG-001). Both
+	// reuse this server's permission views, platform HAL, and target-access guard,
+	// and both file their results in the outbox rather than on the socket — the
+	// faults they describe are the most likely reason the socket is unusable.
+	rt.scene = scenetrigger.New(sc.Name, scenetrigger.Deps{
 		Platform:  p,
 		Guard:     v.guard,
 		Effective: v.effective,
 		Granted:   v.granted,
 		Supported: v.supported,
-		Identity: incidentscene.Identity{
-			Hostname: hostname,
-			OS:       runtime.GOOS,
-			Version:  Version,
-		},
-	}
+		Hostname:  hostname,
+		OS:        runtime.GOOS,
+		Version:   Version,
+	}, limits.SnapshotTimeout, rt.appendScene)
 	// traceegress.Resolver is what lets an in-tunnel trace reach the proxy manager
 	// while the traceroute package stays independent of it, and it owns the
 	// DIAG-004 fail-closed contract (see that package). The limiter is shared with
@@ -217,9 +216,10 @@ func buildServer(
 	// specs (so a pinned target's fault is diagnosed on the leg that carried it),
 	// and a sink that files the report in this server's outbox slice — the same
 	// path the metrics that triggered it took, which is what makes the report
-	// survive the outage it describes.
+	// survive the outage it describes. The same confirmed-fault edge is handed to
+	// the scene trigger, which is why there is one streak machine and not two.
 	rt.trigger = tracetrigger.New(sc.Name, v.effective, v.granted, v.supported,
-		rt.proxies.Specs, rt.trace.Run, rt.appendTrace)
+		rt.proxies.Specs, rt.trace.Run, rt.appendTrace, rt.scene.OnFaultEdge)
 	rt.configurables = append(rt.configurables, rt.trigger)
 	return rt
 }
@@ -236,6 +236,35 @@ func (rt *serverRuntime) appendTrace(res telemetry.TraceResult) {
 	}
 	if dropped > 0 {
 		log.Printf("[%s] WAL over capacity: dropped %d oldest samples (data gap)", rt.cfg.Name, dropped)
+	}
+}
+
+// appendScene files one collected incident scene in this server's slice of the
+// outbox, for the same reasons appendTrace does — with the disconnect trigger
+// making the argument literal: that scene is collected when there is no session
+// to write it to, and only the outbox can hold it until there is.
+//
+// It then flushes, which appendTrace does not need to. conn.Run spills the
+// memory tier the instant a session ends, precisely to close the crash-loss
+// window while the link is down — and the disconnect scene is collected
+// asynchronously and lands AFTER that spill, so without this it would sit in RAM
+// until the age trigger fires. The event this scene exists to describe is a
+// machine that just lost its network, and the likeliest next event on that
+// machine is somebody power-cycling it to fix the internet. Losing the evidence
+// to exactly that reboot would be the whole feature failing at its one job. One
+// scene per server per minute at most, so the extra spill is not a cost worth
+// weighing against it.
+func (rt *serverRuntime) appendScene(scene telemetry.SceneReport) {
+	dropped, err := rt.outbox.Append(wal.Records{SceneReports: []telemetry.SceneReport{scene}}, rt.cfg.Name)
+	if err != nil {
+		log.Printf("[%s] wal append scene %s: %v", rt.cfg.Name, scene.ReportID, err)
+		return
+	}
+	if dropped > 0 {
+		log.Printf("[%s] WAL over capacity: dropped %d oldest samples (data gap)", rt.cfg.Name, dropped)
+	}
+	if err := rt.outbox.Flush(); err != nil {
+		log.Printf("[%s] flush outbox after scene %s: %v", rt.cfg.Name, scene.ReportID, err)
 	}
 }
 
@@ -277,13 +306,8 @@ func (rt *serverRuntime) sink(res collector.Result) {
 	}
 }
 
-// connDeps assembles the session's dependencies for one enrollment. It is built
-// per session rather than once because agentID changes: a revoked server
-// re-enrolls under a new identity, and the incident scene stamps that id into
-// every snapshot it collects.
+// connDeps assembles the session's dependencies for one enrollment.
 func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string) conn.Deps {
-	scene := rt.scene
-	scene.Identity.AgentID = cred.AgentID
 	return conn.Deps{
 		Outbox:        rt.outbox,
 		Configurables: rt.configurables,
@@ -305,8 +329,5 @@ func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string) conn
 		Supported:           rt.views.supported,
 		SnapshotMinInterval: rt.limits.SnapshotMinInterval,
 		SnapshotTimeout:     rt.limits.SnapshotTimeout,
-		CollectIncidentSnapshot: func(ctx context.Context, req pcfg.IncidentSnapshotRequest) telemetry.IncidentSnapshot {
-			return incidentscene.Collect(ctx, req, scene)
-		},
 	}
 }

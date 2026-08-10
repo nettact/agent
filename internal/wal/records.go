@@ -140,6 +140,15 @@ type Records struct {
 	// group: it was planned against that server's targets, permissions and proxy
 	// generation, and means nothing to a second server that never pushed them.
 	TraceResults []telemetry.TraceResult
+	// SceneReports are the incident scenes this agent collected on fault edges it
+	// detected itself. Same argument as the traces above, and one degree stronger:
+	// one of the two edges IS this server's session dropping, so a scene written
+	// to the connection would be a scene that could never be sent at all. It is
+	// the outbox that makes "collect while disconnected, deliver on reconnect" a
+	// coherent thing to do.
+	//
+	// Never present in a lite build, whose scene trigger collects nothing.
+	SceneReports []telemetry.SceneReport
 }
 
 // Batch is a packet to upload.
@@ -154,6 +163,7 @@ type Batch struct {
 	GameGaps        []gamesense.Gap
 	GameHostSeconds []gamesense.HostSecond
 	TraceResults    []telemetry.TraceResult
+	SceneReports    []telemetry.SceneReport
 }
 
 // memGroup is one Append held in memory: an indivisible Records, the server it
@@ -282,6 +292,7 @@ func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 		b.GameGaps = append(b.GameGaps, r.GameGaps...)
 		b.GameHostSeconds = append(b.GameHostSeconds, r.GameHostSeconds...)
 		b.TraceResults = append(b.TraceResults, r.TraceResults...)
+		b.SceneReports = append(b.SceneReports, r.SceneReports...)
 		if d == 0 {
 			continue
 		}
@@ -320,7 +331,7 @@ func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 func rowsOf(r Records) int {
 	return len(r.Metrics) + len(r.Events) + len(r.Inventory) + len(r.Snapshots) +
 		len(r.GameRuns) + len(r.GameBuckets) + len(r.GameGaps) + len(r.GameHostSeconds) +
-		len(r.TraceResults)
+		len(r.TraceResults) + len(r.SceneReports)
 }
 
 // clockTag returns the epoch and monotonic reading to stamp on a group being

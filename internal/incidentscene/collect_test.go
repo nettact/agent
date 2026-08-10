@@ -1,3 +1,5 @@
+//go:build !lite
+
 package incidentscene
 
 import (
@@ -9,7 +11,6 @@ import (
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
 	"github.com/nettact/agent/probepolicy"
-	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 )
@@ -66,11 +67,8 @@ func lanIfaces() []platform.IfaceInfo {
 // detail page for a plain LAN outage — pointing the reader at a layer that was
 // working fine. It must resolve from the routing table instead.
 func TestGatewayTargetResolvesFromRoutingTableNotDNS(t *testing.T) {
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_gw", IncidentID: "inc_gw",
-		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
-	}
-	tg := Collect(context.Background(), req, gatewayDeps(lanIfaces(), nil)).Targets[0]
+	refs := []TargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}}
+	tg := Collect(context.Background(), gatewayDeps(lanIfaces(), nil), refs).Targets[0]
 
 	if tg.ErrorClass != "" {
 		t.Errorf("error class = %q, want empty (the gateway resolved)", tg.ErrorClass)
@@ -88,15 +86,12 @@ func TestGatewayTargetResolvesFromRoutingTableNotDNS(t *testing.T) {
 // The monitor's NIC selection has to reach the snapshot, or a multi-NIC host
 // reports one NIC's gateway for an incident raised on another's.
 func TestGatewayTargetHonoursInterfaceSelection(t *testing.T) {
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_gw2", IncidentID: "inc_gw2",
-		Targets: []pcfg.SnapshotTargetRef{
-			{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway", Iface: "以太网"},
-			// A NIC that no longer exists must not silently fall back to the default.
-			{MonitorID: "mon_gone", Kind: "gateway", Target: "gateway", Iface: "does-not-exist"},
-		},
+	refs := []TargetRef{
+		{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway", Iface: "以太网"},
+		// A NIC that no longer exists must not silently fall back to the default.
+		{MonitorID: "mon_gone", Kind: "gateway", Target: "gateway", Iface: "does-not-exist"},
 	}
-	got := Collect(context.Background(), req, gatewayDeps(lanIfaces(), nil)).Targets
+	got := Collect(context.Background(), gatewayDeps(lanIfaces(), nil), refs).Targets
 
 	if len(got[0].ResolvedIPs) != 1 || got[0].ResolvedIPs[0] != "10.0.0.1" {
 		t.Errorf("named NIC resolved = %v, want [10.0.0.1]", got[0].ResolvedIPs)
@@ -112,10 +107,7 @@ func TestGatewayTargetHonoursInterfaceSelection(t *testing.T) {
 // Each way the gateway lookup can fail gets its own class. Collapsing them (or
 // borrowing dns_error) is the bug this whole path exists to avoid.
 func TestGatewayFailuresAreClassifiedDistinctly(t *testing.T) {
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_gw3", IncidentID: "inc_gw3",
-		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
-	}
+	refs := []TargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}}
 	noGateway := []platform.IfaceInfo{{ID: "eth0", Name: "以太网", Up: true}}
 	// An IPv6-only gateway is not an IPv4 default route: the probe would not use
 	// it, so the snapshot must not name it either.
@@ -128,7 +120,7 @@ func TestGatewayFailuresAreClassifiedDistinctly(t *testing.T) {
 		name   string
 		deps   Deps
 		want   string
-		target pcfg.SnapshotTargetRef
+		target TargetRef
 	}{
 		{name: "no ipv4 gateway", deps: gatewayDeps(noGateway, nil), want: errClassNoGateway},
 		{name: "ipv6 only", deps: gatewayDeps(v6Only, nil), want: errClassNoGateway},
@@ -143,7 +135,7 @@ func TestGatewayFailuresAreClassifiedDistinctly(t *testing.T) {
 		}, want: errClassPermissionDenied},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tg := Collect(context.Background(), req, tc.deps).Targets[0]
+			tg := Collect(context.Background(), tc.deps, refs).Targets[0]
 			if tg.ErrorClass != tc.want {
 				t.Errorf("error class = %q, want %q", tg.ErrorClass, tc.want)
 			}
@@ -159,10 +151,7 @@ func TestGatewayFailuresAreClassifiedDistinctly(t *testing.T) {
 // one snapshot print the default route in its network group while the gateway
 // target next to it claimed permission was denied for the same address.
 func TestGatewayResolutionAcceptsAddressReadPermission(t *testing.T) {
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_gw5", IncidentID: "inc_gw5",
-		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
-	}
+	refs := []TargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}}
 	for _, tc := range []struct {
 		name string
 		set  permission.Set
@@ -177,7 +166,7 @@ func TestGatewayResolutionAcceptsAddressReadPermission(t *testing.T) {
 				Guard:     netguard.New(probepolicy.Default(), false),
 				Effective: tc.set,
 			}
-			tg := Collect(context.Background(), req, deps).Targets[0]
+			tg := Collect(context.Background(), deps, refs).Targets[0]
 			if tg.ErrorClass != "" {
 				t.Errorf("error class = %q, want empty", tg.ErrorClass)
 			}
@@ -197,7 +186,7 @@ func TestRoutesUnreadableKeepsNetworkGroupCollected(t *testing.T) {
 		Guard:     netguard.New(probepolicy.Default(), false),
 		Effective: permission.NewSet(permission.NetIfaceStatusRead, permission.NetIfaceAddressRead),
 	}
-	snap := Collect(context.Background(), pcfg.IncidentSnapshotRequest{RequestID: "isnapreq_ru", IncidentID: "inc_ru"}, deps)
+	snap := Collect(context.Background(), deps, nil)
 
 	var status string
 	for _, g := range snap.Groups {
@@ -238,11 +227,8 @@ func TestDefaultRouteAgreesWithGatewayTarget(t *testing.T) {
 		Guard:     netguard.New(probepolicy.Default(), false),
 		Effective: permission.NewSet(permission.NetIfaceStatusRead, permission.NetworkGatewayProbe),
 	}
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_agree", IncidentID: "inc_agree",
-		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
-	}
-	snap := Collect(context.Background(), req, deps)
+	refs := []TargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}}
+	snap := Collect(context.Background(), deps, refs)
 
 	if snap.Network == nil || snap.Network.DefaultRoute == nil {
 		t.Fatalf("no default route in %+v", snap.Network)
@@ -265,11 +251,8 @@ func TestDefaultRouteAgreesWithGatewayTarget(t *testing.T) {
 func TestGatewayResolvesWithSpentBudget(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_gw4", IncidentID: "inc_gw4",
-		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}},
-	}
-	tg := Collect(ctx, req, gatewayDeps(lanIfaces(), nil)).Targets[0]
+	refs := []TargetRef{{MonitorID: "mon_gw", Kind: "gateway", Target: "gateway"}}
+	tg := Collect(ctx, gatewayDeps(lanIfaces(), nil), refs).Targets[0]
 
 	if tg.ErrorClass != "" || len(tg.ResolvedIPs) != 1 || tg.ResolvedIPs[0] != "192.168.1.1" {
 		t.Errorf("class = %q resolved = %v, want empty class and [192.168.1.1]", tg.ErrorClass, tg.ResolvedIPs)
@@ -284,21 +267,17 @@ func TestGatewayResolvesWithSpentBudget(t *testing.T) {
 func TestExpiredBudgetReportsTimeoutNotDNSError(t *testing.T) {
 	guard := netguard.New(probepolicy.Default(), false)
 	deps := Deps{Guard: guard, Identity: Identity{AgentID: "agent_1"}}
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID:  "isnapreq_1",
-		IncidentID: "inc_1",
-		Targets: []pcfg.SnapshotTargetRef{
-			{MonitorID: "mon_http", Kind: "http", Target: "http://connect.rom.miui.com/generate_204"},
-			{MonitorID: "mon_icmp", Kind: "icmp", Target: "example.invalid"},
-		},
+	refs := []TargetRef{
+		{MonitorID: "mon_http", Kind: "http", Target: "http://connect.rom.miui.com/generate_204"},
+		{MonitorID: "mon_icmp", Kind: "icmp", Target: "example.invalid"},
 	}
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	snap := Collect(ctx, req, deps)
+	snap := Collect(ctx, deps, refs)
 
-	if len(snap.Targets) != len(req.Targets) {
-		t.Fatalf("targets = %d, want %d", len(snap.Targets), len(req.Targets))
+	if len(snap.Targets) != len(refs) {
+		t.Fatalf("targets = %d, want %d", len(snap.Targets), len(refs))
 	}
 	for _, tg := range snap.Targets {
 		if tg.ErrorClass != errClassTimeout {
@@ -318,7 +297,7 @@ func TestExpiredBudgetReportsTimeoutNotDNSError(t *testing.T) {
 	// A session teardown is a distinct class from budget exhaustion.
 	cctx, ccancel := context.WithCancel(context.Background())
 	ccancel()
-	if got := Collect(cctx, req, deps).Targets[0].ErrorClass; got != errClassCanceled {
+	if got := Collect(cctx, deps, refs).Targets[0].ErrorClass; got != errClassCanceled {
 		t.Errorf("canceled error class = %q, want %q", got, errClassCanceled)
 	}
 }
@@ -327,14 +306,11 @@ func TestExpiredBudgetReportsTimeoutNotDNSError(t *testing.T) {
 // reporting the address and endpoint the probe would have used.
 func TestLiteralIPTargetResolvesWithoutBudget(t *testing.T) {
 	deps := Deps{Guard: netguard.New(probepolicy.Default(), false)}
-	req := pcfg.IncidentSnapshotRequest{
-		RequestID: "isnapreq_2", IncidentID: "inc_2",
-		Targets: []pcfg.SnapshotTargetRef{{MonitorID: "mon_tcp", Kind: "tcp", Target: "192.0.2.10", Port: 443}},
-	}
+	refs := []TargetRef{{MonitorID: "mon_tcp", Kind: "tcp", Target: "192.0.2.10", Port: 443}}
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	tg := Collect(ctx, req, deps).Targets[0]
+	tg := Collect(ctx, deps, refs).Targets[0]
 
 	if tg.ErrorClass != "" {
 		t.Errorf("error class = %q, want empty", tg.ErrorClass)
@@ -349,11 +325,16 @@ func TestLiteralIPTargetResolvesWithoutBudget(t *testing.T) {
 
 // Every attempted group is classified even when the budget is spent and no
 // permission is granted, so the server always gets a complete, terminal scene.
+//
+// The target group is the one exception, and its absence is a statement: a scene
+// collected on the disconnect edge has no target in question — the probes were
+// fine and only the uplink was not — so reporting an empty "targets: collected"
+// would answer a question nobody asked. A scene with refs must still carry it.
 func TestGroupsAlwaysReported(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	snap := Collect(ctx, pcfg.IncidentSnapshotRequest{RequestID: "isnapreq_3", IncidentID: "inc_3"},
-		Deps{Guard: netguard.New(probepolicy.Default(), false)})
+	deps := Deps{Guard: netguard.New(probepolicy.Default(), false)}
+	snap := Collect(ctx, deps, nil)
 
 	got := map[string]string{}
 	for _, g := range snap.Groups {
@@ -361,13 +342,27 @@ func TestGroupsAlwaysReported(t *testing.T) {
 	}
 	for _, group := range []string{
 		telemetry.SnapshotGroupNetwork, telemetry.SnapshotGroupAgent,
-		telemetry.SnapshotGroupResources, telemetry.SnapshotGroupTargets,
+		telemetry.SnapshotGroupResources,
 	} {
 		if got[group] == "" {
 			t.Errorf("group %s missing from %v", group, got)
 		}
 	}
+	if _, ok := got[telemetry.SnapshotGroupTargets]; ok {
+		t.Errorf("a scene with no target in question reported a targets group: %v", got)
+	}
 	if got[telemetry.SnapshotGroupAgent] != telemetry.ScopeCollected {
 		t.Errorf("agent group = %q, want %q", got[telemetry.SnapshotGroupAgent], telemetry.ScopeCollected)
+	}
+
+	withRefs := Collect(ctx, deps, []TargetRef{{MonitorID: "mon_icmp", Kind: "icmp", Target: "192.0.2.10"}})
+	var seen bool
+	for _, g := range withRefs.Groups {
+		if g.Group == telemetry.SnapshotGroupTargets {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("a scene with a failing target dropped its targets group: %+v", withRefs.Groups)
 	}
 }

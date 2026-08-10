@@ -124,6 +124,24 @@ func TraceEligibleKind(probeKind string) bool {
 	return false
 }
 
+// SceneEligibleKind reports whether a probe kind's availability fault is worth
+// collecting an incident scene for. It is TraceEligibleKind plus gateway.
+//
+// The two answer different questions and that is why they differ on exactly one
+// kind. Tracing asks "is there a path here worth walking hop by hop", and a
+// gateway is one hop away — there is nothing to walk. A scene asks "what did
+// this machine look like when the fault was detected", and an unreachable
+// default gateway is the case where that is worth the most: interfaces, routes
+// and DNS configuration are the whole answer, and they are precisely what a
+// server that has also lost the agent cannot go and look at.
+//
+// host and wireless stay out of both. They name a metric series rather than a
+// network destination, so neither a path nor a local network context is what
+// their failure is about.
+func SceneEligibleKind(probeKind string) bool {
+	return TraceEligibleKind(probeKind) || probeKind == "gateway"
+}
+
 // traceModeForKind maps a directly-dialed probe kind to its natural traceroute
 // mode. ICMP monitors run ICMP traceroute; TCP and HTTP monitors run TCP
 // traceroute. dns/nat are absent on purpose: their mode follows the resolver

@@ -196,7 +196,11 @@ type Limits struct {
 	MinProbeInterval    time.Duration
 	MaxProbeConcurrency int
 	SnapshotMinInterval time.Duration
-	SnapshotTimeout     time.Duration
+	// SnapshotTimeout bounds one collection — both the console's live host
+	// snapshot and an incident scene. They are one knob because they are one
+	// question: how long this machine may spend answering "what does it look like
+	// right now" before answering partially instead.
+	SnapshotTimeout time.Duration
 	// MaxTraceConcurrency bounds simultaneously executing incident traceroutes
 	// (distinct report ids) on this Agent; diagnostics use their own work channel,
 	// never the probe scheduler.
@@ -596,8 +600,10 @@ func Run(ctx context.Context, cfg Config) error {
 		for _, rt := range runtimes {
 			rt.sched.Wait()
 			// The trigger's in-flight traces also append to the outbox, so they are
-			// joined in the same phase as the schedulers that started them.
+			// joined in the same phase as the schedulers that started them. The
+			// scene collector is in that same phase and for that same reason.
 			rt.trigger.Wait()
+			rt.scene.Wait()
 		}
 		hbWG.Wait()
 		_ = outbox.Close()
@@ -681,8 +687,10 @@ func Run(ctx context.Context, cfg Config) error {
 		rt.sched.Run(runCtx)
 		// Arm the traceroute trigger with the same context: it launches goroutines
 		// that append to the outbox, so it must start alongside the schedulers that
-		// feed it and be joined in the same phase.
+		// feed it and be joined in the same phase. Same for the scene trigger,
+		// which additionally fires on an edge the schedulers know nothing about.
 		rt.trigger.Start(runCtx)
+		rt.scene.Start(runCtx)
 	}
 
 	// Watch this machine's clock for the rest of the run. It joins hbWG so it is
@@ -878,6 +886,10 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 		}
 
 		agentID := cred.AgentID
+		// Every scene records the identity it was collected under, so a later
+		// re-enrollment (a revoked server comes back as a new agent) does not
+		// rewrite what the old one saw.
+		rt.scene.SetAgentID(agentID)
 		err := conn.Run(ctx, conn.Options{
 			ServerName: rt.cfg.Name,
 			ServerURL:  rt.cfg.URL,
@@ -903,6 +915,14 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				// other build it is a no-op.
 				rt.outbox.SetServerOnline(rt.cfg.Name, up)
 
+				// Arm (or spend) the disconnect edge for the scene trigger. Both
+				// halves are a flag write: the collection itself, if there is one,
+				// is started from OnRetry and runs on a goroutine of its own —
+				// this callback is on the session goroutine and must not block it.
+				if up {
+					rt.scene.SessionUp()
+				}
+
 				kind := EventDisconnected
 				if up {
 					kind = EventConnected
@@ -926,14 +946,35 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				env.cfg.emit(Event{Kind: kind, Server: rt.cfg.Name, AgentID: agentID})
 			},
 			OnRetry: func(err error, retryIn time.Duration) {
+				reason := conn.Classify(err)
+				// The disconnect edge is taken here rather than on OnSession(false)
+				// because this hook fires for exactly the endings worth describing.
+				// A superseded connection, a revoked credential and a schema
+				// mismatch all end a session, but they end the RUN and never reach a
+				// retry — and none of them is a network fault, so collecting for
+				// them would file a picture of a healthy machine under an incident
+				// that will never be opened. Shutdown is the same story. An auth
+				// rejection is excluded for the opposite reason: reaching the server
+				// well enough to be refused proves the network works, and the fault
+				// is in the credential.
+				if reason != conn.ReasonAuth {
+					rt.scene.SessionLost(string(reason), time.Now())
+				}
 				env.status.set(rt.cfg.Name, func(s *serverStatus) {
 					s.State = statusWaitingRetry
 					s.Since = time.Now().Unix()
 					s.NextRetryAt = time.Now().Add(retryIn).Unix()
-					s.LastError = &statusError{Code: string(conn.Classify(err)), Detail: err.Error()}
+					s.LastError = &statusError{Code: string(reason), Detail: err.Error()}
 				})
 			},
 		}, rt.connDeps(cred, env.cfg.DataDir))
+
+		// Run returned, so this session ended in a way that never reached the retry
+		// hook — shutdown, or one of the terminal close codes. Spend the disconnect
+		// arm without collecting: nothing here is a network fault, and leaving it
+		// set would hand it to the first failed dial of the NEXT enrollment, which
+		// would then describe a session that never existed.
+		rt.scene.Disarm()
 
 		if ctx.Err() != nil {
 			return nil

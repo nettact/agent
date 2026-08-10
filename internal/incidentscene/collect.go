@@ -1,17 +1,26 @@
+//go:build !lite
+
 // Package incidentscene collects the agent's allowlisted incident-scene evidence
-// for one config.IncidentSnapshotRequest (INCIDENT-002). It answers exactly the
-// typed field groups the protocol defines — local network context, the agent's
-// own identity/version, a basic CPU/memory summary, and per-target resolution —
-// and NOTHING else: it never reads process lists, user names, file paths,
-// credentials, request/response headers or bodies, or connection lists.
+// (INCIDENT-005). It answers exactly the typed field groups the protocol defines
+// — local network context, the agent's own identity/version, a basic CPU/memory
+// summary, and per-target resolution — and NOTHING else: it never reads process
+// lists, user names, file paths, credentials, request/response headers or
+// bodies, or connection lists.
 //
 // Each group is classified independently (collected/denied/unsupported/failed)
 // against the agent's existing effective/granted/supported permission views and
-// the platform's real capabilities, so a partial snapshot completes immediately
+// the platform's real capabilities, so a partial scene completes immediately
 // instead of waiting on a denied or unsupported group. The whole collection is
-// bounded by the request's budget; the returned IncidentSnapshot always carries
-// the request/incident id and one result per attempted group, even when every
-// group is denied. Nothing here is persisted.
+// bounded by the caller's context. Nothing here is persisted.
+//
+// The collector answers no request: scenetrigger decides when to call it, from
+// fault edges this agent detected itself, and stamps the report identity and the
+// triggers onto what comes back. See telemetry.SceneReport for why that
+// inversion was necessary.
+//
+// It is excluded from the lite build. Collection is cheap in CPU but the report
+// is large next to a router's whole outbox budget, and a device with 5000 rows
+// of memory for its telemetry should spend them on measurements.
 package incidentscene
 
 import (
@@ -27,7 +36,6 @@ import (
 
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
-	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 
@@ -77,6 +85,23 @@ type Identity struct {
 	Version  string
 }
 
+// TargetRef identifies one monitor target the scene should resolve. It carries
+// enough to key the result by monitor id, choose the probe semantics (Kind), and
+// reconstruct the endpoint (Target + Port).
+//
+// Kind decides how Target is interpreted, and NOT every kind carries a
+// resolvable host: gateway monitors carry the server-normalized sentinel
+// "gateway" and are resolved from the agent's routing table (via Iface), never
+// through DNS. Host-anchor monitors never appear here at all — they name a
+// metric series ("host", "*", "C:"), not a network destination.
+type TargetRef struct {
+	MonitorID string // stable server-side monitor id (probe_tasks.id)
+	Kind      string // "icmp" | "dns" | "http" | "tcp" | "nat" | "gateway"
+	Target    string // literal/host/URL as configured; the sentinel "gateway" for kind=gateway
+	Port      int    // TCP/UDP port when the kind carries one
+	Iface     string // kind=gateway only: the NIC to resolve the gateway from; "" = default NIC
+}
+
 // Deps are the agent-side capabilities the collector reuses — the same platform
 // HAL, target-access guard, and permission views the live probes run under. No
 // new capability surface is introduced.
@@ -89,36 +114,41 @@ type Deps struct {
 	Identity  Identity
 }
 
-// Collect gathers the allowlisted incident-scene snapshot for req, bounded by
-// ctx (the caller derives ctx from req.BudgetMs). It always returns a snapshot
-// carrying the request/incident id and a result for every attempted group.
-func Collect(ctx context.Context, req pcfg.IncidentSnapshotRequest, deps Deps) telemetry.IncidentSnapshot {
-	snap := telemetry.IncidentSnapshot{
-		RequestID:   req.RequestID,
-		IncidentID:  req.IncidentID,
-		CollectedAt: time.Now().UTC(),
-	}
+// Collect gathers the allowlisted scene, bounded by ctx, resolving refs as the
+// target group. It always returns a report with a result for every attempted
+// group; the caller stamps on the report id and the triggers that caused it.
+//
+// An empty refs omits the target group entirely rather than reporting an empty
+// collected one. The two are different statements — "these targets resolved to
+// nothing" versus "no target was in question" — and the disconnect trigger is
+// the second: the probes were fine and only the uplink was not, so a line
+// claiming the targets were surveyed would be an answer to a question nobody
+// asked.
+func Collect(ctx context.Context, deps Deps, refs []TargetRef) telemetry.SceneReport {
+	var scene telemetry.SceneReport
 
 	// Each group is attempted and classified independently. Denied/unsupported
 	// groups return instantly (no OS work), so they never delay the collected ones.
 	net, netRes := collectNetwork(ctx, deps)
-	snap.Network = net
-	snap.Groups = append(snap.Groups, netRes)
+	scene.Network = net
+	scene.Groups = append(scene.Groups, netRes)
 
 	agent, agentRes := collectAgent(deps)
-	snap.Agent = agent
-	snap.Groups = append(snap.Groups, agentRes)
+	scene.Agent = agent
+	scene.Groups = append(scene.Groups, agentRes)
 
 	resources, resRes := collectResources(ctx, deps)
-	snap.Resources = resources
-	snap.Groups = append(snap.Groups, resRes)
+	scene.Resources = resources
+	scene.Groups = append(scene.Groups, resRes)
 
-	targets, tgtRes := collectTargets(ctx, deps, req.Targets)
-	snap.Targets = targets
-	snap.Groups = append(snap.Groups, tgtRes)
+	if len(refs) > 0 {
+		targets, tgtRes := collectTargets(ctx, deps, refs)
+		scene.Targets = targets
+		scene.Groups = append(scene.Groups, tgtRes)
+	}
 
-	snap.CollectedAt = time.Now().UTC()
-	return snap
+	scene.CollectedAt = time.Now().UTC()
+	return scene
 }
 
 // groupResult builds a SnapshotGroupResult with the current agent clock.
@@ -289,19 +319,15 @@ func sampleCPU(ctx context.Context) (float64, error) {
 // point through the SAME netguard policy the live probes use, reporting the
 // resolved IPs, the endpoints it would probe, and a coarse error class. It never
 // opens a connection or reads any request/response content. The group is always
-// collected (resolution outcomes live per target); an empty target list yields an
-// empty, collected group.
-func collectTargets(ctx context.Context, deps Deps, refs []pcfg.SnapshotTargetRef) ([]telemetry.SnapshotTargetResult, telemetry.SnapshotGroupResult) {
-	if len(refs) == 0 {
-		return nil, groupResult(telemetry.SnapshotGroupTargets, telemetry.ScopeCollected, "")
-	}
-
+// collected (resolution outcomes live per target); Collect skips it entirely
+// when there is no target in question.
+func collectTargets(ctx context.Context, deps Deps, refs []TargetRef) ([]telemetry.SnapshotTargetResult, telemetry.SnapshotGroupResult) {
 	out := make([]telemetry.SnapshotTargetResult, len(refs))
 	sem := make(chan struct{}, targetResolveConcurrency)
 	var wg sync.WaitGroup
 	for i, ref := range refs {
 		wg.Add(1)
-		go func(i int, ref pcfg.SnapshotTargetRef) {
+		go func(i int, ref TargetRef) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -321,7 +347,7 @@ func collectTargets(ctx context.Context, deps Deps, refs []pcfg.SnapshotTargetRe
 // it is resolved from the routing table instead. Handing the sentinel to the
 // resolver would report "DNS resolution failed" for an incident whose real cause
 // is a dead LAN, sending the reader after a layer that is working fine.
-func resolveTarget(ctx context.Context, deps Deps, ref pcfg.SnapshotTargetRef) telemetry.SnapshotTargetResult {
+func resolveTarget(ctx context.Context, deps Deps, ref TargetRef) telemetry.SnapshotTargetResult {
 	res := telemetry.SnapshotTargetResult{
 		MonitorID: ref.MonitorID,
 		Kind:      ref.Kind,
@@ -461,7 +487,7 @@ func ctxErrorClass(ctx context.Context) string {
 // deriveHostPort extracts the host and probe port from a target ref. HTTP targets
 // carry a URL (host + explicit or scheme-default port); other kinds use the
 // literal target and the ref's own port.
-func deriveHostPort(ref pcfg.SnapshotTargetRef) (string, int) {
+func deriveHostPort(ref TargetRef) (string, int) {
 	if ref.Kind == "http" {
 		return httpHostPort(ref)
 	}
@@ -470,7 +496,7 @@ func deriveHostPort(ref pcfg.SnapshotTargetRef) (string, int) {
 
 // httpHostPort parses an HTTP monitor URL into host + port, preferring an
 // explicit ref port, then the URL's port, then the scheme default.
-func httpHostPort(ref pcfg.SnapshotTargetRef) (string, int) {
+func httpHostPort(ref TargetRef) (string, int) {
 	u, err := url.Parse(ref.Target)
 	if err != nil || u.Hostname() == "" {
 		return "", 0
