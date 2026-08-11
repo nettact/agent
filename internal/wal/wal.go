@@ -147,6 +147,7 @@ func Open(dir string, servers []string, opt Options) (*Store, error) {
 				continue
 			}
 			c.acked = cs.Acked
+			c.identity = cs.Identity
 			if cs.ClaimN > 0 {
 				c.claim = &claim{seq: cs.ClaimSeq, from: cs.ClaimFrom, to: cs.ClaimTo, n: cs.ClaimN}
 			}
@@ -563,7 +564,7 @@ func (s *Store) stateWithLocked(claims map[string]*claim) walState {
 		Cursors: make(map[string]cursorState, len(s.cursors)),
 	}
 	for name, c := range s.cursors {
-		cs := cursorState{Acked: c.acked}
+		cs := cursorState{Acked: c.acked, Identity: c.identity}
 		if cl := claims[name]; cl != nil {
 			cs.ClaimSeq, cs.ClaimFrom, cs.ClaimTo, cs.ClaimN = cl.seq, cl.from, cl.to, cl.n
 		}
@@ -887,6 +888,127 @@ func (s *Store) dropClaimedLocked(server string, cl *claim) bool {
 		s.mem = kept
 	}
 	return touchedDisk
+}
+
+// BindIdentity states the enrolled identity (the server-assigned agent_id) one
+// server's session is about to run under, and returns how many queued samples
+// were discarded because they belong to a different one (>0 is a data gap the
+// caller should surface).
+//
+// # Why the queue has to be discarded at all
+//
+// A revoked agent deletes its credential and re-enrolls, and without a
+// console-issued reinstall token the server mints a BRAND-NEW agent_id. The
+// backlog is grouped by server name, which survives that exchange, so without
+// this the first packet of the new session would upload records collected by the
+// old agent — and the server files every packet under the identity it
+// authenticated, so metrics, events, inventory deltas, traceroutes and incident
+// scenes collected by agent X would land on agent Y's timeline. Scene reports
+// make the contradiction visible: their payload still names the id they were
+// collected under, which would then disagree with the row storing them.
+//
+// # Why discard rather than carry the old id along
+//
+// The alternative is to persist the collecting agent_id per group and hand those
+// groups over under it. That needs the SERVER to accept telemetry attributed to
+// an identity the connection did not authenticate, which is a new authenticated
+// handover path (prove old and new are the same machine) rather than a WAL
+// change — and until that exists, an agent asserting "store this as someone
+// else" is exactly the thing an authenticated ingest must refuse. Losing the
+// records collected before a revocation is a bounded, explainable gap; filing
+// them under the wrong machine is silent corruption of the evidence the product
+// exists to produce.
+//
+// # Why the discard must be explicit
+//
+// Tagging the stale groups and merely skipping them in NextBatch would leak
+// disk forever: a segment's bytes are only collectable once every server owing
+// something in it has acked, so a group that will never be served pins its
+// segment for good and each spill adds another. The discard therefore does the
+// full ack-shaped thing — drop the groups from both tiers, release the in-flight
+// claim, advance the cursor past everything appended so far, persist, and run the
+// segment sweep — so the storage is actually reclaimed. The cursor is advanced to
+// the last gid handed out rather than to the newest group still indexed, so
+// groups that only exist in a segment tail (evicted from the index but rescanned
+// by a restart) cannot come back from the dead.
+//
+// The in-flight claim goes with them: its packet was built from the old agent's
+// records and its sequence is simply burned, which the server tolerates since it
+// takes MAX for its watermark and never requires contiguity.
+//
+// # Ownership and ordering
+//
+// It is called by the session runner on the session goroutine, before that
+// session's first NextBatch — the same goroutine that owns this server's cursor
+// for everything else. Only this server's groups are touched: another server's
+// cursor, claim and view of a shared segment are untouched, because their
+// identities are independent and one server revoking says nothing about the rest.
+//
+// An empty agentID states nothing and is a no-op, so a caller that has not
+// enrolled needs no branch. An unknown server name is a wiring bug and is
+// reported. A failed state write leaves the in-memory discard standing and is
+// self-correcting: the stale state resurrects those groups at the next Open,
+// where the identity recorded beside them still disagrees and they are discarded
+// again.
+func (s *Store) BindIdentity(server, agentID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return 0, fmt.Errorf("wal: bind identity for unknown server %q", server)
+	}
+	if agentID == "" || c.identity == agentID {
+		return 0, nil
+	}
+	prev := c.identity
+	c.identity = agentID
+	if prev == "" {
+		// Nothing was ever collected under a different identity, so the backlog
+		// is this identity's own: a first enrollment, or a server just added to
+		// the configuration. Only record it.
+		return 0, s.saveStateLocked()
+	}
+
+	dropped := s.discardServerLocked(server, c)
+	log.Printf("wal: %q re-enrolled as %s (was %s); discarded %d queued samples collected under the old identity (data gap)",
+		server, agentID, prev, dropped)
+	if err := s.saveStateLocked(); err != nil {
+		return dropped, err
+	}
+	s.gcLocked()
+	return dropped, nil
+}
+
+// discardServerLocked drops everything one server owns from both tiers, releases
+// its claim and moves its cursor past every group handed out so far, returning
+// the number of sample rows discarded. Caller holds mu.
+func (s *Store) discardServerLocked(server string, c *cursor) int {
+	dropped := 0
+	kept := make([]diskGroup, 0, len(s.disk))
+	for _, g := range s.disk {
+		if g.owner == server {
+			dropped += g.n
+			continue
+		}
+		kept = append(kept, g)
+	}
+	s.disk = kept
+
+	buf := make([]memGroup, 0, len(s.mem))
+	for _, g := range s.mem {
+		if g.owner == server {
+			dropped += g.n
+			s.memRows -= g.n
+			continue
+		}
+		buf = append(buf, g)
+	}
+	s.mem = buf
+
+	c.claim = nil
+	c.acked = s.nextGid - 1
+	return dropped
 }
 
 // FastForward durably raises the next-sequence allocator to at least

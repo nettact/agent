@@ -22,6 +22,14 @@
 // append at all) rather than broadcast from one group — which is what keeps the
 // ownership rule total and this file free of audience arithmetic.
 //
+// Ownership is by server NAME, and a name outlives the credential behind it: a
+// revoked agent deletes its credential and re-enrolls at the same configured
+// server, coming back as a different agent_id. The server files every packet
+// under the identity that authenticated it, so each cursor also records which
+// identity its queue was collected under, and a session that binds a different
+// one discards that queue outright rather than filing one machine's evidence
+// under another's name. See BindIdentity in either build.
+//
 // Each server therefore has a cursor: how far it has acknowledged, and the one
 // batch it currently owes an ack for. A group's bytes become collectable when
 // its owner acks it; a server that is offline for a week pins only its own
@@ -263,6 +271,22 @@ func countClaimed(owner string, cl *claim, disk []diskGroup, mem []memGroup) int
 type cursor struct {
 	acked uint64
 	claim *claim
+	// identity is the agent_id this server's sessions have been running under,
+	// as last stated by BindIdentity. It is the one piece of credential identity
+	// the log carries, and it is deliberately here — one per consumer — rather
+	// than on every group.
+	//
+	// A group needs no identity of its own because the cursor already answers the
+	// only question that has an answer: everything this server still owes was
+	// collected under the identity recorded here, because the moment that
+	// identity changes the whole backlog is discarded (see BindIdentity). Per
+	// group, the field would have to be persisted on every line and would only
+	// enable a handover the server side cannot authenticate anyway.
+	//
+	// Empty means no session has ever bound one: a fresh install, or a server
+	// just added to the configuration. That is a real steady state rather than a
+	// missing value, which is why the persisted field is optional.
+	identity string
 }
 
 // flatten concatenates the claimed groups into the packet to send, preserving

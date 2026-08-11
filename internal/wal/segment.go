@@ -106,7 +106,16 @@ type diskGroup struct {
 // when there is none in flight, so a store whose servers are all idle renders a
 // state file barely longer than the allocator positions.
 type cursorState struct {
-	Acked     uint64 `json:"acked"`
+	Acked uint64 `json:"acked"`
+	// Identity is the agent_id this server's sessions were running under when
+	// this state was written. It is what lets a re-enrollment be detected across
+	// a restart — the credential is replaced on disk by a process that may never
+	// get to reconnect, so an in-memory comparison alone would miss exactly the
+	// case where the backlog outlived the identity that collected it.
+	//
+	// Omitted while empty, which is the honest encoding of "no session has bound
+	// one yet" (see cursor.identity) rather than a value that went missing.
+	Identity  string `json:"identity,omitempty"`
 	ClaimSeq  uint64 `json:"claim_seq,omitempty"`
 	ClaimFrom uint64 `json:"claim_from,omitempty"`
 	ClaimTo   uint64 `json:"claim_to,omitempty"`
