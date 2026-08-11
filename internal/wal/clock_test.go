@@ -243,8 +243,9 @@ func TestGroupsFromAnEarlierProcessAreServedAsStored(t *testing.T) {
 
 // A group carries one monotonic reading, taken when it was appended. That
 // describes a probe round or a tier sweep, not a game run spanning minutes of
-// play or a traceroute with a start, a completion and per-hop times — correcting
-// part of one of those would produce a record whose end precedes its start.
+// play or the span of a traceroute sweep — correcting part of one of those would
+// produce a record whose end precedes its start. (The trigger instant a trace
+// also carries is a single moment and IS corrected; see the slow-clock test.)
 func TestLongSpanningPayloadsAreNotShifted(t *testing.T) {
 	c := &fakeClock{epoch: "proc-1"}
 	s := openClockStore(t, c)
@@ -279,6 +280,174 @@ func TestLongSpanningPayloadsAreNotShifted(t *testing.T) {
 	}
 	if got := b.TraceResults[0].StartedAt.UTC(); !got.Equal(started) {
 		t.Fatalf("trace start was shifted to %s", got)
+	}
+}
+
+// The acceptance case for WAL-002: an agent whose clock is SLOW still has its
+// self-describing reports claimed by the incident they belong to.
+//
+// A trace's FirstFailedAt and a scene trigger's FirstFailedAt/DisconnectedAt are
+// join keys, not decoration — server-side (incidentops) they are compared
+// against fault_signals.observed_at, which is the SERVER's clock, with two
+// minutes of slack. Left as collected by a clock twenty minutes behind, they sit
+// far outside that gate: the report is stored, and the incident that caused it
+// can never claim it.
+//
+// The direction is the whole test. The server's gate is one-sided — a trigger is
+// refused for being too EARLY, never for being too late — so the same scenario
+// with the clock set FAST passes with the correction removed. This one fails.
+func TestTriggerInstantsAreCorrectedForASlowClock(t *testing.T) {
+	c := &fakeClock{epoch: "proc-1"}
+	s := openClockStore(t, c)
+
+	// Everything below is stamped by a clock that is twenty minutes behind, so
+	// the true instant of each is twenty minutes later than what is stored.
+	const slow = 20 * time.Minute
+	failed := clockBase
+	started := clockBase.Add(10 * time.Second)
+	completed := clockBase.Add(40 * time.Second)
+	collected := clockBase.Add(45 * time.Second)
+	dropped := clockBase.Add(5 * time.Second)
+
+	rec := Records{
+		TraceResults: []telemetry.TraceResult{{
+			ReportID: "tr-1", DestKey: "ip:1.1.1.1",
+			TriggerReason: telemetry.TraceTriggerConsecutiveFailures, TriggerStreak: 3,
+			FirstFailedAt: failed, StartedAt: started, CompletedAt: completed,
+		}},
+		SceneReports: []telemetry.SceneReport{{
+			ReportID: "sc-1", CollectedAt: collected,
+			Triggers: []telemetry.SceneTrigger{
+				{
+					Kind: telemetry.SceneTriggerProbeFault, MonitorID: "probe_mon1",
+					ConfigSerial: 7, TriggerStreak: 3, FirstFailedAt: failed,
+				},
+				{
+					Kind: telemetry.SceneTriggerServerDisconnect, Reason: "network",
+					EdgeCount: 1, DisconnectedAt: dropped,
+				},
+			},
+		}},
+	}
+	if _, err := s.Append(rec, clockServer); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// The link comes back and NTP steps the clock forward onto the truth.
+	c.advance(time.Minute)
+	c.step(slow)
+
+	b, ok, err := s.NextBatch(clockServer, 100)
+	if err != nil || !ok {
+		t.Fatalf("batch: ok=%v err=%v", ok, err)
+	}
+
+	// The server observed the same outage on its own clock, twenty minutes later
+	// than the agent's stamps say. claimable mirrors incidentops' gate.
+	observedAt := failed.Add(slow)
+	if claimable(failed, observedAt) {
+		t.Fatal("the fixture does not reproduce the bug: an uncorrected trigger " +
+			"must fall outside the server's slack, or this test proves nothing")
+	}
+
+	tr := b.TraceResults[0]
+	if !claimable(tr.FirstFailedAt.UTC(), observedAt) {
+		t.Errorf("trace first-failure sent as %s; the incident observed at %s cannot claim it",
+			tr.FirstFailedAt.UTC(), observedAt)
+	}
+	if got := tr.FirstFailedAt.UTC(); !got.Equal(failed.Add(slow)) {
+		t.Errorf("trace first-failure = %s, want the corrected %s", got, failed.Add(slow))
+	}
+	// The sweep's own span is left as collected: one offset cannot be applied to
+	// part of it without risking an end that precedes its start.
+	if got := tr.StartedAt.UTC(); !got.Equal(started) {
+		t.Errorf("trace start was shifted to %s; a span stays as collected", got)
+	}
+	if got := tr.CompletedAt.UTC(); !got.Equal(completed) {
+		t.Errorf("trace completion was shifted to %s; a span stays as collected", got)
+	}
+
+	sc := b.SceneReports[0]
+	probe, disc := sc.Triggers[0], sc.Triggers[1]
+	if !claimable(probe.FirstFailedAt.UTC(), observedAt) {
+		t.Errorf("scene probe edge sent as %s; the incident observed at %s cannot claim it",
+			probe.FirstFailedAt.UTC(), observedAt)
+	}
+	if got := probe.FirstFailedAt.UTC(); !got.Equal(failed.Add(slow)) {
+		t.Errorf("scene probe edge = %s, want the corrected %s", got, failed.Add(slow))
+	}
+	if got := disc.DisconnectedAt.UTC(); !got.Equal(dropped.Add(slow)) {
+		t.Errorf("scene disconnect edge = %s, want the corrected %s", got, dropped.Add(slow))
+	}
+	// Exactly one instant is filled per trigger kind, and server-side an edge of
+	// zero deliberately owns no outage. Shifting one would invent a placeable
+	// timestamp two thousand years out of date.
+	if !probe.DisconnectedAt.IsZero() {
+		t.Errorf("a probe trigger's empty disconnect edge was given a time: %s", probe.DisconnectedAt)
+	}
+	if !disc.FirstFailedAt.IsZero() {
+		t.Errorf("a disconnect trigger's empty first-failure was given a time: %s", disc.FirstFailedAt)
+	}
+	// CollectedAt is not a join key: the server stores it AS the agent's clock and
+	// derives delivery lag and its clock-ahead flag from it, so correcting it
+	// would erase the only record of what the agent thought the time was.
+	if got := sc.CollectedAt.UTC(); !got.Equal(collected) {
+		t.Errorf("scene collection time was shifted to %s; it is the agent's own clock by design", got)
+	}
+}
+
+// claimable mirrors the server's one-sided time gate (incidentops.attachSlack):
+// an agent-stamped trigger is refused when it lands more than two minutes before
+// the signal's first observed failing round.
+func claimable(edge, observedAt time.Time) bool {
+	const attachSlack = 2 * time.Minute
+	return !edge.Before(observedAt.Add(-attachSlack))
+}
+
+// A scene's Triggers live behind a slice, so the batch's copy of the report
+// shares that array with the stored record. Shifting it in place would move the
+// STORED edges, and a claim re-served after a session drop — same sequence,
+// frozen revision, same offset — would move them a second time. The server
+// dedups on (agent_id, sequence) and would swallow the differing retry.
+func TestReServingASceneDoesNotShiftItsTriggersTwice(t *testing.T) {
+	c := &fakeClock{epoch: "proc-1"}
+	s := openClockStore(t, c)
+
+	edge := clockBase
+	rec := Records{SceneReports: []telemetry.SceneReport{{
+		ReportID: "sc-1", CollectedAt: clockBase.Add(10 * time.Second),
+		Triggers: []telemetry.SceneTrigger{{
+			Kind: telemetry.SceneTriggerProbeFault, MonitorID: "probe_mon1",
+			ConfigSerial: 7, TriggerStreak: 3, FirstFailedAt: edge,
+		}},
+	}}}
+	if _, err := s.Append(rec, clockServer); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	c.advance(time.Minute)
+	c.step(15 * time.Minute)
+
+	first, ok, err := s.NextBatch(clockServer, 100)
+	if err != nil || !ok {
+		t.Fatalf("first batch: ok=%v err=%v", ok, err)
+	}
+	// Read the value out NOW. The batch's Triggers header can alias the stored
+	// array — that aliasing IS the bug — so holding the Batch and comparing the
+	// two attempts field by field would compare the same memory with itself and
+	// pass either way. A time.Time copy is what makes the two attempts
+	// independent observations.
+	want := edge.Add(15 * time.Minute)
+	firstEdge := first.SceneReports[0].Triggers[0].FirstFailedAt
+	if got := firstEdge.UTC(); !got.Equal(want) {
+		t.Fatalf("first attempt sent %s, want %s", got, want)
+	}
+	// The session dropped before the ack, so the same packet is served again.
+	again, ok, err := s.NextBatch(clockServer, 100)
+	if err != nil || !ok {
+		t.Fatalf("re-serve: ok=%v err=%v", ok, err)
+	}
+	if got := again.SceneReports[0].Triggers[0].FirstFailedAt.UTC(); !got.Equal(want) {
+		t.Fatalf("re-serve sent %s, first attempt %s — the stored trigger was shifted in place",
+			got, firstEdge.UTC())
 	}
 }
 

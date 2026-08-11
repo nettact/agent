@@ -43,8 +43,41 @@
 // from the one that process was actually running with. Samples spilled by a
 // process that died before it learned the time therefore keep sysfixtime's
 // accuracy, which is bounded by how recently the agent last wrote to flash (at
-// most one persist interval on the router builds). Everything this process
-// stamps is corrected exactly.
+// most one persist interval on the router builds).
+//
+// # Which timestamps this actually moves
+//
+// None, directly. This package only publishes the offset; the outbox decides
+// what to apply it to, and the rule lives in wal.flatten rather than here
+// because it is a property of how records are batched. It is narrower than
+// "every stamp this process takes", and the reason is that a WAL group carries
+// ONE monotonic reading — taken when the group was appended — which describes
+// the end of the collection cycle that filled it, not every instant inside the
+// records it carries.
+//
+// Corrected are the per-cycle stamps (metric, event, inventory, interface
+// snapshot; all taken seconds before the append) and the TRIGGER instants of the
+// agent's self-describing reports: a traceroute's FirstFailedAt and a scene
+// trigger's FirstFailedAt/DisconnectedAt. Each names a single moment, so moving
+// it cannot contradict another stamp in the same record, and each is read
+// against the SERVER's clock when it claims the report as an incident's evidence
+// — an uncorrected one on a badly-set clock is evidence that stores fine and can
+// never be claimed. Their accuracy is bounded in one more way than a metric's: a
+// trigger can predate its group's append by minutes, so a step observed in
+// between is not folded into it and the shift is a lower bound on the true
+// error.
+//
+// NOT corrected are timestamps that SPAN — a game run's start and end, a trace's
+// start, completion and per-hop times — because one offset applied to part of a
+// span produces a record whose end precedes its start, which is worse than one
+// stamped uniformly early. Nor is a scene's CollectedAt, which the server reads
+// as the agent's own clock in order to report delivery lag and a clock-ahead
+// flag; correcting it would erase exactly the observation it exists to carry.
+// The residual there is that on a badly-set clock a corrected trigger can land
+// after the uncorrected CollectedAt of the very report that carries it. Nothing
+// joins those two — the trigger is matched against the server's fault signals
+// and CollectedAt against the server's receipt time — so the inconsistency is
+// visible but inert.
 //
 // # The offset model
 //
