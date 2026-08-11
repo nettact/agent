@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 // that does not recognise the number must show nothing rather than guess: the
 // fields are a contract with a LuCI page that ships and upgrades separately from
 // the agent, so the two are routinely different vintages on the same device.
-const statusFileSchema = 1
+const statusFileSchema = 2
 
 // Connection states reported per server. They are a reader's vocabulary, not an
 // internal state machine — conn and the enrollment loop have their own — and are
@@ -83,12 +84,124 @@ type serverStatus struct {
 
 // statusDoc is the whole file.
 type statusDoc struct {
-	Schema       int            `json:"schema"`
-	PID          int            `json:"pid"`
-	AgentVersion string         `json:"agent_version"`
-	StartedAt    int64          `json:"started_at"`
-	UpdatedAt    int64          `json:"updated_at"`
-	Servers      []serverStatus `json:"servers"`
+	Schema       int    `json:"schema"`
+	PID          int    `json:"pid"`
+	AgentVersion string `json:"agent_version"`
+	StartedAt    int64  `json:"started_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+
+	// Fatal is why this PROCESS gave up, in one sentence, or empty while it is
+	// still running. It exists beside the per-server rows below rather than
+	// instead of them, because the two answer different questions and one of
+	// them has no row to live in.
+	//
+	// A configuration the agent refuses, an unreadable key, a WAL it cannot open:
+	// none of those belong to any server, and they happen before a single server
+	// row exists. On a router they are also the worst case there is — the process
+	// dies in under a second, procd respawns it ten seconds later forever, and
+	// the reason goes to stderr where nobody will ever read it (procd's log
+	// reader routinely loses the last line a process writes before exiting, which
+	// is exactly this one). Without this field the status page can only report
+	// what the router can observe from outside — "not running" — which is the
+	// black box this whole file exists to open.
+	//
+	// It is a plain string, and it is sanitised, because its first reader is
+	// BusyBox sh. launch.sh republishes it to syslog on the next respawn, using
+	// `sed -n 's/.*"fatal":"\([^"]*\)".*/\1/p'`, and that expression is only
+	// correct if the value can never contain a quote or a backslash — a JSON
+	// string carrying `\"` would be truncated at the escape, cutting the sentence
+	// off exactly where it starts being useful. Encoding it as a nested object
+	// like LastError below would push the same problem one level deeper without
+	// solving it: there is no JSON parser in launch.sh. So the agent guarantees
+	// the property instead of asking the reader to handle it (see shellSafe).
+	Fatal string `json:"fatal,omitempty"`
+
+	Servers []serverStatus `json:"servers"`
+}
+
+// shellSafeMax caps the sanitised reason. Syslog truncates long lines, the LuCI
+// log panel shows thirty of them, and every failure worth reporting says what it
+// is in its first sentence; the untruncated text is still in Servers.LastError
+// for the page that can render it.
+const shellSafeMax = 300
+
+// shellSafe renders err as a single line that survives both JSON encoding and a
+// sed extraction unchanged: no quote, no backslash, no control character, no run
+// of blanks.
+//
+// The two offending characters are treated differently on purpose. A quote is a
+// delimiter — dropping it cannot run two words together — while a backslash
+// separates (`C:\data\agent.key`), so it becomes a space rather than nothing.
+// Control characters and newlines go the same way as the backslash: the joined
+// error of several servers is multi-line, and one line is what syslog and the
+// status panel each show.
+func shellSafe(err error) string {
+	if err == nil {
+		return ""
+	}
+	var b strings.Builder
+	space := false
+	for _, r := range err.Error() {
+		switch {
+		case r == '"':
+			// Dropped outright, leaving `server "default": …` as `server default: …`.
+		case r == '\\' || r == ' ' || r == '\t' || r < 0x20 || r == 0x7f:
+			space = b.Len() > 0
+		default:
+			if space {
+				b.WriteRune(' ')
+				space = false
+			}
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	if len(s) > shellSafeMax {
+		// ToValidUTF8 drops the rune the cut landed inside, so the result is never
+		// a byte sequence a JSON encoder has to escape its way around.
+		s = strings.ToValidUTF8(s[:shellSafeMax], "")
+	}
+	return s
+}
+
+// ReportStartupFailure records, in the status file, why the agent is refusing to
+// start at all — the failures that happen before Run can be called and therefore
+// before Run can report anything itself.
+//
+// It is exported for one caller shape: a supervised agent whose configuration is
+// rejected (a UCI value the router's own settings page produced, say) exits
+// before it has a status writer, a server list or a log anyone reads. On a
+// router that is indistinguishable from every other kind of silence, and the
+// status file is the only surface the LuCI page and the launch script can both
+// see. A caller that got as far as calling Run must not call this as well: Run
+// already reports its own failures, in more detail than a single line can carry,
+// and this replaces the whole document rather than adding to it.
+//
+// Doing nothing when path is empty is the ordinary case (a standalone agent's
+// status surface is its log), and every error here is swallowed on purpose —
+// this is a diagnostic, and a diagnostic that can fail the thing it is
+// diagnosing is worse than none.
+func ReportStartupFailure(path string, err error) {
+	if path == "" || err == nil {
+		return
+	}
+	now := time.Now().Unix()
+	data, merr := json.Marshal(statusDoc{
+		Schema:       statusFileSchema,
+		PID:          os.Getpid(),
+		AgentVersion: Version,
+		StartedAt:    now,
+		UpdatedAt:    now,
+		Fatal:        shellSafe(err),
+		// Empty rather than absent: a reader that iterates the servers must find a
+		// list to iterate, not null. There genuinely are none — that is the point
+		// of this document.
+		Servers: []serverStatus{},
+	})
+	if merr != nil {
+		return
+	}
+	_ = replaceStatusFile(path, data)
 }
 
 // Status codes for the failures that are agentrt's rather than conn's. Every
@@ -221,6 +334,25 @@ func (w *statusWriter) set(server string, mutate func(*serverStatus)) {
 	w.nudge()
 }
 
+// setFatal records why the whole process is giving up, so the document that
+// outlives it says so at the top rather than leaving a reader to infer it from a
+// list of servers that may well be empty. Safe to call from any goroutine, and
+// like every method here a no-op when there is no status file.
+//
+// It must be called BEFORE Run's teardown cancels the context: finish() below is
+// what persists the document, and it decides between persisting and removing by
+// asking whether there is anything worth keeping.
+func (w *statusWriter) setFatal(err error) {
+	if w == nil || err == nil {
+		return
+	}
+	w.mu.Lock()
+	w.doc.Fatal = shellSafe(err)
+	w.doc.UpdatedAt = time.Now().Unix()
+	w.mu.Unlock()
+	w.nudge()
+}
+
 // refresh re-reads every server's backlog depth and stamps the document.
 //
 // Transitions alone would leave a connected agent's file frozen at the instant
@@ -292,7 +424,7 @@ func (w *statusWriter) run(ctx context.Context) {
 // picks between them at random. Half the time the loop above would exit without
 // ever writing the state it exists to report.
 func (w *statusWriter) finish() {
-	if !w.hasTerminal() {
+	if !w.hasFinalOutcome() {
 		_ = os.Remove(w.path)
 		return
 	}
@@ -304,11 +436,15 @@ func (w *statusWriter) finish() {
 	}
 }
 
-// hasTerminal reports whether any server ended in the state that must outlive
-// the process.
-func (w *statusWriter) hasTerminal() bool {
+// hasFinalOutcome reports whether this document says something that must outlive
+// the process — a server that gave up, or a process-level failure that means no
+// server ever got a chance to.
+func (w *statusWriter) hasFinalOutcome() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.doc.Fatal != "" {
+		return true
+	}
 	for i := range w.doc.Servers {
 		if w.doc.Servers[i].State == statusTerminal {
 			return true
@@ -323,7 +459,10 @@ func (w *statusWriter) hasTerminal() bool {
 // refreshes every five seconds would otherwise eventually catch a half-written
 // document and render an empty panel with no error anywhere. Marshalling holds
 // the lock; the I/O does not, so a slow flash write never stalls a session
-// goroutine reporting a state change.
+// goroutine reporting a state change. (The lock cannot be dropped any earlier
+// than the marshal: the document owns a slice of server rows that session
+// goroutines mutate in place, so handing the struct out and encoding it
+// afterwards would be a copy of the header and a race on the rows.)
 func (w *statusWriter) write() error {
 	w.mu.Lock()
 	data, err := json.Marshal(w.doc)
@@ -331,9 +470,16 @@ func (w *statusWriter) write() error {
 	if err != nil {
 		return err
 	}
+	return replaceStatusFile(w.path, data)
+}
+
+// replaceStatusFile is the file half of write, split out so a process that never
+// got as far as building a statusWriter can still leave the one document that
+// explains why (see ReportStartupFailure).
+func replaceStatusFile(path string, data []byte) error {
 	data = append(data, '\n')
 
-	dir := filepath.Dir(w.path)
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -355,5 +501,5 @@ func (w *statusWriter) write() error {
 	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, w.path)
+	return os.Rename(tmpName, path)
 }

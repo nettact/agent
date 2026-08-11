@@ -107,6 +107,12 @@ stop_service() {
 	# stops where it never gets the chance. A file left behind by a killed agent
 	# would read as live status frozen at the last thing that happened to it.
 	rm -f "$NETTACT_STATUS_FILE"
+	# And the note saying that reason has already been reported. Dropping it here
+	# and nowhere else is what makes the difference between a person restarting
+	# the service and procd respawning it: the respawn must not repeat the same
+	# line every ten seconds, but someone who has just restarted by hand is asking
+	# whether it still fails, and deserves the answer in the log again.
+	rm -f "$NETTACT_REASON_STAMP"
 }
 
 service_triggers() {

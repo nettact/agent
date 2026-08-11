@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -365,4 +366,181 @@ func TestStatusFileIsRemovedOnAnOrdinaryShutdown(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("os.Stat(%s) = %v, want the file to be gone", path, err)
 	}
+}
+
+// TestRunRecordsAStartupFailure: the failures that kill the agent BEFORE it has
+// a server to have an opinion about are the ones a router owner has no way at
+// all to see. procd respawns the process in under a second, its stderr is
+// written in the instant before it exits (which is the window procd's log reader
+// loses), and the status page is left able to say only "not running".
+//
+// Run must therefore leave the reason behind even when it never got as far as
+// building a status writer — which is the whole point: no writer means no
+// document, and no document means no explanation.
+func TestRunRecordsAStartupFailure(t *testing.T) {
+	dir := agentDataDir(t)
+	path := filepath.Join(dir, "status.json")
+
+	// A WAL directory that cannot be opened, produced the way a router would:
+	// a plain file where the agent expects to create a directory.
+	if err := os.WriteFile(filepath.Join(dir, "wal"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("plant the wal blocker: %v", err)
+	}
+
+	err := Run(context.Background(), Config{
+		Servers:    []ServerConfig{{Name: "default", URL: "http://127.0.0.1:1"}},
+		DataDir:    dir,
+		WireFormat: "json",
+		StatusFile: path,
+		Policy:     permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
+	})
+	if err == nil {
+		t.Fatal("Run succeeded with an unopenable WAL")
+	}
+
+	raw, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("no status file after a startup failure (%v); the reason reached nobody", rerr)
+	}
+	var doc statusDoc
+	if uerr := json.Unmarshal(raw, &doc); uerr != nil {
+		t.Fatalf("unmarshal status: %v; contents %q", uerr, raw)
+	}
+	if doc.Fatal == "" {
+		t.Fatalf("fatal is empty in %q, want the reason Run refused to start with", raw)
+	}
+	if doc.Schema != statusFileSchema {
+		t.Errorf("schema = %d, want %d", doc.Schema, statusFileSchema)
+	}
+	if doc.PID != os.Getpid() {
+		t.Errorf("pid = %d, want this process (%d)", doc.PID, os.Getpid())
+	}
+	// A reader iterating servers must find a list, not null.
+	if doc.Servers == nil {
+		t.Error("servers is null; a reader that iterates it would break on the one document that matters")
+	}
+	// And the shell must be able to lift it out with the expression launch.sh
+	// uses, which needs the raw bytes to carry no escape in that value.
+	if got := fatalByShellRule(t, raw); got != doc.Fatal {
+		t.Errorf("sed-equivalent extraction = %q, want %q", got, doc.Fatal)
+	}
+}
+
+// TestStatusFileSurvivesAProcessLevelFailure: `fatal` has to keep the document
+// alive on its own. A process that dies before any server row exists has no
+// terminal state to be recognised by, so a rule that only looked for one would
+// delete the only sentence there is — which is precisely the case this field was
+// added for.
+func TestStatusFileSurvivesAProcessLevelFailure(t *testing.T) {
+	dir := agentDataDir(t)
+	path := filepath.Join(dir, "status.json")
+	outbox, err := wal.Open(filepath.Join(dir, "wal"), []string{"default"}, wal.Options{})
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	w := newStatusWriter(path, Config{Servers: []ServerConfig{{Name: "default", URL: "http://s"}}}, outbox)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.run(ctx)
+	}()
+
+	// No server ever leaves statusConnecting: only the process-level record says
+	// anything happened.
+	w.setFatal(errors.New("server \"default\": enroll: unsupported schema_version 3"))
+	cancel()
+	<-done
+
+	raw, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("status file was removed despite a fatal reason: %v", rerr)
+	}
+	var doc statusDoc
+	if uerr := json.Unmarshal(raw, &doc); uerr != nil {
+		t.Fatalf("unmarshal status: %v", uerr)
+	}
+	if doc.Fatal == "" {
+		t.Fatalf("fatal is empty in %q", raw)
+	}
+	if got := fatalByShellRule(t, raw); got != doc.Fatal {
+		t.Errorf("sed-equivalent extraction = %q, want %q", got, doc.Fatal)
+	}
+}
+
+// TestShellSafeReasonSurvivesSedExtraction pins the property the OpenWrt scripts
+// depend on and cannot check for themselves.
+//
+// launch.sh lifts the reason out with `sed -n 's/.*"fatal":"\([^"]*\)".*/\1/p'`,
+// because there is no JSON parser in BusyBox ash. That expression is exact only
+// while the encoded value contains no quote and no backslash — and the reasons
+// that matter most are the ones most likely to contain both, since a rejected
+// enrollment carries the server's JSON error body inside its own message. Left
+// unsanitised, the sentence would be cut off at the first escape, which is
+// exactly where it starts naming the problem.
+func TestShellSafeReasonSurvivesSedExtraction(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{{
+		name: "the failure this was written for",
+		err: errors.New(`server "default": enroll: enroll failed (500 Internal Server Error): ` +
+			`{"error":"unsupported schema_version 3 (this build speaks 5; upgrade the other side)"}`),
+		want: `server default: enroll: enroll failed (500 Internal Server Error): ` +
+			`{error:unsupported schema_version 3 (this build speaks 5; upgrade the other side)}`,
+	}, {
+		name: "a multi-line join keeps one line",
+		err:  errors.New("server \"a\": no token\nserver \"b\": no token"),
+		want: "server a: no token server b: no token",
+	}, {
+		name: "a windows path does not escape into a backslash",
+		err:  errors.New(`open C:\data\agent.key: permission denied`),
+		want: "open C: data agent.key: permission denied",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shellSafe(tc.err)
+			if got != tc.want {
+				t.Errorf("shellSafe() = %q, want %q", got, tc.want)
+			}
+			raw, err := json.Marshal(statusDoc{Schema: statusFileSchema, Fatal: got})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if extracted := fatalByShellRule(t, raw); extracted != got {
+				t.Errorf("the shell would read %q, not %q", extracted, got)
+			}
+		})
+	}
+
+	// The cap keeps a syslog line and a status panel readable; the untruncated
+	// text is still on each server's own row.
+	long := errors.New(strings.Repeat("x", shellSafeMax*2))
+	if got := shellSafe(long); len(got) > shellSafeMax {
+		t.Errorf("shellSafe() returned %d bytes, want at most %d", len(got), shellSafeMax)
+	}
+}
+
+// fatalByShellRule extracts `fatal` from raw document bytes the way launch.sh
+// does — a plain scan for the unescaped key, taking everything up to the next
+// quote. Written against the bytes rather than against a parsed document on
+// purpose: the point is what the SHELL will see, and a parser would paper over
+// exactly the escaping the shell cannot handle.
+func fatalByShellRule(t *testing.T, raw []byte) string {
+	t.Helper()
+	const key = `"fatal":"`
+	i := strings.Index(string(raw), key)
+	if i < 0 {
+		return ""
+	}
+	rest := string(raw)[i+len(key):]
+	j := strings.IndexByte(rest, '"')
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
 }

@@ -595,6 +595,9 @@ msgstr "尚无连接状态 —— 探针正在启动。"
 msgid "The agent has not refreshed this status for over a minute; it may be stuck."
 msgstr "探针已超过一分钟没有刷新此状态，可能已卡住。"
 
+msgid "The agent stopped and will not recover on its own:"
+msgstr "探针已停止，且不会自行恢复："
+
 msgid "%ds"
 msgstr "%d 秒"
 

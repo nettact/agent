@@ -172,7 +172,7 @@ function parseAgentStatus(st) {
 		return null;
 	try {
 		var doc = JSON.parse(st.agent_status);
-		return (doc && doc.schema === 1 && Array.isArray(doc.servers)) ? doc : null;
+		return (doc && doc.schema === 2 && Array.isArray(doc.servers)) ? doc : null;
 	} catch (e) {
 		return null;
 	}
@@ -223,16 +223,26 @@ return view.extend({
 	// reporting", which is the question anyone opens it to ask.
 	renderServers: function (st) {
 		var doc = parseAgentStatus(st);
-		// A terminal document is rendered even when procd reports the service
-		// down, because down is precisely when it exists: the agent wrote it on
-		// the way out and is now in a respawn delay. Hiding it here would throw
-		// away the one state that says why this router stopped reporting, and
-		// leave the page blank for exactly the case it was built for.
-		var terminal = false;
+		// A final document is rendered even when procd reports the service down,
+		// because down is precisely when it exists: the agent wrote it on the way
+		// out and is now in a respawn delay. Hiding it here would throw away the
+		// one state that says why this router stopped reporting, and leave the
+		// page blank for exactly the case it was built for.
+		//
+		// `fatal` counts as well as a terminal server row, and it is the case
+		// with no rows at all: a configuration the agent refuses, a key it cannot
+		// read, a WAL it cannot open. Those kill the process before it has a
+		// single server to have an opinion about, so a check that only counted
+		// server states would score the document empty and hide the only sentence
+		// in it — the exact black box ("the service is not running", full stop)
+		// that this panel exists to open.
+		var isFinal = false;
+		if (doc && doc.fatal)
+			isFinal = true;
 		if (doc && doc.servers)
 			for (var i = 0; i < doc.servers.length; i++)
-				if (doc.servers[i].state === 'terminal') { terminal = true; break; }
-		if (!st.running && !terminal)
+				if (doc.servers[i].state === 'terminal') { isFinal = true; break; }
+		if (!st.running && !isFinal)
 			return E([]);
 		if (!doc)
 			return E('div', { 'class': 'cbi-value-description' },
@@ -246,7 +256,21 @@ return view.extend({
 		var now = st.now || routerNow();
 		var box = E([]);
 
-		if (doc.updated_at && now - doc.updated_at > staleAfter)
+		// Above everything else, and in the loudest style the page has: it is the
+		// sentence that says the agent is not coming back without help, and on a
+		// router in a respawn loop it is the only one that has not been overwritten
+		// by a startup state.
+		//
+		// It also takes the place of the staleness warning rather than sitting
+		// beside it. A document that names a fatal reason is stale by definition —
+		// the process that would refresh it is gone — and "it may be stuck" beside
+		// "it stopped, for this reason" is a guess arguing with an answer.
+		if (doc.fatal)
+			box.appendChild(E('p', { 'class': 'alert-message danger' }, [
+				_('The agent stopped and will not recover on its own:'),
+				E('br'), E('strong', {}, doc.fatal)
+			]));
+		else if (doc.updated_at && now - doc.updated_at > staleAfter)
 			box.appendChild(E('p', { 'class': 'alert-message warning' },
 				_('The agent has not refreshed this status for over a minute; it may be stuck.')));
 

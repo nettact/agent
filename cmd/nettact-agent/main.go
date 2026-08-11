@@ -101,15 +101,40 @@ func main() {
 
 	// Layer a YAML config file over the environment when one is named or found.
 	lookup := envcfg.Lookup(os.LookupEnv)
+
+	// refuse ends the process the way log.Fatalf would, and additionally leaves
+	// the reason in the status file when one is configured.
+	//
+	// This covers only the failures that happen BEFORE agentrt.Run — a config file
+	// that cannot be read, a value the agent will not accept. Run records its own
+	// outcome, in more detail than this can, so it is deliberately not wrapped
+	// here. The path is re-read from `lookup` at each call because `lookup` gains
+	// the config file's own settings partway down, and status_file is one of them.
+	//
+	// The reason a configuration error deserves this at all is what a supervised
+	// agent does with it: a router renders its agent config from UCI, so a value
+	// the settings page allowed and the agent rejects produces a process that
+	// exits in well under a second and is respawned ten seconds later, forever.
+	// The stderr that says why is written in the instant before the exit, which is
+	// exactly the window procd's log reader loses — so without this the router's
+	// owner is left with a status page that says "not running" and nothing else.
+	refuse := func(format string, args ...any) {
+		err := fmt.Errorf(format, args...)
+		if path, ok := lookup("NETTACT_AGENT_STATUS_FILE"); ok && path != "" {
+			agentrt.ReportStartupFailure(path, err)
+		}
+		log.Fatal(err)
+	}
+
 	path, _, err := envcfg.ResolveConfigPath(configPath, lookup)
 	if err != nil {
-		log.Fatalf("invalid configuration: %v", err)
+		refuse("invalid configuration: %v", err)
 	}
 	var fileCfg envcfg.File
 	if path != "" {
 		fileCfg, err = envcfg.LoadFile(path)
 		if err != nil {
-			log.Fatalf("invalid configuration: %v", err)
+			refuse("invalid configuration: %v", err)
 		}
 		lookup = envcfg.Layered(fileCfg, lookup)
 		log.Printf("using config file %s", path)
@@ -117,7 +142,7 @@ func main() {
 
 	cfg, err := envcfg.Load(lookup, fileCfg)
 	if err != nil {
-		log.Fatalf("invalid configuration:\n%v", err)
+		refuse("invalid configuration:\n%v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

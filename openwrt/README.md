@@ -93,14 +93,20 @@ OpenWrt SDK and no cross toolchain.
 ./test-scripts.sh
 ```
 
-Stubs `opkg` and `uci` and checks the architecture table, version resolution,
-the storage-mode paths, the stale-binary prune, the rendered YAML and the rpcd
-contract. Three of those are worth testing offline in particular: picking the
-wrong ARM variant is not a slow binary but a SIGILL on the first unsupported
-instruction; a prune that took the flash directory rather than two files in it
-would delete the package's own scripts; and a rendered config that carries both
-`server_url:` and `servers:` is rejected by the agent, which takes the router
-off the air.
+Stubs `opkg`, `uci` and `logger`, and checks the architecture table, version
+resolution, the storage-mode paths, the stale-binary prune, the rendered YAML,
+the rpcd contract, the boot-time version check and the way a stopped agent's
+reason reaches syslog. Several of those are worth testing offline in particular:
+picking the wrong ARM variant is not a slow binary but a SIGILL on the first
+unsupported instruction; a prune that took the flash directory rather than two
+files in it would delete the package's own scripts; a rendered config that
+carries both `server_url:` and `servers:` is rejected by the agent, which takes
+the router off the air; and a version check that lost its backoff would turn
+procd's ten-second respawn into a download loop against the mirror.
+
+The shell cases call the shipped functions directly, under `set -e`, rather than
+restating their logic — a case that re-implements what it tests passes whatever
+the shipped script does.
 
 There is one gap the stubs cannot cover: whether the agent actually *accepts*
 the document. To check that, render one and feed it to a real binary —
@@ -124,10 +130,13 @@ nettact-agent/
   files/etc/config/nettact              UCI defaults + schema
   files/etc/init.d/nettact              procd service
   files/lib/upgrade/keep.d/nettact      what sysupgrade must preserve
-  files/usr/lib/nettact/common.sh       shared paths + UCI accessors + prune
+  files/usr/lib/nettact/common.sh       shared paths, UCI accessors, prune,
+                                        status-document rules, version check
   files/usr/lib/nettact/genconfig.sh    UCI -> /var/etc/nettact/agent.yaml
-  files/usr/lib/nettact/launch.sh       waits for clock/network, fetches, execs
+  files/usr/lib/nettact/launch.sh       reports the last stop, waits for
+                                        clock/network, fetches, execs
   files/usr/lib/nettact/fetch.sh        arch table, download, verify, install
+  files/usr/lib/nettact/update.sh       the nightly auto_update cron job
 luci-app-nettact/
   control/{control,postinst,postrm}
   files/usr/libexec/rpcd/luci.nettact   ubus object luci.nettact (the file
