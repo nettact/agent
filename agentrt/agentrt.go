@@ -459,7 +459,28 @@ type runEnv struct {
 //
 // All goroutines it starts are stopped before it returns, and the WAL is closed,
 // so re-running on the same DataDir is safe.
-func Run(ctx context.Context, cfg Config) error {
+func Run(ctx context.Context, cfg Config) (retErr error) {
+	// Everything below this line that fails before there is a status writer fails
+	// with nothing but a log line to show for it — and on a router that log line
+	// is routinely lost, because procd's reader drops what a process wrote in the
+	// instant before it exited. An unreadable key, a WAL on a full overlay, a
+	// configuration the router's own settings page produced and the agent
+	// refuses: each of those is a sub-second exit followed by a respawn ten
+	// seconds later, forever, with the status page able to say only "not
+	// running". Recording the reason here is what turns that into a sentence.
+	//
+	// Guarded on the writer being absent rather than done unconditionally, and the
+	// guard is the whole design: once the writer exists it owns the file, and
+	// overwriting its document with this one-line summary would throw away the
+	// per-server rows — which host, which certificate, when the next attempt is
+	// due — that a reader needs far more than it needs the summary.
+	var status *statusWriter
+	defer func() {
+		if retErr != nil && status == nil && ctx.Err() == nil {
+			ReportStartupFailure(cfg.StatusFile, retErr)
+		}
+	}()
+
 	if err := cfg.normalize(); err != nil {
 		return err
 	}
@@ -515,7 +536,8 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	// The status file reports backlog depth, so it needs the outbox; the runners
 	// report into it, so it has to exist before they are built.
-	env.status = newStatusWriter(cfg.StatusFile, cfg, outbox)
+	status = newStatusWriter(cfg.StatusFile, cfg, outbox)
+	env.status = status
 	owner := cfg.Servers[gameOwner].Name
 
 	// An installed sensor that cannot collect looks identical to no sensor at all
@@ -809,7 +831,16 @@ func Run(ctx context.Context, cfg Config) error {
 			errs = append(errs, fmt.Errorf("server %q: %w", runtimes[i].cfg.Name, err))
 		}
 	}
-	return errors.Join(errs...)
+	joined := errors.Join(errs...)
+	// Every server has stopped for good, so say so once at the top of the status
+	// document as well as in each server's own row. The rows are what a status
+	// page renders; this is what a shell script reads, and on a router the shell
+	// is what puts the reason into syslog — see launch.sh, which republishes it on
+	// the respawn that follows. Set here rather than in the defer above because
+	// the writer is still alive at this point: the teardown that cancels it, and
+	// with it the final write that persists this, runs after the return.
+	env.status.setFatal(joined)
+	return joined
 }
 
 // runServer owns one server for the life of the Run: enroll if needed, hold a

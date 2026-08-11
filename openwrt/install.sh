@@ -407,6 +407,12 @@ if ! /usr/lib/nettact/fetch.sh install "$VERSION"; then
 	else
 		die "could not download the agent binary, and this router has none to fall back on. Check --download-base/--version and that the router can reach it, then re-run. Nothing has been discarded: this router's identity and queued telemetry are as they were."
 	fi
+else
+	# The version this router should run has just been established, so the boot
+	# check in launch.sh has nothing left to ask. Saying so here spares the
+	# restart below a second round trip to the same source, at the one moment
+	# this script is already waiting on the agent to come online.
+	nettact_mark_version_checked
 fi
 
 # Now, and not before: the configuration is written and valid and the binary is in
@@ -462,8 +468,11 @@ Worth checking:
   ls -l $NETTACT_DATA_DIR/          agent.json present means enrollment succeeded
 
 An agent that exits immediately, over and over, is most often one the server
-refuses: a spent or wrong token, or a build too old for it. The reason is on the
-agent's own stderr — run it once in the foreground to see it:
+refuses: a spent or wrong token, or a build too old for it. When it gives up for
+a reason like that it records the reason in the "fatal" field of the connection
+status printed above, and the next start repeats it into the system log — so
+'logread -e nettact' should now say why. If neither carries it, run the agent
+once in the foreground:
   NETTACT_AGENT_CONFIG_FILE=$NETTACT_GEN_CONFIG NETTACT_AGENT_DATA_DIR=$NETTACT_DATA_DIR $(nettact_bin)
 EOF
 }

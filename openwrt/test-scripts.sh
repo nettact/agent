@@ -76,6 +76,18 @@ EOF
 
 cat > "$STUB/logger" <<'EOF'
 #!/bin/sh
+# Silent unless a test asks to see what reached syslog. `logger -t nettact -p
+# daemon.err -- <message…>`: everything after `--` is the message, and that is
+# the only part worth recording.
+[ -n "${T_LOGGER_OUT:-}" ] || exit 0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--) shift; break ;;
+		-t|-p) shift 2 ;;
+		*) shift ;;
+	esac
+done
+printf '%s\n' "$*" >> "$T_LOGGER_OUT"
 exit 0
 EOF
 
@@ -486,10 +498,9 @@ cat > "$STUB/ubus" <<'EOF'
 echo '{"nettact":{"instances":{"nettact":{"running":true}}}}'
 EOF
 
-cat > "$STUB/logger" <<'EOF'
-#!/bin/sh
-exit 0
-EOF
+# (The logger stub from the top of this file is still the live one; the checks
+# later on that count what reached syslog depend on it not being re-created as a
+# no-op here.)
 chmod 0755 "$STUB/logread" "$STUB/ubus" "$STUB/logger"
 
 RPCD="$STUB/rpcd-nettact"
@@ -525,7 +536,7 @@ case " $out " in
 esac
 
 # $$ is this script: a pid that is certainly alive.
-printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$STATUS_STUB"
+printf '{"schema":2,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$STATUS_STUB"
 out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
 case " $out " in
 	*" agent_status"*) printf '  ok   %-28s -> passed through for a live pid\n' "status.agent_status" ;;
@@ -536,7 +547,7 @@ esac
 # just waited on is not about to come back as something else.
 sh -c 'exit 0' & dead_pid=$!
 wait "$dead_pid" 2>/dev/null || true
-printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$dead_pid" > "$STATUS_STUB"
+printf '{"schema":2,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$dead_pid" > "$STATUS_STUB"
 out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
 case " $out " in
 	*" agent_status"*) printf '  FAIL %-28s -> stale status from a dead pid passed through\n' "status.agent_status"; fail=1 ;;
@@ -545,11 +556,27 @@ esac
 
 # A document with no pid at all cannot be attributed to a process, so it is not
 # status either.
-printf '{"schema":1,"servers":[{"name":"default","state":"connected"}]}\n' > "$STATUS_STUB"
+printf '{"schema":2,"servers":[{"name":"default","state":"connected"}]}\n' > "$STATUS_STUB"
 out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
 case " $out " in
 	*" agent_status"*) printf '  FAIL %-28s -> pid-less document passed through\n' "status.agent_status"; fail=1 ;;
 	*) printf '  ok   %-28s -> dropped when it names no pid\n' "status.agent_status" ;;
+esac
+
+# …and the exception to all of the above: a document naming a FATAL reason is
+# passed through even though its process is gone, because gone is when it exists.
+# The agent writes it on the way out, so by the time anyone opens the page procd
+# is in a respawn delay and the pid is dead — the two grounds that discard every
+# other document. It also carries no server rows at all, being the failure that
+# happens before any server exists, so a rule that only counted terminal states
+# would score it empty and drop the one sentence that says why this router
+# stopped reporting.
+printf '{"schema":2,"pid":%d,"fatal":"invalid configuration: max_probe_concurrency lots","servers":[]}\n' \
+	"$dead_pid" > "$STATUS_STUB"
+out="$(T_ARCH=x86_64 NETTACT_STATUS_FILE="$STATUS_STUB" "$RPCD" call status </dev/null 2>/dev/null || echo 'ERROR')"
+case " $out " in
+	*" agent_status"*) printf '  ok   %-28s -> a fatal document outlives its pid\n' "status.agent_status" ;;
+	*) printf '  FAIL %-28s -> fatal document dropped with the dead pid\n' "status.agent_status"; fail=1 ;;
 esac
 rm -f "$STATUS_STUB"
 
@@ -561,6 +588,18 @@ if grep -q 'rm -f "$NETTACT_STATUS_FILE"' "$HERE/nettact-agent/files/usr/lib/net
 else
 	printf '  FAIL %-28s -> does not clear the stale status file\n' "launch.status"; fail=1
 fi
+
+# Both steps that exist to stop a router going dark are one function call each,
+# and a call quietly dropped from the boot path is invisible until a real device
+# needs it. Anchored at the start of a line so the prose above them — which names
+# both functions — cannot answer for the wiring.
+for wired in nettact_report_terminal_reason nettact_check_binary_version; do
+	if grep -qE "^[[:space:]]*$wired([[:space:]]|\$)" "$HERE/nettact-agent/files/usr/lib/nettact/launch.sh"; then
+		printf '  ok   %-28s -> called by launch.sh\n' "launch.$wired"
+	else
+		printf '  FAIL %-28s -> not called by launch.sh\n' "launch.$wired"; fail=1
+	fi
+done
 
 # The methods the views call must all be listed, or ubus rejects them.
 listed="$("$RPCD" list </dev/null 2>/dev/null || true)"
@@ -750,6 +789,9 @@ NETTACT_FLASH_DIR="$INST/usr/lib/nettact"
 NETTACT_RAM_DIR="$INST/tmp/nettact"
 NETTACT_STATUS_FILE="$INST/tmp/status.json"
 NETTACT_GEN_CONFIG="$INST/var/etc/nettact/agent.yaml"
+NETTACT_RUN_DIR="$INST/tmp/nettact"
+NETTACT_VERSION_STAMP="$INST/tmp/nettact/version-checked"
+NETTACT_REASON_STAMP="$INST/tmp/nettact/reason-reported"
 EOF
 
 INSTALLER="$INST/install.sh"
@@ -966,20 +1008,20 @@ check "1" "$(grep -c 'install /tmp/out/nettact-agent.ipk' "$INST/opkg.log")" "lo
 # The online check. A live pid plus a connected server is success; the same file
 # naming a dead process is the respawn loop this exists to catch, so it must time
 # out instead of believing it.
-printf '{"schema":1,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
+printf '{"schema":2,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
 run_install --server-url http://srv:12450 --token t --wait 9 \
 	&& printf '  ok   %-28s -> connected\n' "status: live pid" \
 	|| { printf '  FAIL %-28s -> not detected\n' "status: live pid"; fail=1; }
 
 dead=4194303
 while kill -0 "$dead" 2>/dev/null; do dead=$(( dead - 1 )); done
-printf '{"schema":1,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connected"}]}\n' "$dead" > "$INST/tmp/status.json"
+printf '{"schema":2,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connected"}]}\n' "$dead" > "$INST/tmp/status.json"
 run_install --server-url http://srv:12450 --token t --wait 6 \
 	&& { printf '  FAIL %-28s -> reported connected\n' "status: dead pid"; fail=1; } \
 	|| printf '  ok   %-28s -> not connected\n' "status: dead pid"
 
 # A server that is reachable but not connected is not success either.
-printf '{"schema":1,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connecting"}]}\n' "$$" > "$INST/tmp/status.json"
+printf '{"schema":2,"pid":%d,"agent_version":"v1","servers":[{"name":"default","state":"connecting"}]}\n' "$$" > "$INST/tmp/status.json"
 run_install --server-url http://srv:12450 --token t --wait 6 \
 	&& { printf '  FAIL %-28s -> reported connected\n' "status: connecting" ; fail=1; } \
 	|| printf '  ok   %-28s -> not connected\n' "status: connecting"
@@ -1034,7 +1076,7 @@ check "old" "$(sed -n 's/.*"agent_token":"\([^"]*\)".*/\1/p' "$INST/etc/nettact/
 
 # Once the service starts the contract is the native installer's: the previous
 # identity is replaced, so the token given here is the one that enrolls.
-printf '{"schema":1,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
+printf '{"schema":2,"pid":%d,"servers":[{"name":"default","state":"connected"}]}\n' "$$" > "$INST/tmp/status.json"
 rerun_install --server-url http://srv:12450 --token new-tok --reinstall --wait 9 \
 	&& printf '  ok   %-28s -> connected\n' "--reinstall that connects" \
 	|| { printf '  FAIL %-28s -> failed\n' "--reinstall that connects"; fail=1; }
@@ -1166,6 +1208,212 @@ nettact.main.auto_update=1' nettact_sync_cron
 T_UCI='nettact.main.enabled=1
 nettact.main.auto_update=1' nettact_remove_cron
 check "0" "$(cronline)" "remove_cron ignores UCI"
+
+# --- what a stopped agent leaves behind ---------------------------------------
+#
+# Two things read the agent's status document and they must not disagree:
+# launch.sh deletes the one that does NOT describe a stopped agent (so a respawn
+# cannot leave the page showing a dead process's last state), and the rpcd
+# backend passes through the one that does (so the page CAN show the state whose
+# process is by definition gone). One function decides; these drive that
+# function, since a copy of the rule written here would agree with itself no
+# matter what the package shipped.
+
+echo "status document finality:"
+
+RUNDIR="$STUB/run"
+mkdir -p "$RUNDIR"
+NETTACT_RUN_DIR="$RUNDIR"
+NETTACT_STATUS_FILE="$RUNDIR/status.json"
+export NETTACT_RUN_DIR NETTACT_STATUS_FILE
+# Both are read at source time, so common.sh has to be sourced again now that
+# they are set — the earlier source baked in the defaults.
+. "$HERE/nettact-agent/files/usr/lib/nettact/common.sh"
+
+final_case() { # final_case <label> <yes|no> <document>
+	if nettact_status_is_final "$3"; then isfinal=yes; else isfinal=no; fi
+	check "$2" "$isfinal" "$1"
+}
+
+final_case "nothing at all"        no  ''
+final_case "a live session"        no  '{"schema":2,"pid":1,"servers":[{"name":"a","state":"connected"}]}'
+final_case "waiting to retry"      no  '{"schema":2,"pid":1,"servers":[{"name":"a","state":"waiting_retry"}]}'
+final_case "every server terminal" yes '{"schema":2,"pid":1,"servers":[{"name":"a","state":"terminal"}]}'
+# One terminal row beside a live one belongs to a dead process: passing the
+# document through would present that "connected" as current.
+final_case "one of two terminal"   no  '{"schema":2,"pid":1,"servers":[{"name":"a","state":"terminal"},{"name":"b","state":"connected"}]}'
+# The shape `fatal` exists for — the process died before it had any server rows
+# to be terminal in.
+final_case "fatal, no servers"     yes '{"schema":2,"pid":1,"fatal":"invalid configuration: max_probe_concurrency","servers":[]}'
+
+echo "terminal reason to syslog:"
+
+T_LOGGER_OUT="$RUNDIR/syslog"
+export T_LOGGER_OUT
+
+# logged <pattern> — how many syslog lines matched. `grep -c` prints its own 0
+# and exits 1 doing it, so only the missing-file case needs a substitute.
+logged() {
+	[ -f "$T_LOGGER_OUT" ] || { echo 0; return 0; }
+	grep -c -- "$1" "$T_LOGGER_OUT" 2>/dev/null || true
+}
+
+# Every case below calls the real function BARE, exactly as launch.sh does, so
+# `set -e` is in full force: a function that aborts halfway takes this whole run
+# down rather than passing. Wrapping the call in an `if` would suppress `set -e`
+# for everything inside it — which is how a green suite once hid a shipped script
+# that stopped at its first failing fallback. stderr is discarded because
+# nettact_err writes there as well, and syslog is what is under test.
+rm -f "$T_LOGGER_OUT" "$NETTACT_REASON_STAMP" "$NETTACT_STATUS_FILE"
+nettact_report_terminal_reason 2>/dev/null
+check "0" "$(logged 'will not recover')" "no status file: silent"
+
+printf '{"schema":2,"pid":1,"servers":[{"name":"default","state":"connected"}]}\n' > "$NETTACT_STATUS_FILE"
+nettact_report_terminal_reason 2>/dev/null
+check "0" "$(logged 'will not recover')" "a running agent: silent"
+
+# The failure this exists for. On the router that produced it, the agent's own
+# stderr never reached syslog — procd's reader loses what a process writes in the
+# instant before exiting — so the owner had "not running" and nothing else.
+printf '{"schema":2,"pid":1,"fatal":"server default: enroll failed (500): unsupported schema_version 3 (this build speaks 5)","servers":[]}\n' \
+	> "$NETTACT_STATUS_FILE"
+nettact_report_terminal_reason 2>/dev/null
+check "1" "$(logged 'schema_version 3')" "the reason reaches syslog"
+
+# procd respawns every ten seconds, forever. Repeating the line each time would
+# be thousands of identical entries a day in a ring buffer thirty lines of which
+# reach the status page.
+nettact_report_terminal_reason 2>/dev/null
+nettact_report_terminal_reason 2>/dev/null
+check "1" "$(logged 'schema_version 3')" "…and only once"
+
+# A different reason is news again.
+printf '{"schema":2,"pid":1,"fatal":"no enrollment token available","servers":[]}\n' > "$NETTACT_STATUS_FILE"
+nettact_report_terminal_reason 2>/dev/null
+check "1" "$(logged 'no enrollment token')" "a new reason is reported"
+
+# --- binary version drift -----------------------------------------------------
+#
+# launch.sh used to ask only whether a binary EXISTS, so a router that downloaded
+# the agent the day before a release ran that build until something removed the
+# file — in flash mode, indefinitely. A real device sat twenty-one hours on a
+# build whose wire schema the server had stopped accepting, in a respawn loop.
+# What the fix must NOT do is turn that existence check into a download on every
+# one of procd's ten-second respawns; these cases pin both halves.
+
+echo "binary version drift:"
+
+VER="$STUB/ver"
+mkdir -p "$VER"
+unset T_MODE 2>/dev/null || true
+T_UCI=""
+export T_UCI
+NETTACT_RAM_DIR="$VER"          # where nettact_bin points in the default ram mode
+NETTACT_FETCH="$VER/fetch"
+
+# A stand-in agent that answers --version. It gets a shebang rather than being an
+# empty file for the reason noted further up: on Git Bash `chmod 0755` leaves an
+# EMPTY file non-executable, and `[ -x ]` would then answer false — testing the
+# wrong branch entirely.
+cat > "$VER/nettact-agent" <<'EOF'
+#!/bin/sh
+[ "$1" = "--version" ] && echo "nettact-agent ${T_BIN_VERSION:-v0.3.1}"
+exit 0
+EOF
+
+# A recording fetch.sh. What needs asserting is which subcommands are called and
+# with what, not that eleven megabytes move.
+cat > "$VER/fetch" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$VER/fetch.log"
+case "\$1" in
+	resolve)
+		[ -n "\${T_RESOLVE_FAIL:-}" ] && exit 1
+		printf '%s\n' "\${T_LATEST:-v0.4.0}" ;;
+	install)
+		[ -n "\${T_INSTALL_FAIL:-}" ] && exit 1 ;;
+esac
+exit 0
+EOF
+chmod 0755 "$VER/nettact-agent" "$VER/fetch"
+
+fetchlog() {
+	[ -f "$VER/fetch.log" ] || return 0
+	tr '\n' ' ' < "$VER/fetch.log" | sed 's/ *$//'
+}
+
+T_BIN_VERSION=v0.3.1
+T_LATEST=v0.4.0
+export T_BIN_VERSION T_LATEST
+
+# Called bare under `set -e`, for the same reason as the block above.
+rm -f "$VER/fetch.log" "$NETTACT_VERSION_STAMP"
+nettact_check_binary_version 2>/dev/null
+check "resolve install v0.4.0" "$(fetchlog)" "a stale binary is replaced"
+
+# Up to date: nothing is downloaded. `fetch.sh install` would reach the same
+# conclusion, but only after transferring the whole binary to find out.
+T_BIN_VERSION=v0.4.0
+rm -f "$VER/fetch.log" "$NETTACT_VERSION_STAMP"
+nettact_check_binary_version 2>/dev/null
+check "resolve" "$(fetchlog)" "a current binary is left alone"
+
+# The mirror protection, and the reason the stamp is written before the network
+# work rather than after a successful check: procd's ten-second respawn must not
+# become a request loop against the one thing that may already be failing.
+T_BIN_VERSION=v0.3.1
+rm -f "$VER/fetch.log"
+nettact_check_binary_version 2>/dev/null
+nettact_check_binary_version 2>/dev/null
+check "" "$(fetchlog)" "a restart inside the window is silent"
+
+# …and once the window has passed it checks again.
+printf '%s\n' 0 > "$NETTACT_VERSION_STAMP"
+rm -f "$VER/fetch.log"
+nettact_check_binary_version 2>/dev/null
+check "resolve install v0.4.0" "$(fetchlog)" "an expired window checks again"
+
+# An unreachable download source is the normal state of a router whose WAN is
+# still coming up. It must cost nothing: no install, no failure, and the binary
+# already present is what gets started.
+T_RESOLVE_FAIL=1
+export T_RESOLVE_FAIL
+printf '%s\n' 0 > "$NETTACT_VERSION_STAMP"
+rm -f "$VER/fetch.log" "$T_LOGGER_OUT"
+nettact_check_binary_version 2>/dev/null
+check "resolve" "$(fetchlog)" "an unreachable source installs nothing"
+check "1" "$(logged 'could not reach the download source')" "…and says so"
+unset T_RESOLVE_FAIL
+
+# A download that fails is the same promise one step later: say so, and start
+# what is already there rather than failing the boot.
+T_INSTALL_FAIL=1
+export T_INSTALL_FAIL
+printf '%s\n' 0 > "$NETTACT_VERSION_STAMP"
+rm -f "$VER/fetch.log"
+nettact_check_binary_version 2>/dev/null
+check "resolve install v0.4.0" "$(fetchlog)" "a failed download is not fatal"
+unset T_INSTALL_FAIL
+
+# The stamp is a file on tmpfs that anything could have written, and none of
+# these shapes may abort the function — it runs under `set -e` on the path to
+# starting the agent. `08` in particular is not eight: POSIX arithmetic reads a
+# leading zero as OCTAL, so `$((08))` is "value too great for base", a syntax
+# error that ends the command it is in. That exact trap once disabled automatic
+# updates on whichever routers happened to have the wrong MAC address.
+for stamp in '' garbage 08 000123 0000000000 -5; do
+	printf '%s\n' "$stamp" > "$NETTACT_VERSION_STAMP"
+	rm -f "$VER/fetch.log"
+	nettact_check_binary_version 2>/dev/null
+	check "resolve install v0.4.0" "$(fetchlog)" "stamp '$stamp' still checks"
+done
+
+# And with no binary at all there is nothing to compare and nothing to fall back
+# on, so this must not download: obtaining a binary is the caller's step, and it
+# runs first for a reason.
+rm -f "$VER/nettact-agent" "$VER/fetch.log" "$NETTACT_VERSION_STAMP"
+nettact_check_binary_version 2>/dev/null
+check "" "$(fetchlog)" "no binary: not this function's job"
 
 [ "$fail" = 0 ] && echo "all checks passed" || echo "FAILURES" >&2
 exit "$fail"
