@@ -289,6 +289,7 @@ func (s *Store) recover(now time.Time) error {
 				continue
 			}
 			c.acked = cs.Acked
+			c.identity = cs.Identity
 			if cs.ClaimN > 0 {
 				c.claim = &claim{seq: cs.ClaimSeq, from: cs.ClaimFrom, to: cs.ClaimTo, n: cs.ClaimN}
 			}
@@ -692,7 +693,7 @@ func (s *Store) stateLocked() walState {
 		Cursors: make(map[string]cursorState, len(s.cursors)),
 	}
 	for name, c := range s.cursors {
-		cs := cursorState{Acked: c.acked}
+		cs := cursorState{Acked: c.acked, Identity: c.identity}
 		if cl := c.claim; cl != nil {
 			cs.ClaimSeq, cs.ClaimFrom, cs.ClaimTo, cs.ClaimN = cl.seq, cl.from, cl.to, cl.n
 		}
@@ -1013,6 +1014,87 @@ func (s *Store) dropClaimedLocked(server string, cl *claim) bool {
 		s.mem = kept
 	}
 	return touchedDisk
+}
+
+// BindIdentity states the enrolled identity (the server-assigned agent_id) one
+// server's session is about to run under, and returns how many queued samples
+// were discarded because they belong to a different one (>0 is a data gap the
+// caller should surface).
+//
+// Same contract and the same reasoning as the default build's BindIdentity —
+// read that one for why a re-enrollment must discard the backlog, why the
+// records cannot simply be handed over under the old id, and why a "tag and
+// skip" would pin segments forever. Only the writing differs, and in the
+// direction this build always differs: the identity is kept in memory and rides
+// out with the next state file the store was going to write anyway (every spill
+// and every durable claim renders it), so binding an identity on a router that
+// has never been disconnected still costs no erase cycle. A discard that
+// actually removed durable groups DOES write, because it has just invalidated
+// what is on the flash and the sweep behind it is what gives those bytes back.
+func (s *Store) BindIdentity(server, agentID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return 0, fmt.Errorf("wal: bind identity for unknown server %q", server)
+	}
+	if agentID == "" || c.identity == agentID {
+		return 0, nil
+	}
+	prev := c.identity
+	c.identity = agentID
+	if prev == "" {
+		// Nothing was ever collected under a different identity, so the backlog
+		// is this identity's own: a first enrollment, or a server just added to
+		// the configuration.
+		return 0, nil
+	}
+
+	dropped, touchedDisk := s.discardServerLocked(server, c)
+	log.Printf("wal: %q re-enrolled as %s (was %s); discarded %d queued samples collected under the old identity (data gap)",
+		server, agentID, prev, dropped)
+	if !touchedDisk {
+		return dropped, nil
+	}
+	if err := s.saveStateLocked(); err != nil {
+		return dropped, err
+	}
+	s.gcLocked()
+	return dropped, nil
+}
+
+// discardServerLocked drops everything one server owns from both tiers, releases
+// its claim and moves its cursor past every group handed out so far. It returns
+// the number of sample rows discarded and whether any of them were durable — the
+// latter being what decides whether the flash has to be written. Caller holds mu.
+func (s *Store) discardServerLocked(server string, c *cursor) (int, bool) {
+	dropped, touchedDisk := 0, false
+	kept := make([]diskGroup, 0, len(s.disk))
+	for _, g := range s.disk {
+		if g.owner == server {
+			dropped += g.n
+			touchedDisk = true
+			continue
+		}
+		kept = append(kept, g)
+	}
+	s.disk = kept
+
+	buf := make([]memGroup, 0, len(s.mem))
+	for _, g := range s.mem {
+		if g.owner == server {
+			dropped += g.n
+			s.memRows -= g.n
+			continue
+		}
+		buf = append(buf, g)
+	}
+	s.mem = buf
+
+	c.claim = nil
+	c.acked = s.nextGid - 1
+	return dropped, touchedDisk
 }
 
 // FastForward raises the next-sequence allocator to at least watermark+1 so the

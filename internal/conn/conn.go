@@ -303,6 +303,32 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		appliedConfigVersion: -1,
 		appliedGameVersion:   -1,
 	}
+	// Tell the outbox which enrolled identity this session runs under, before
+	// anything can be claimed from it.
+	//
+	// Run is re-entered with a fresh AgentID whenever a revoked agent re-enrolls,
+	// and without a console-issued reinstall token that enrollment mints a
+	// BRAND-NEW agent. The backlog is grouped by server NAME, which survives the
+	// exchange, so the first packet of this session would otherwise carry records
+	// the old agent collected — and the server files every packet under the
+	// identity it authenticated, putting the old agent's metrics, events,
+	// traceroutes and incident scenes on the new agent's timeline. The store
+	// discards them instead; see wal.Store.BindIdentity for why discard rather
+	// than a handover under the old id.
+	//
+	// It happens here, and not in the enrollment loop that calls Run, because
+	// this is the goroutine that owns this server's cursor — every NextBatch and
+	// Ack runs on it — and no session has started yet, so the discard cannot race
+	// the drain it exists to protect. The store logs the resulting gap itself,
+	// naming both identities, so only the failure is reported here.
+	if _, err := deps.Outbox.BindIdentity(opts.ServerName, opts.AgentID); err != nil {
+		// Never fatal. Either this store has no cursor for the server (a wiring
+		// bug the first drain reports too), or only the durable record of the
+		// discard failed to land — the discard itself already stands in memory,
+		// so nothing stale can go out on this session, and the next Open reaches
+		// the same verdict from the identity stored beside the backlog.
+		r.logf("bind outbox identity %s: %v", opts.AgentID, err)
+	}
 	// Resume monitoring before the first dial. Everything downstream of the
 	// collectors already survives an unreachable server; the target list was the
 	// one thing that did not, which is why a router rebooted mid-outage used to
