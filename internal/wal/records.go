@@ -274,6 +274,10 @@ type cursor struct {
 // by value into the batch's own arrays, so the shift lands on the copy and the
 // stored timestamps are never touched. A re-served claim re-reads pristine
 // stamps and re-derives the same result from its frozen revision.
+//
+// "By value" stops at the first slice a record contains, which is why the one
+// corrected field that lives behind one — a scene's Triggers — is copied
+// explicitly before it is shifted (see shiftedTriggers).
 func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 	b := Batch{Sequence: seq}
 	for i, r := range recs {
@@ -283,6 +287,7 @@ func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 		}
 		mStart, eStart := len(b.Metrics), len(b.Events)
 		iStart, sStart := len(b.Inventory), len(b.Snapshots)
+		tStart, cStart := len(b.TraceResults), len(b.SceneReports)
 		b.Metrics = append(b.Metrics, r.Metrics...)
 		b.Events = append(b.Events, r.Events...)
 		b.Inventory = append(b.Inventory, r.Inventory...)
@@ -296,19 +301,42 @@ func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 		if d == 0 {
 			continue
 		}
-		// Only the payloads whose timestamps all belong to ONE collection cycle
-		// are corrected, because the group carries one monotonic reading — taken
-		// when it was appended, which is the end of that cycle. That reading
-		// describes a probe round or a tier sweep, both of which are stamped
-		// seconds before it.
+		// A group carries ONE monotonic reading, taken when it was appended, so the
+		// offset derived from it describes the clock at the END of the collection
+		// cycle that filled the group. Which stamps that single offset may be
+		// applied to is decided per payload, on two questions: does the stamp name
+		// one instant, and is it ever read against the SERVER's clock?
 		//
-		// It does NOT describe a game run spanning minutes of play, or a
-		// traceroute carrying a start, a completion and a per-hop time. A clock
-		// step landing inside one of those would correct part of it and not the
-		// rest, which is worse than leaving it alone: a run whose end precedes its
-		// start is a corrupt record, while one stamped consistently early is
-		// merely early. Those payloads are therefore left as collected, and the
-		// residual is stated in clockmon's package comment.
+		// Corrected are the per-cycle stamps — a probe round, a tier sweep, both
+		// taken seconds before the append — and the TRIGGER instants of the
+		// self-describing reports: a traceroute's FirstFailedAt and a scene
+		// trigger's FirstFailedAt/DisconnectedAt. Each of those names a single
+		// moment, so shifting it cannot contradict a second stamp inside the same
+		// record, and each is a join key: server-core matches it against
+		// fault_signals.observed_at with two minutes of slack
+		// (incidentops.attachSlack), so a report from an agent wronger than that
+		// stores fine and can never be claimed by its own incident — evidence
+		// nobody will ever see. A trigger can predate its group's append by
+		// minutes (a scene waits out a collection cooldown; disconnect edges merge
+		// across a flap), so a step observed in between is not folded in and the
+		// shift is a lower bound on the true error — still strictly closer to the
+		// truth than not moving it at all.
+		//
+		// NOT corrected is anything that SPANS: a game run covering minutes of
+		// play, a trace's start, completion and per-hop times across a sweep. The
+		// group's one reading describes the end of the cycle, not the inside of a
+		// span, so a clock step landing within one would move part of it and not
+		// the rest — and a run whose end precedes its start is a corrupt record,
+		// while one stamped consistently early is merely early.
+		//
+		// Nor is a scene's CollectedAt, which is a single instant but is not read
+		// against the server's clock: the server stores it AS the agent's clock and
+		// derives delivery lag and its clock-ahead flag from the distance to its
+		// own receipt time. Correcting it would erase the only record of what the
+		// agent thought the time was, which is the one thing that reading exists
+		// for. The price is that on a badly-set clock a corrected trigger can land
+		// after an uncorrected CollectedAt in the same report; nothing joins the
+		// two, and the residual is stated in clockmon's package comment.
 		for j := mStart; j < len(b.Metrics); j++ {
 			b.Metrics[j].TS = b.Metrics[j].TS.Add(d)
 		}
@@ -316,15 +344,53 @@ func flatten(seq uint64, recs []Records, offsets []time.Duration) Batch {
 			b.Events[j].TS = b.Events[j].TS.Add(d)
 		}
 		for j := iStart; j < len(b.Inventory); j++ {
-			if !b.Inventory[j].LastSeen.IsZero() {
-				b.Inventory[j].LastSeen = b.Inventory[j].LastSeen.Add(d)
-			}
+			b.Inventory[j].LastSeen = shifted(b.Inventory[j].LastSeen, d)
 		}
 		for j := sStart; j < len(b.Snapshots); j++ {
 			b.Snapshots[j].SampledAt = b.Snapshots[j].SampledAt.Add(d)
 		}
+		for j := tStart; j < len(b.TraceResults); j++ {
+			b.TraceResults[j].FirstFailedAt = shifted(b.TraceResults[j].FirstFailedAt, d)
+		}
+		for j := cStart; j < len(b.SceneReports); j++ {
+			b.SceneReports[j].Triggers = shiftedTriggers(b.SceneReports[j].Triggers, d)
+		}
 	}
 	return b
+}
+
+// shifted moves a stamp by the correction, leaving a zero one zero. A zero time
+// means "this field was not reported", not "the epoch", and the distinction is
+// load-bearing on a scene trigger: exactly one of FirstFailedAt/DisconnectedAt
+// is filled per trigger kind, and server-side an edge of zero deliberately owns
+// no outage. Shifting one would invent a placeable timestamp two thousand years
+// out of date.
+func shifted(t time.Time, d time.Duration) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	return t.Add(d)
+}
+
+// shiftedTriggers returns a scene's triggers with the correction applied to both
+// trigger instants.
+//
+// It COPIES the slice rather than shifting in place, which is what keeps the
+// correction redoable. Appending a SceneReport into the batch copies the struct
+// but not the array its Triggers header points at, so an in-place shift would
+// land on the stored record — and a claim re-served after a session drop would
+// move the same stamps a second time, under a sequence the server dedups on.
+func shiftedTriggers(in []telemetry.SceneTrigger, d time.Duration) []telemetry.SceneTrigger {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]telemetry.SceneTrigger, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].FirstFailedAt = shifted(out[i].FirstFailedAt, d)
+		out[i].DisconnectedAt = shifted(out[i].DisconnectedAt, d)
+	}
+	return out
 }
 
 // rowsOf counts the sample rows one Records would occupy.
