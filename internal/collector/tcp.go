@@ -563,6 +563,12 @@ func (c *TCPCollector) probe(ctx context.Context, t pcfg.ProbeTarget, gateDeadli
 				defer c.gate.Release()
 			} else {
 				tlsAdmitted = false
+				// TLS is part of this monitor's verdict; skipping the handshake
+				// under gate contention must NOT read as healthy (overallOK would
+				// be true with tlsErr nil). The cycle reports no availability
+				// verdict at all — the same "no measurement" a fan-out that never
+				// bound a port gets — never a fabricated ok.
+				noMeasurement = true
 			}
 		}
 		if tlsAdmitted {
