@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +52,8 @@ type HTTPCollector struct {
 	// the egress path the operator just replaced.
 	mu      sync.Mutex
 	clients map[string]*http.Client
+
+	flowHistory *flowHistory
 }
 
 func NewHTTPCollector(guard *netguard.Guard, proxies *proxydial.Manager, allowExtended bool, gate *ProbeGate) *HTTPCollector {
@@ -59,6 +63,7 @@ func NewHTTPCollector(guard *netguard.Guard, proxies *proxydial.Manager, allowEx
 		proxies:       proxies,
 		allowExtended: allowExtended,
 		clients:       map[string]*http.Client{},
+		flowHistory:   newFlowHistory(),
 	}
 }
 
@@ -264,7 +269,12 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 		// failure would replay from the WAL as a false service outage.
 		return Result{}, nil
 	}
-	defer c.gate.Release()
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			c.gate.Release()
+		}
+	}()
 	// A run aborted by cancellation (agent shutdown) must not fabricate request
 	// failures — they would replay from the WAL as a false service outage on the
 	// next start.
@@ -289,6 +299,12 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 		method := t.Params.Method
 		if method == "" {
 			method = http.MethodGet
+		}
+		if t.Params.FlowFanout >= 2 && proxy == nil && (method == http.MethodGet || method == http.MethodHead) {
+			return c.runFanout(ctx, t, now, timeout, func() {
+				c.gate.Release()
+				gateHeld = false
+			}), nil
 		}
 
 		var bodyReader io.Reader
@@ -427,6 +443,266 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 		)
 	}
 	return res, nil
+}
+
+type httpFanoutBranch struct {
+	attempted bool
+	bad       bool
+	status    int
+	latencyMs float64
+	reason    int
+	detail    string
+	blocked   *netguard.BlockedError
+}
+
+// runFanout executes a complete HTTP check on each deterministic source port.
+// Redirects are intentionally not followed: every branch must describe the same
+// original destination and five-tuple, while a redirect is a different target.
+func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now time.Time, timeout time.Duration, releaseOuter func()) Result {
+	u, err := url.Parse(t.Target)
+	if err != nil || u.Hostname() == "" {
+		return Result{}
+	}
+	host := u.Hostname()
+	port := 80
+	if u.Scheme == "https" {
+		port = 443
+	}
+	if u.Port() != "" {
+		port, err = strconv.Atoi(u.Port())
+		if err != nil {
+			return Result{}
+		}
+	}
+
+	cycleCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dst := host
+	if a, parseErr := netip.ParseAddr(host); parseErr == nil {
+		dst = a.Unmap().String()
+		if dec := c.guard.CheckAddr(a.Unmap()); !dec.Allowed {
+			return Result{Blocked: []BlockedProbe{{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: dec.Matched, Reason: "literal_denied"}}}
+		}
+	} else {
+		hd := c.guard.CheckHost(host)
+		if hd.Denied {
+			return Result{Blocked: []BlockedProbe{{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: hd.Matched, Reason: "resolved_denied"}}}
+		}
+		vetted, resolveErr := c.guard.ResolveVetted(cycleCtx, host, hd.NameAuthorized)
+		if resolveErr != nil {
+			var be *netguard.BlockedError
+			if errors.As(resolveErr, &be) {
+				return Result{Blocked: []BlockedProbe{blockedFromErr(t, be)}}
+			}
+			if ctx.Err() != nil {
+				return Result{}
+			}
+			reason := classifyNetError(resolveErr)
+			if reason == telemetry.ProbeReasonOther {
+				reason = telemetry.ProbeReasonDNS
+			}
+			// Resolution failed before any branch had a destination or source port,
+			// so this is an HTTP availability failure but not a fan-out sample. Code 4
+			// is reserved for a cycle that entered the branch phase yet produced fewer
+			// than two attempted branches (for example, local binds all failed).
+			return httpFanoutFailureResult(now, t, reason, errText(resolveErr), "HTTP DNS resolution failed: "+t.Target)
+		}
+		dst = vetted[0].String()
+	}
+
+	// The target-level admission slot protected resolution. Branches account for
+	// themselves, so release it before starting N concurrent socket operations.
+	releaseOuter()
+	n := t.Params.FlowFanout
+	ports := flowPorts(dst, port, t.MonitorID, t.ConfigSerial, n)
+	out := make([]httpFanoutBranch, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		if cycleCtx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			fctx, fcancel := context.WithTimeout(cycleCtx, timeout)
+			defer fcancel()
+			dl, _ := fctx.Deadline()
+			if c.gate.Acquire(fctx, dl) != AdmittedOK {
+				return
+			}
+			defer c.gate.Release()
+			out[i] = c.httpFanoutRequest(fctx, t, dst, host, port, ports[i])
+		}(i)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return Result{}
+	}
+	for i := range out {
+		if out[i].blocked != nil {
+			return Result{Blocked: []BlockedProbe{blockedFromErr(t, out[i].blocked)}}
+		}
+	}
+
+	attempted := make([]bool, n)
+	bad := make([]bool, n)
+	firstBad := -1
+	firstResponseStatus := 0
+	responseCount := 0
+	latencySum := 0.0
+	for i, branch := range out {
+		attempted[i] = branch.attempted
+		bad[i] = branch.bad
+		if !branch.attempted {
+			continue
+		}
+		if branch.bad && firstBad < 0 {
+			firstBad = i
+		}
+		if branch.status > 0 {
+			if firstResponseStatus == 0 {
+				firstResponseStatus = branch.status
+			}
+			responseCount++
+			latencySum += branch.latencyMs
+		}
+	}
+	code, flows, badStable, badNew, okCount := c.flowHistory.outcome(t.MonitorID, t.ConfigSerial, attempted, bad)
+	labels := map[string]string{
+		telemetry.FlowFanoutFlowsLabel:     strconv.Itoa(flows),
+		telemetry.FlowFanoutBadStableLabel: strconv.Itoa(badStable),
+		telemetry.FlowFanoutBadNewLabel:    strconv.Itoa(badNew),
+		telemetry.FlowFanoutOKLabel:        strconv.Itoa(okCount),
+	}
+	ff := telemetry.Metric{TS: now, Kind: telemetry.HTTPFlowFanout, Target: t.Target, Layer: telemetry.LayerService,
+		Value: float64(code), Unit: telemetry.UnitCode, Labels: labels, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial}
+	if flows == 0 {
+		return Result{Metrics: []telemetry.Metric{ff}}
+	}
+
+	ok := firstBad < 0
+	okValue := 0.0
+	reason := telemetry.ProbeReasonNone
+	detail := ""
+	if ok {
+		okValue = 1
+	} else {
+		reason = out[firstBad].reason
+		detail = out[firstBad].detail
+	}
+	representativeStatus := firstResponseStatus
+	if firstBad >= 0 && out[firstBad].status > 0 {
+		representativeStatus = out[firstBad].status
+	}
+	ec := telemetry.Metric{TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService,
+		Value: float64(reason), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial}
+	if reason != telemetry.ProbeReasonNone {
+		ec.Labels = withDetail(nil, detail)
+	}
+	res := Result{Metrics: []telemetry.Metric{
+		{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: okValue, Unit: telemetry.UnitBool, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+		ec,
+		ff,
+	}}
+	if representativeStatus > 0 {
+		res.Metrics = append(res.Metrics,
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(representativeStatus), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: latencySum / float64(responseCount), Unit: telemetry.UnitMs, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+		)
+	}
+	if !ok {
+		res.Events = append(res.Events, telemetry.Event{ID: newID(), TS: now, Type: telemetry.EventProbeFailed,
+			Layer: telemetry.LayerService, Severity: telemetry.SeverityWarn, Message: "HTTP fan-out request failed: " + t.Target})
+	}
+	return res
+}
+
+func (c *HTTPCollector) httpFanoutRequest(ctx context.Context, t pcfg.ProbeTarget, dst, host string, port, sourcePort int) httpFanoutBranch {
+	tr := &http.Transport{
+		Proxy:               nil,
+		DisableKeepAlives:   true,
+		ForceAttemptHTTP2:   false,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			return c.guard.DialSourcePort(dialCtx, network, net.JoinHostPort(dst, strconv.Itoa(port)), sourcePort, host)
+		},
+	}
+	if t.Params.IgnoreTLS {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit monitor setting
+	}
+	client := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer tr.CloseIdleConnections()
+	method := t.Params.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var body io.Reader
+	if t.Params.Body != "" {
+		body = strings.NewReader(t.Params.Body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, t.Target, body)
+	if err != nil {
+		return httpFanoutBranch{}
+	}
+	req.Close = true
+	for k, v := range t.Params.Headers {
+		if strings.EqualFold(k, "Host") {
+			req.Host = v
+		} else {
+			req.Header.Set(k, v)
+		}
+	}
+	t0 := time.Now()
+	resp, err := client.Do(req)
+	latency := msSince(t0)
+	if err != nil {
+		var be *netguard.BlockedError
+		if errors.As(err, &be) {
+			return httpFanoutBranch{blocked: be}
+		}
+		if isAddrInUse(err) {
+			return httpFanoutBranch{}
+		}
+		return httpFanoutBranch{attempted: true, bad: true, reason: classifyNetError(err), detail: errText(err)}
+	}
+	defer resp.Body.Close()
+	bodyMatch := true
+	var bodyErr error
+	if t.Params.Keyword != "" {
+		limit := t.Params.MaxResponseBytes
+		if limit <= 0 {
+			limit = defaultMaxResponseBytes
+		}
+		buf, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(limit)))
+		bodyErr = readErr
+		bodyMatch = strings.Contains(string(buf), t.Params.Keyword) != t.Params.KeywordInvert
+	}
+	statusOK := statusAccepted(resp.StatusCode, t.Params.AcceptedStatuses)
+	b := httpFanoutBranch{attempted: true, status: resp.StatusCode, latencyMs: latency}
+	switch {
+	case !statusOK:
+		b.bad, b.reason, b.detail = true, telemetry.ProbeReasonHTTPStatus, "HTTP "+strconv.Itoa(resp.StatusCode)
+	case !bodyMatch && bodyErr != nil:
+		b.bad, b.reason, b.detail = true, classifyNetError(bodyErr), errText(bodyErr)
+	case !bodyMatch:
+		b.bad, b.reason = true, telemetry.ProbeReasonHTTPKeyword
+		if t.Params.KeywordInvert {
+			b.detail = "keyword " + strconv.Quote(t.Params.Keyword) + " unexpectedly present"
+		} else {
+			b.detail = "keyword " + strconv.Quote(t.Params.Keyword) + " not found"
+		}
+	}
+	return b
+}
+
+func httpFanoutFailureResult(now time.Time, t pcfg.ProbeTarget, reason int, detail, message string) Result {
+	return Result{
+		Metrics: []telemetry.Metric{
+			{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: 0, Unit: telemetry.UnitBool, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+			{TS: now, Kind: telemetry.HTTPErrorClass, Target: t.Target, Layer: telemetry.LayerService, Value: float64(reason), Unit: telemetry.UnitCode, Labels: withDetail(nil, detail), MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
+		},
+		Events: []telemetry.Event{{ID: newID(), TS: now, Type: telemetry.EventProbeFailed, Layer: telemetry.LayerService, Severity: telemetry.SeverityWarn, Message: message}},
+	}
 }
 
 // httpParamsNeedExtended mirrors permission.RequiredForTarget's HTTP rule: a

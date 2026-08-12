@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
-	"hash/fnv"
 	"net"
 	"net/netip"
 	"strconv"
@@ -26,23 +24,7 @@ type TCPCollector struct {
 	guard   *netguard.Guard
 	proxies *proxydial.Manager
 	*probeRunner
-	// flowPrev keeps each monitor's previous fan-out cycle's per-flow failure
-	// flags, keyed by monitorID, so a deterministic bad subset (bad_stable) is
-	// distinguishable from a flapping one (bad_new) across consecutive cycles —
-	// the reproducibility that pinned source ports exist to create. The config
-	// serial the history was measured under travels with it: a material config
-	// edit re-derives the flow ports (the serial is in the seed), so the new set
-	// starts a fresh history rather than being compared against a different port
-	// set. Cycles run on separate goroutines, hence the mutex.
-	flowPrev   map[string]flowPrevState
-	flowPrevMu sync.Mutex
-}
-
-// flowPrevState is one monitor's previous fan-out cycle: the per-flow failure
-// flags in flow-plan order, and the config serial that cycle ran under.
-type flowPrevState struct {
-	serial int
-	bad    []bool
+	flowHistory *flowHistory
 }
 
 // NewTCPCollector builds the collector. gate is the machine-wide probe budget —
@@ -50,7 +32,7 @@ type flowPrevState struct {
 func NewTCPCollector(guard *netguard.Guard, proxies *proxydial.Manager, gate *ProbeGate) *TCPCollector {
 	return &TCPCollector{
 		guard: guard, proxies: proxies,
-		flowPrev: map[string]flowPrevState{},
+		flowHistory: newFlowHistory(),
 		probeRunner: newProbeRunner(pcfg.DefaultTCPInterval, gate),
 	}
 }
@@ -99,86 +81,6 @@ func tcpTimeout(p pcfg.ProbeParams) time.Duration {
 		return time.Duration(p.TimeoutMs) * time.Millisecond
 	}
 	return pcfg.DefaultTCPTimeout
-}
-
-// flowPorts derives a fan-out cycle's source ports: base..base+n-1 where base is
-// deterministic in the target, so the same flow set repeats every cycle. That
-// stability is what makes a bad subset reproducible — ECMP/LAG hashing keys on
-// the full five-tuple, so the same source port hits the same member every time,
-// and a bad member shows up as the same flows failing cycle after cycle. The
-// config serial is in the seed, so a material config edit (even one that leaves
-// the target and port untouched) starts a fresh, unrelated port set.
-func flowPorts(targetIP string, port int, monitorID string, configSerial, n int) []int {
-	h := fnv.New32a()
-	h.Write([]byte(fmt.Sprintf("%s:%d:%s:%d", targetIP, port, monitorID, configSerial)))
-	base := 10000 + int(h.Sum32()%22000)
-	out := make([]int, n)
-	for i := range out {
-		out[i] = base + i
-	}
-	return out
-}
-
-// classifyFlowFanout classifies one fan-out cycle's per-flow outcomes into the
-// probe.tcp.flow_fanout code. Codes:
-//
-//	4 = insufficient — fewer than two flows ran (could not bind enough source
-//	    ports, or the cycle's budget cut it short)
-//	3 = all flows failed — target unreachable, not merely degraded
-//	2 = member-level — a deterministic bad subset (bad_stable>0) while some flows
-//	    stay clean: the ECMP/LAG member fault the fan-out exists to find
-//	1 = uniform — no deterministic bad subset (all clean, or failures flapping
-//	    across flows)
-//
-// bad_stable / bad_new come from the one-cycle history flowOutcome keeps; this
-// function only folds the counts.
-func classifyFlowFanout(flows, badStable, badNew int) int {
-	switch {
-	case flows < 2:
-		return 4
-	case badStable == flows && badNew == 0:
-		return 3
-	case badStable > 0 && badStable+badNew < flows:
-		return 2
-	default:
-		return 1
-	}
-}
-
-// flowOutcome folds one cycle's per-flow outcomes into the flow_fanout facts and
-// advances the monitor's history. attempted[i] reports that flow i actually bound
-// a source port and dialed; bad[i] that the dial failed. It returns the
-// classification code plus the label counts (flows / bad_stable / bad_new / ok)
-// per the contract in protocol/telemetry. A flow that did not run this cycle
-// carries no verdict, so it is absent from every count; the ok count therefore
-// also rises when a flow was clean this cycle and was not measured (or was clean)
-// last cycle.
-func (c *TCPCollector) flowOutcome(monitorID string, configSerial int, attempted, bad []bool) (code, flows, badStable, badNew, okCount int) {
-	c.flowPrevMu.Lock()
-	defer c.flowPrevMu.Unlock()
-	prev, have := c.flowPrev[monitorID]
-	if !have || prev.serial != configSerial {
-		prev = flowPrevState{}
-	}
-	next := make([]bool, len(attempted))
-	for i := range attempted {
-		if !attempted[i] {
-			continue
-		}
-		flows++
-		prevBad := i < len(prev.bad) && prev.bad[i]
-		next[i] = bad[i]
-		switch {
-		case bad[i] && prevBad:
-			badStable++
-		case bad[i]:
-			badNew++
-		case !prevBad:
-			okCount++
-		}
-	}
-	c.flowPrev[monitorID] = flowPrevState{serial: configSerial, bad: next}
-	return classifyFlowFanout(flows, badStable, badNew), flows, badStable, badNew, okCount
 }
 
 // probe runs one TCP cycle: it times DNS resolution, the pure TCP connect, and
@@ -493,7 +395,7 @@ func (c *TCPCollector) probe(ctx context.Context, t pcfg.ProbeTarget, gateDeadli
 		case firstBadIdx >= 0:
 			errClass, detail = firstBad, firstDetail
 		}
-		code, flowsN, badStable, badNew, okN := c.flowOutcome(t.MonitorID, t.ConfigSerial, attempted, bad)
+		code, flowsN, badStable, badNew, okN := c.flowHistory.outcome(t.MonitorID, t.ConfigSerial, attempted, bad)
 		fanoutCode = code
 		fanoutLabels = make(map[string]string, len(labels)+4)
 		for k, v := range labels {
