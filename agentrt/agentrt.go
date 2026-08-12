@@ -29,12 +29,12 @@ import (
 	"github.com/google/uuid"
 	pshost "github.com/shirou/gopsutil/v3/host"
 
+	"github.com/nettact/agent/internal/clockmon"
 	"github.com/nettact/agent/internal/collector"
 	"github.com/nettact/agent/internal/conn"
+	"github.com/nettact/agent/internal/desiredstate"
 	"github.com/nettact/agent/internal/enroll"
 	"github.com/nettact/agent/internal/gamesense"
-	"github.com/nettact/agent/internal/clockmon"
-	"github.com/nettact/agent/internal/desiredstate"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/netguard"
 	"github.com/nettact/agent/internal/platform"
@@ -939,20 +939,23 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 		// rewrite what the old one saw.
 		rt.scene.SetAgentID(agentID)
 		err := conn.Run(ctx, conn.Options{
-			ServerName: rt.cfg.Name,
-			ServerURL:  rt.cfg.URL,
-			Token:      cred.AgentToken,
-			Insecure:   rt.cfg.Insecure,
-			Format:     env.subprotocol,
-			Dialer:     rt.cfg.Dialer,
-			AgentID:    cred.AgentID,
-			SiteID:     cred.SiteID,
+			ServerName:      rt.cfg.Name,
+			ServerURL:       rt.cfg.URL,
+			Token:           cred.AgentToken,
+			Insecure:        rt.cfg.Insecure,
+			Format:          env.subprotocol,
+			Dialer:          rt.cfg.Dialer,
+			AgentID:         cred.AgentID,
+			SiteID:          cred.SiteID,
+			EnrollmentEpoch: cred.EnrollmentEpoch,
 			Hello: wire.Hello{
-				SchemaVersion: protocol.SchemaVersion,
-				Hostname:      env.hostname,
-				Platform:      env.platformID,
-				AgentVersion:  Version,
-				Permissions:   rt.report,
+				SchemaVersion:   protocol.SchemaVersion,
+				Hostname:        env.hostname,
+				Platform:        env.platformID,
+				AgentVersion:    Version,
+				Permissions:     rt.report,
+				Capabilities:    []string{wire.CapSequenceFloorV1},
+				EnrollmentEpoch: cred.EnrollmentEpoch,
 			},
 			OnAuthRejected: func() bool {
 				// Escalate only when a configured INLINE token is not the one this
@@ -1028,7 +1031,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 					s.LastError = &statusError{Code: string(reason), Detail: err.Error()}
 				})
 			},
-		}, rt.connDeps(cred, env.cfg.DataDir))
+		}, rt.connDeps(cred, env.cfg.DataDir, env.key))
 
 		// Run returned, so this session ended in a way that never reached the retry
 		// hook — shutdown, or one of the terminal close codes. Spend the disconnect
@@ -1131,6 +1134,10 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		SiteID:            resp.SiteID,
 		AgentToken:        resp.AgentToken,
 		ConsumedTokenHash: hex.EncodeToString(sum[:]),
+		// The server-generated credential generation: persisted with the
+		// credential so the Hello, the floor barrier and a later rotation all
+		// agree on which epoch this identity is on.
+		EnrollmentEpoch: resp.EnrollmentEpoch,
 	}
 	// The one-time token is spent the moment the exchange returned — the server
 	// consumes it in the same transaction that issued the response — so this is

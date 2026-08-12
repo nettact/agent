@@ -290,6 +290,7 @@ func (s *Store) recover(now time.Time) error {
 			}
 			c.acked = cs.Acked
 			c.identity = cs.Identity
+			c.epoch = cs.Epoch
 			if cs.ClaimN > 0 {
 				c.claim = &claim{seq: cs.ClaimSeq, from: cs.ClaimFrom, to: cs.ClaimTo, n: cs.ClaimN}
 			}
@@ -693,7 +694,7 @@ func (s *Store) stateLocked() walState {
 		Cursors: make(map[string]cursorState, len(s.cursors)),
 	}
 	for name, c := range s.cursors {
-		cs := cursorState{Acked: c.acked, Identity: c.identity}
+		cs := cursorState{Acked: c.acked, Identity: c.identity, Epoch: c.epoch}
 		if cl := c.claim; cl != nil {
 			cs.ClaimSeq, cs.ClaimFrom, cs.ClaimTo, cs.ClaimN = cl.seq, cl.from, cl.to, cl.n
 		}
@@ -1128,6 +1129,79 @@ func (s *Store) FastForward(watermark uint64) error {
 		s.seqNext = target
 	}
 	return nil
+}
+
+// SetEpoch moves one server's cursor to a new enrollment epoch (credential
+// generation). Semantics and reasoning are the default build's — read that one
+// for why the data is re-queued rather than discarded, and why the in-flight
+// claim is abandoned instead of renumbered. Only the writing differs, in the
+// direction this build always differs: with Persist enabled the epoch rides
+// out with the state file like the identity does, and without it the move is
+// memory-only, exactly like everything else in the non-persist store.
+func (s *Store) SetEpoch(server string, epoch uint64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return 0, fmt.Errorf("wal: set epoch for unknown server %q", server)
+	}
+	if c.epoch == epoch {
+		return 0, nil
+	}
+	c.epoch = epoch
+	c.acked = 0
+	c.claim = nil
+	requeued := pendingRowsLocked(server, s.disk, s.mem)
+	if !s.persist {
+		return requeued, nil
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return requeued, err
+	}
+	return requeued, s.saveStateLocked()
+}
+
+// ApplyFloor raises the allocator past the server's floor for one cursor's
+// epoch and reports whether an in-flight claim sits at or below that floor —
+// the one case where the claim must never be re-served under its sequence.
+// The epoch mismatch is an error for the same reason as the default build's.
+//
+// The floor raise itself is memory-only, like every FastForward on this
+// build: conn calls FastForward on EVERY ack, and a write there would put an
+// erase cycle on the healthy path — the one thing this store is built not to
+// do. But the floor barrier is a once-per-session event that the server is
+// about to trust for the rest of this agent's life, so it is the ONE place
+// the floor is made durable: with Persist enabled the allocator position
+// (floor+1, which is what stateLocked renders) is written to flash here, and
+// a reboot resumes above the floor instead of re-serving sequences the server
+// has accepted. Without Persist the whole store is memory-only anyway and
+// there is nothing to write to.
+func (s *Store) ApplyFloor(server string, epoch uint64, floor uint64) (conflict bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return false, fmt.Errorf("wal: apply floor for unknown server %q", server)
+	}
+	if c.epoch != epoch {
+		return false, fmt.Errorf("wal: floor for epoch %d does not match cursor epoch %d of %q", epoch, c.epoch, server)
+	}
+	conflict = c.claim != nil && c.claim.seq <= floor
+	if floor == math.MaxUint64 {
+		return false, fmt.Errorf("wal: floor %d at uint64 max; no successor sequence", floor)
+	}
+	if floor+1 > s.seqNext {
+		s.seqNext = floor + 1
+	}
+	if !s.persist {
+		return conflict, nil
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return conflict, err
+	}
+	return conflict, s.saveStateLocked()
 }
 
 // Pending returns the number of samples one server has not yet acknowledged,

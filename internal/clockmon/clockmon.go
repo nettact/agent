@@ -269,6 +269,27 @@ func (m *Monitor) OffsetAt(epoch string, mono int64, rev int) time.Duration {
 	return off
 }
 
+// ServerNow is this machine's best estimate of the server's current time: the
+// wall clock plus the standing offset model. conn uses it to judge
+// server-stated deadlines — the epoch-rotation challenge's ExpiresAt — against
+// the server's own clock, because on the devices this agent runs on the wall
+// clock is the thing most likely to be wrong and a challenge that looks
+// expired or unexpired by it would be misjudged. With no recorded error it is
+// just the wall clock.
+func (m *Monitor) ServerNow() time.Time {
+	if m == nil {
+		return time.Now()
+	}
+	m.mu.Lock()
+	cur := m.curErrLocked()
+	wall := m.wall
+	m.mu.Unlock()
+	if wall == nil {
+		wall = func() time.Time { return time.Now() }
+	}
+	return wall().Add(cur)
+}
+
 // Run samples the two clocks until ctx ends. One goroutine per process.
 func (m *Monitor) Run(stop <-chan struct{}) {
 	t := time.NewTicker(sampleInterval)

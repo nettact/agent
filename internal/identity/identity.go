@@ -76,6 +76,19 @@ type Credential struct {
 	// has no such field), which merely reverts that credential to the legacy
 	// "unknown" classification — never a hard failure.
 	ConsumedTokenHash string `json:"consumed_token_hash,omitempty"`
+
+	// EnrollmentEpoch is the server-generated credential generation (schema 8):
+	// the counter the server bumps every time it rotates this agent's credential
+	// and sequence space. It rides the Hello on every connect, gates the WAL's
+	// sequence-floor barrier, and is re-persisted (with the new bearer token)
+	// when a rotation completes.
+	//
+	// It is additive to the v2 format for the same reason and with the same
+	// downgrade shape as ConsumedTokenHash: a credential written before schema 8
+	// reads as zero, which the wire protocol defines as "unknown epoch" — a
+	// schema-8 server then skips the floor barrier for that agent until its next
+	// enrollment or rotation, and nothing breaks.
+	EnrollmentEpoch uint64 `json:"enrollment_epoch,omitempty"`
 }
 
 // credentialFile is the on-disk shape of agent.json.

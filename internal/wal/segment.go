@@ -115,7 +115,14 @@ type cursorState struct {
 	//
 	// Omitted while empty, which is the honest encoding of "no session has bound
 	// one yet" (see cursor.identity) rather than a value that went missing.
-	Identity  string `json:"identity,omitempty"`
+	Identity string `json:"identity,omitempty"`
+	// Epoch is the enrollment epoch (credential generation) this server's
+	// sessions run under. The sequence space is scoped to it, so it is what the
+	// schema-8 floor barrier is validated against after a restart: a floor for
+	// any other epoch than the credential's own is refused. Additive — a state
+	// file written before schema 8 omits it and reads as zero, matching a
+	// zero-epoch (pre-schema-8) credential.
+	Epoch     uint64 `json:"epoch,omitempty"`
 	ClaimSeq  uint64 `json:"claim_seq,omitempty"`
 	ClaimFrom uint64 `json:"claim_from,omitempty"`
 	ClaimTo   uint64 `json:"claim_to,omitempty"`

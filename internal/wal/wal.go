@@ -148,6 +148,7 @@ func Open(dir string, servers []string, opt Options) (*Store, error) {
 			}
 			c.acked = cs.Acked
 			c.identity = cs.Identity
+			c.epoch = cs.Epoch
 			if cs.ClaimN > 0 {
 				c.claim = &claim{seq: cs.ClaimSeq, from: cs.ClaimFrom, to: cs.ClaimTo, n: cs.ClaimN}
 			}
@@ -564,7 +565,7 @@ func (s *Store) stateWithLocked(claims map[string]*claim) walState {
 		Cursors: make(map[string]cursorState, len(s.cursors)),
 	}
 	for name, c := range s.cursors {
-		cs := cursorState{Acked: c.acked, Identity: c.identity}
+		cs := cursorState{Acked: c.acked, Identity: c.identity, Epoch: c.epoch}
 		if cl := claims[name]; cl != nil {
 			cs.ClaimSeq, cs.ClaimFrom, cs.ClaimTo, cs.ClaimN = cl.seq, cl.from, cl.to, cl.n
 		}
@@ -1033,13 +1034,20 @@ func (s *Store) discardServerLocked(server string, c *cursor) int {
 // explicit — a watermark at the uint64 max has no representable successor, so it
 // errors rather than wrapping next_seq back to zero.
 func (s *Store) FastForward(watermark uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fastForwardLocked(watermark)
+}
+
+// fastForwardLocked is FastForward with the lock already held. ApplyFloor goes
+// through it so that one epoch check, one conflict verdict and one allocator
+// raise happen under a single lock acquisition rather than three. Caller holds
+// mu.
+func (s *Store) fastForwardLocked(watermark uint64) error {
 	if watermark == math.MaxUint64 {
 		return fmt.Errorf("wal: watermark %d at uint64 max; no successor sequence", watermark)
 	}
 	target := watermark + 1
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// The live reservation has to be checked FIRST, and separately from the
 	// durable position. Reserving a block pushes the durable value a whole block
@@ -1066,6 +1074,83 @@ func (s *Store) FastForward(watermark uint64) error {
 	// A durable jump invalidates any reservation made below it.
 	s.seqNext, s.seqCeil = 0, 0
 	return nil
+}
+
+// SetEpoch moves one server's cursor to a new enrollment epoch (credential
+// generation), and returns how many sample rows the move re-queued for upload
+// (0 when the cursor was already on that epoch and nothing changes).
+//
+// The sequence space is scoped to the epoch: a packet's sequence is only
+// meaningful under the epoch its credential names, so when the credential
+// rotates — or a session-start reconcile finds the cursor behind the
+// credential after a crash — every sequence issued under the old epoch is
+// dead. But the DATA is not: the groups belong to the same agent and are
+// still owed to the server. The cursor therefore resets to "nothing ever
+// acked" (acked=0, so the whole backlog becomes pending again) and the
+// in-flight claim is abandoned outright — it may only ever be re-served under
+// its own sequence, and that sequence cannot be renumbered in place to belong
+// to the new epoch. Everything is re-claimed under FRESH sequences once the
+// server applies its floor for the new epoch (see ApplyFloor), which is the
+// schema-8 barrier that makes "fresh" mean "above everything the server has
+// durably accepted for this agent".
+//
+// A failed state write leaves the in-memory epoch change standing: the
+// caller's session still runs under the new epoch, and a restart re-runs the
+// reconcile from the credential, which is the durable truth the cursor must
+// follow anyway.
+func (s *Store) SetEpoch(server string, epoch uint64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return 0, fmt.Errorf("wal: set epoch for unknown server %q", server)
+	}
+	if c.epoch == epoch {
+		return 0, nil
+	}
+	c.epoch = epoch
+	c.acked = 0
+	c.claim = nil
+	requeued := pendingRowsLocked(server, s.disk, s.mem)
+	if err := s.saveStateLocked(); err != nil {
+		return requeued, err
+	}
+	return requeued, nil
+}
+
+// ApplyFloor durably fast-forwards the sequence allocator past the server's
+// floor for one cursor's epoch, and reports whether an in-flight claim sits at
+// or below that floor. The caller treats conflict as "this claim can never be
+// served again under its sequence" — the schema-8 remedy is an epoch rotation,
+// never a renumber.
+//
+// The epoch check is the guard: a floor only has meaning inside the epoch its
+// credential names, so a floor for any other epoch than the cursor's is a
+// protocol mismatch and an error. The floor itself is what FastForward always
+// was — the durable allocator never re-emits a sequence the server has
+// accepted — except that here it runs under the same lock as the epoch check
+// and the conflict verdict, because the three describe one barrier moment.
+//
+// This is the ONE place a floor is made durable in this build: FastForward
+// already persists the new allocator position, and the state write it makes
+// renders the cursor's epoch alongside it, so no separate write is needed.
+func (s *Store) ApplyFloor(server string, epoch uint64, floor uint64) (conflict bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cursors[server]
+	if !ok {
+		return false, fmt.Errorf("wal: apply floor for unknown server %q", server)
+	}
+	if c.epoch != epoch {
+		return false, fmt.Errorf("wal: floor for epoch %d does not match cursor epoch %d of %q", epoch, c.epoch, server)
+	}
+	conflict = c.claim != nil && c.claim.seq <= floor
+	if err := s.fastForwardLocked(floor); err != nil {
+		return false, err
+	}
+	return conflict, nil
 }
 
 // Pending returns the number of samples one server has not yet acknowledged,

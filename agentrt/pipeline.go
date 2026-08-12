@@ -1,6 +1,8 @@
 package agentrt
 
 import (
+	"crypto/ed25519"
+	"fmt"
 	"log"
 	"runtime"
 	"time"
@@ -313,7 +315,11 @@ func (rt *serverRuntime) sink(res collector.Result) {
 }
 
 // connDeps assembles the session's dependencies for one enrollment.
-func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string) conn.Deps {
+//
+// key is the process ed25519 key (identity.LoadOrCreateKey): the session
+// signs the server's rotation challenge with it, proving possession of the
+// enrolled identity before the server issues a rotated credential.
+func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string, key ed25519.PrivateKey) conn.Deps {
 	return conn.Deps{
 		Outbox:        rt.outbox,
 		Configurables: rt.configurables,
@@ -324,6 +330,26 @@ func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string) conn
 		Game:          rt.game,
 		Diag:          rt.trigger,
 		Clock:         rt.clock,
+		SignChallenge: func(challenge []byte) []byte {
+			return ed25519.Sign(key, challenge)
+		},
+		// PersistRotation saves the rotated credential: the new bearer token and
+		// epoch, with the agent/site identity — and the consumed-token hash —
+		// carried over from the credential already on disk. conn owns the flow
+		// but never imports identity; this closure is the identity half of it.
+		PersistRotation: func(epoch uint64, token string) error {
+			creds, err := identity.LoadCredentials(dataDir)
+			if err != nil {
+				return err
+			}
+			cur, ok := creds[rt.cfg.Name]
+			if !ok {
+				return fmt.Errorf("rotate %q: no credential to update", rt.cfg.Name)
+			}
+			cur.AgentToken = token
+			cur.EnrollmentEpoch = epoch
+			return identity.SaveCredential(dataDir, rt.cfg.Name, cur)
+		},
 		// Bound to the credential in hand, not merely to the server name: a name
 		// or URL can be re-pointed at a different server, and restoring that
 		// server's targets under this one would both run the wrong monitors and —

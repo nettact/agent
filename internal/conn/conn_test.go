@@ -350,7 +350,20 @@ func TestDrainFastForwardsResetWAL(t *testing.T) {
 					t.Errorf("first packet: %+v err=%v", first, err)
 					return
 				}
-				if err := srvWrite(ctx, c, wire.Frame{Ack: &wire.Ack{HighestSequence: watermark, ServerTime: time.Now().UTC()}}); err != nil {
+				// A real server's watermark is its retained MAX, which must include
+				// the packet it just accepted — so it can never sit below the
+				// claim's own sequence. Keeping that honest matters now that the
+				// agent rejects lower-water acks: on the lite build the allocator
+				// seeds from the wall clock (≈1.78e18), far above the synthetic
+				// watermark, so the raw constant would be rejected and the test
+				// would not be testing what it says. The default build still sees
+				// exactly the original scenario (claim sequence 1, watermark
+				// 33711).
+				highest := watermark
+				if first.Packet.Sequence > highest {
+					highest = first.Packet.Sequence
+				}
+				if err := srvWrite(ctx, c, wire.Frame{Ack: &wire.Ack{HighestSequence: highest, ServerTime: time.Now().UTC()}}); err != nil {
 					t.Errorf("write high-watermark ack: %v", err)
 					return
 				}

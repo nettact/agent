@@ -259,6 +259,26 @@ func countClaimed(owner string, cl *claim, disk []diskGroup, mem []memGroup) int
 	return n
 }
 
+// pendingRowsLocked counts how many sample rows one server still holds across
+// both tiers — buffered, spilled and claimed alike. Unlike Pending it does not
+// consult the cursor's watermark: SetEpoch uses it to report the size of the
+// backlog it just re-opened, at which point the watermark has already been
+// reset to zero and every group present is owed again. Caller holds mu.
+func pendingRowsLocked(owner string, disk []diskGroup, mem []memGroup) int {
+	n := 0
+	for _, g := range disk {
+		if g.owner == owner {
+			n += g.n
+		}
+	}
+	for _, g := range mem {
+		if g.owner == owner {
+			n += g.n
+		}
+	}
+	return n
+}
+
 // cursor is one server's position in the shared log: every group of its own with
 // gid <= acked is delivered and done, and claim is the packet it currently owes
 // an ack for.
@@ -271,6 +291,25 @@ func countClaimed(owner string, cl *claim, disk []diskGroup, mem []memGroup) int
 type cursor struct {
 	acked uint64
 	claim *claim
+	// epoch is the enrollment epoch (credential generation) this server's
+	// sessions have been running under, as last stated by SetEpoch. Together
+	// with identity it is the credential-shaped state the log carries, and it
+	// rides the same persistence path: the cursor fields are what state.json
+	// and every spill render, so the epoch is as durable as the claim and the
+	// watermark it guards.
+	//
+	// The sequence space is scoped to the epoch. A floor or a claim can only
+	// exist under the epoch the credential names; when a rotation (or a fresh
+	// enrollment) moves the credential to a new epoch, SetEpoch re-opens the
+	// whole backlog — the groups themselves are NOT discarded (they belong to
+	// the same agent), but the old claim is abandoned and everything is
+	// re-claimed under fresh sequences once the server applies its floor for
+	// the new epoch.
+	//
+	// Zero means no epoch has ever been recorded: a fresh store, or a
+	// credential enrolled before schema 8 — which is the state the barrier
+	// treats as legacy and does not gate.
+	epoch uint64
 	// identity is the agent_id this server's sessions have been running under,
 	// as last stated by BindIdentity. It is the one piece of credential identity
 	// the log carries, and it is deliberately here — one per consumer — rather

@@ -62,6 +62,16 @@ var (
 // it; the exported vocabulary for that state is ReasonAckTimeout.
 var errAckTimeout = errors.New("no acknowledgement from server")
 
+// errEpochRotated marks a completed credential rotation (schema 8). The
+// session that carried it out returns this so Run can end it and reconnect:
+// the rotation result has already moved the runner's token and epoch, so the
+// next session presents the rotated credential and the server re-drives the
+// floor barrier for the new epoch. Run treats it like any other retryable
+// session end — log, backoff, reconnect — which is why it stays unexported:
+// nothing outside this package needs to branch on it, and the retry log line
+// carries the epoch in its error text.
+var errEpochRotated = errors.New("credential epoch rotated")
+
 const (
 	writeTimeout = 10 * time.Second
 	pingInterval = 15 * time.Second
@@ -106,6 +116,15 @@ type Options struct {
 	// AgentID/SiteID stamp every telemetry packet (from the enrollment credential).
 	AgentID string
 	SiteID  string
+
+	// EnrollmentEpoch is the credential generation this session runs under
+	// (from the enrollment credential, schema 8). It gates the sequence-floor
+	// barrier — no packet may be claimed or sent until the server pushes a
+	// SequenceFloor for this epoch — and names the epoch a rotation request
+	// signs itself out of. Zero means the credential predates schema 8: the
+	// session runs without a barrier, exactly as it did before, because a
+	// schema-8 server is required not to push floors to a zero-epoch Hello.
+	EnrollmentEpoch uint64
 
 	// Hello carries the static identity fields sent as the first frame of every
 	// (re)connect.
@@ -261,6 +280,21 @@ type Deps struct {
 	// selects hostsnapshot.Collect; tests inject a stub to avoid the CPU sample
 	// window.
 	CollectSnapshot func(ctx context.Context, requestID string, collect permission.Set) telemetry.HostSnapshot
+
+	// SignChallenge signs the server's epoch-rotation challenge with the ed25519
+	// key this agent enrolled with, proving possession before the server issues
+	// a rotated credential. agentrt wires the process key here (identity owns
+	// the key file); a session that receives a challenge without a signer wired
+	// is a wiring error and ends.
+	SignChallenge func(challenge []byte) []byte
+
+	// PersistRotation durably saves a rotated credential — the new bearer token
+	// and epoch; the agent/site identity stay — so a crash after the rotation
+	// comes back with the new credential rather than the dead one. agentrt wires
+	// identity.SaveCredential here; this package deliberately never imports
+	// identity. It runs on the session goroutine, after the WAL's epoch has
+	// already moved (see applyRotationResult for why that order).
+	PersistRotation func(epoch uint64, token string) error
 }
 
 // Run dials the server and keeps a session alive until ctx is cancelled,
@@ -341,6 +375,20 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// so nothing stale can go out on this session, and the next Open reaches
 		// the same verdict from the identity stored beside the backlog.
 		r.logf("bind outbox identity %s: %v", opts.AgentID, err)
+	}
+	// Reconcile the outbox's epoch with the credential this session runs under,
+	// before anything can be claimed from it. Idempotent: on an ordinary start
+	// it is a no-op (the rotation flow already moved the WAL, or the store
+	// reloaded the persisted epoch), and after a crash between the rotation's
+	// two durable writes — the WAL epoch landed, the credential write did not —
+	// it re-syncs the cursor to the credential, which is the durable truth it
+	// must follow. A real move re-queues the backlog for fresh sequences, the
+	// same reclamation a rotation performs; see wal.Store.SetEpoch.
+	if _, err := deps.Outbox.SetEpoch(opts.ServerName, opts.EnrollmentEpoch); err != nil {
+		// Never fatal, and for the same reason as the identity bind above: the
+		// in-memory move stands, and the next Run re-reads the credential and
+		// re-drives the reconcile.
+		r.logf("set outbox epoch %d: %v", opts.EnrollmentEpoch, err)
 	}
 	// Resume monitoring before the first dial. Everything downstream of the
 	// collectors already survives an unreachable server; the target list was the
@@ -472,6 +520,14 @@ type runner struct {
 	// persisting; see desiredstate.Digest for why a version test is wrong twice
 	// over. A failed save leaves it unchanged, so the next push retries.
 	persistedDigest string
+
+	// floor is the sequence floor the server pushed for THIS session (schema 8),
+	// nil until it has been durably applied and the applied reply sent. It is
+	// per-session state that happens to live on the runner — reset at the top of
+	// session() — because the session goroutine is the sole writer of the runner
+	// anyway; the barrier it gates is drain(), which checks it. While nil (and
+	// the session's epoch is non-zero) nothing may be claimed or sent.
+	floor *wire.SequenceFloor
 }
 
 // logf writes a session log line tagged with the server it belongs to. Every
@@ -486,6 +542,10 @@ func (r *runner) logf(format string, args ...any) {
 // until the connection dies or ctx is cancelled. It always returns with the
 // connection closed.
 func (r *runner) session(ctx context.Context) error {
+	// Each session starts behind its own floor barrier: nothing this session
+	// sends is under a floor the PREVIOUS session applied, so the server must
+	// re-state it (and it does, on every connect).
+	r.floor = nil
 	dialCtx, cancel := context.WithTimeout(ctx, r.opts.dialTimeout)
 	c, err := r.dialer(dialCtx, r.opts.Token)
 	cancel()
@@ -563,18 +623,24 @@ func (r *runner) session(ctx context.Context) error {
 	// needed anywhere in the session.
 	errCh := make(chan error, 2) // reader + pinger, at most one send each
 	ackCh := make(chan wire.Ack, 1)
+	ctrlCh := make(chan wire.Frame, 4)
 	pushCh := make(chan wire.Frame, 4)
 
-	go r.readLoop(sessionCtx, c, ackCh, pushCh, errCh)
+	go r.readLoop(sessionCtx, c, ackCh, ctrlCh, pushCh, errCh)
 	go r.pingLoop(sessionCtx, c, errCh)
 
-	return r.sessionLoop(ctx, sessionCtx, c, ackCh, pushCh, errCh)
+	return r.sessionLoop(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh)
 }
 
 // readLoop is the session's sole reader: it decodes each frame and routes it
 // to the session goroutine. Any read/decode failure ends the session (via
 // errCh) — after a transport error the frame stream cannot be trusted.
-func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- wire.Ack, pushCh chan<- wire.Frame, errCh chan<- error) {
+//
+// The schema-8 control frames (SequenceFloor, EpochRotationChallenge,
+// EpochRotationResult) get their own channel: they drive state machines the
+// session goroutine runs, and mixing them into pushCh would let them queue
+// behind config frames while a rotation or a barrier waits.
+func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- wire.Ack, ctrlCh chan<- wire.Frame, pushCh chan<- wire.Frame, errCh chan<- error) {
 	for {
 		f, err := c.ReadFrame(sessionCtx)
 		if err != nil {
@@ -588,6 +654,12 @@ func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- 
 			case <-sessionCtx.Done():
 				return
 			}
+		case f.SequenceFloor != nil, f.EpochRotationChallenge != nil, f.EpochRotationResult != nil:
+			select {
+			case ctrlCh <- f:
+			case <-sessionCtx.Done():
+				return
+			}
 		case f.DesiredState != nil, f.SnapshotRequest != nil:
 			select {
 			case pushCh <- f:
@@ -595,7 +667,8 @@ func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- 
 				return
 			}
 		default:
-			// Hello/Packet/HostSnapshot flow agent→server only; a server that
+			// Hello/Packet/HostSnapshot/SequenceFloorApplied/EpochRotationRequest/
+			// EpochRotationChallengeRequest flow agent→server only; a server that
 			// echoes them is broken and the session should not limp along.
 			errCh <- fmt.Errorf("server sent an agent-bound-invalid frame")
 			return
@@ -628,10 +701,12 @@ func (r *runner) pingLoop(sessionCtx context.Context, c wire.Conn, errCh chan<- 
 
 // sessionLoop is the session goroutine's main loop: drain the WAL on a ticker
 // (plus once immediately) and apply server pushes as they arrive.
-func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
+func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	// Immediate first drain: a freshly-(re)connected session should flush
 	// whatever accumulated while offline without waiting a full tick —
-	// preserves the old loop's fast-startup behavior.
+	// preserves the old loop's fast-startup behavior. (It stays behind the
+	// floor barrier: until the server pushes a SequenceFloor for this epoch,
+	// drain is a no-op.)
 	if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh); err != nil {
 		return err
 	}
@@ -653,6 +728,10 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 			if err := r.applyPush(ctx, sessionCtx, c, f); err != nil {
 				return err
 			}
+		case f := <-ctrlCh:
+			if err := r.applyControl(ctx, sessionCtx, c, f, pushCh, errCh, ctrlCh); err != nil {
+				return err
+			}
 		case ms := <-trackerUpdates:
 			// Runtime target-policy transition — write the full-state frame on the
 			// session goroutine (single-writer invariant preserved).
@@ -667,12 +746,200 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 	}
 }
 
+// applyControl runs one server→agent control frame: the sequence-floor
+// barrier and the epoch-rotation state machine (schema 8). All of it runs on
+// the session goroutine, so the WAL cursor, the runner's floor and the
+// socket's single-writer invariant stay untouched by anyone else.
+func (r *runner) applyControl(ctx, sessionCtx context.Context, c wire.Conn, f wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error, ctrlCh <-chan wire.Frame) error {
+	switch {
+	case f.SequenceFloor != nil:
+		return r.applySequenceFloor(sessionCtx, c, f.SequenceFloor)
+	case f.EpochRotationChallenge != nil:
+		return r.applyRotationChallenge(ctx, sessionCtx, c, f.EpochRotationChallenge, pushCh, errCh, ctrlCh)
+	default: // EpochRotationResult
+		return fmt.Errorf("server sent an epoch rotation result with no rotation in flight")
+	}
+}
+
+// applySequenceFloor applies the server's pre-claim barrier: validate the
+// floor against this session's epoch, durably fast-forward the allocator past
+// it, and either open the drain or — when an in-flight claim sits at or below
+// the floor, which must never be re-served under its sequence — ask the server
+// for an epoch rotation instead.
+func (r *runner) applySequenceFloor(sessionCtx context.Context, c wire.Conn, floor *wire.SequenceFloor) error {
+	if r.floor != nil {
+		// One floor per session. A second one means the server is confused about
+		// the phase, and anything sent from here on is of uncertain validity.
+		return fmt.Errorf("server sent a second sequence floor in one session")
+	}
+	if floor.EnrollmentEpoch != r.opts.EnrollmentEpoch {
+		// The floor is scoped to the epoch the credential names. A mismatch means
+		// the server's view of this agent's credential generation differs from
+		// ours — non-terminal: the session ends, and the server drives a
+		// rotation challenge on the reconnect.
+		return fmt.Errorf("sequence floor for epoch %d does not match this session's epoch %d",
+			floor.EnrollmentEpoch, r.opts.EnrollmentEpoch)
+	}
+	conflict, err := r.deps.Outbox.ApplyFloor(r.opts.ServerName, floor.EnrollmentEpoch, floor.SequenceFloor)
+	if err != nil {
+		return fmt.Errorf("apply sequence floor %d: %w", floor.SequenceFloor, err)
+	}
+	if conflict {
+		// An in-flight claim at or below the floor may never be served again
+		// under its sequence, and the WAL never renumbers a claim in place. The
+		// only way forward is a fresh epoch: ask the server to challenge us, and
+		// keep the barrier closed — r.floor stays nil, so drain keeps returning
+		// immediately — until the rotation lands and the session reconnects.
+		if err := r.writeFrame(sessionCtx, c, wire.Frame{EpochRotationChallengeRequest: &wire.EpochRotationChallengeRequest{Reason: "claim_below_floor"}}); err != nil {
+			return fmt.Errorf("write rotation challenge request: %w", err)
+		}
+		r.logf("in-flight claim at or below floor %d; requested an epoch rotation", floor.SequenceFloor)
+		return nil
+	}
+	r.floor = floor
+	if err := r.writeFrame(sessionCtx, c, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: floor.EnrollmentEpoch,
+		SequenceFloor:   floor.SequenceFloor,
+	}}); err != nil {
+		return fmt.Errorf("write sequence floor applied: %w", err)
+	}
+	r.logf("sequence floor %d applied for epoch %d (session %s)", floor.SequenceFloor, floor.EnrollmentEpoch, floor.SessionID)
+	return nil
+}
+
+// applyRotationChallenge answers a server-driven credential rotation: verify
+// the challenge is usable, prove possession of the enrolled key, and await the
+// server's verdict.
+func (r *runner) applyRotationChallenge(ctx, sessionCtx context.Context, c wire.Conn, ch *wire.EpochRotationChallenge, pushCh <-chan wire.Frame, errCh <-chan error, ctrlCh <-chan wire.Frame) error {
+	if ch.Challenge == "" {
+		return fmt.Errorf("server sent an empty epoch rotation challenge")
+	}
+	if !ch.ExpiresAt.After(r.anchoredNow()) {
+		return fmt.Errorf("epoch rotation challenge already expired at %s", ch.ExpiresAt.Format(time.RFC3339))
+	}
+	if r.deps.SignChallenge == nil {
+		return fmt.Errorf("epoch rotation challenge received but no challenge signer is wired")
+	}
+	sig := r.deps.SignChallenge([]byte(ch.Challenge))
+	if err := r.writeFrame(sessionCtx, c, wire.Frame{EpochRotationRequest: &wire.EpochRotationRequest{
+		Challenge: ch.Challenge,
+		OldEpoch:  r.opts.EnrollmentEpoch,
+		Signature: sig,
+	}}); err != nil {
+		return fmt.Errorf("write epoch rotation request: %w", err)
+	}
+	r.logf("answered epoch rotation challenge (reason %q); awaiting the server's verdict", ch.Reason)
+	return r.awaitRotationResult(ctx, sessionCtx, c, pushCh, errCh, ctrlCh)
+}
+
+// awaitRotationResult blocks for the server's verdict on an in-flight rotation
+// request. It follows awaitAck's pattern for the same deadlock reason: config
+// pushes keep being consumed inline while waiting, or the reader would stall
+// sending to pushCh and the result could never be read off the wire.
+func (r *runner) awaitRotationResult(ctx, sessionCtx context.Context, c wire.Conn, pushCh <-chan wire.Frame, errCh <-chan error, ctrlCh <-chan wire.Frame) error {
+	timer := time.NewTimer(r.opts.ackTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			return err
+		case f := <-pushCh:
+			if err := r.applyPush(ctx, sessionCtx, c, f); err != nil {
+				return err
+			}
+		case f := <-ctrlCh:
+			if f.EpochRotationResult == nil {
+				return fmt.Errorf("server sent an unexpected control frame while a rotation was in flight")
+			}
+			return r.applyRotationResult(f.EpochRotationResult)
+		case <-timer.C:
+			return fmt.Errorf("no epoch rotation result within %s: %w", r.opts.ackTimeout, errAckTimeout)
+		}
+	}
+}
+
+// applyRotationResult acts on the server's verdict for the rotation request
+// this session sent. On success it moves the WAL's epoch first, then the
+// credential, then ends the session so the reconnect presents the rotated
+// identity; a denial, a retry or an unknown status is a plain session error
+// and the old credential stays in force.
+func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
+	switch res.Status {
+	case wire.RotationOK:
+		if res.NewEpoch <= r.opts.EnrollmentEpoch {
+			return fmt.Errorf("server rotated to epoch %d, not above the current %d", res.NewEpoch, r.opts.EnrollmentEpoch)
+		}
+		if res.AgentToken == "" {
+			return fmt.Errorf("server rotated the credential but issued no agent token")
+		}
+		// The WAL's epoch moves before the credential's. A crash between the
+		// two durable writes leaves the WAL ahead of the credential, and Run's
+		// session-start reconcile resets it from the credential — the direction
+		// that always converges on "WAL follows credential". A failed epoch
+		// write is likewise non-fatal: the in-memory move stands for this
+		// process, and the same reconcile heals the durable one.
+		if _, err := r.deps.Outbox.SetEpoch(r.opts.ServerName, res.NewEpoch); err != nil {
+			r.logf("set outbox epoch %d: %v", res.NewEpoch, err)
+		}
+		if r.deps.PersistRotation == nil {
+			return fmt.Errorf("server rotated the credential to epoch %d but no persistence hook is wired", res.NewEpoch)
+		}
+		if err := r.deps.PersistRotation(res.NewEpoch, res.AgentToken); err != nil {
+			return fmt.Errorf("persist rotated credential: %w", err)
+		}
+		// The runner's own copy of the identity moves last, so the session Run
+		// opens next presents the rotated credential: the new bearer token on
+		// the upgrade request and the new epoch in the Hello and in the floor
+		// validation.
+		r.opts.Token = res.AgentToken
+		r.opts.EnrollmentEpoch = res.NewEpoch
+		r.opts.Hello.EnrollmentEpoch = res.NewEpoch
+		return fmt.Errorf("credential rotated to epoch %d; reconnecting under the new identity: %w", res.NewEpoch, errEpochRotated)
+	default:
+		// Denied, retry and any unknown status share one shape: this session's
+		// rotation failed, the old credential stays in force, and the server
+		// re-drives a fresh challenge on the reconnect (or not, for a denial —
+		// either way nothing here needs to remember the attempt).
+		reason := res.Reason
+		if reason == "" {
+			reason = res.Status
+		}
+		return fmt.Errorf("epoch rotation %s: %s", res.Status, reason)
+	}
+}
+
+// anchoredNow is the session's best reading of the server's current time, for
+// judging server-stated deadlines (the rotation challenge's ExpiresAt). A
+// wrong wall clock is the ordinary case on the devices this agent runs on, so
+// a clock anchor that can produce a corrected time wins; the wall clock is the
+// fallback, and it is also what an unanchored session has to be content with.
+func (r *runner) anchoredNow() time.Time {
+	if r.deps.Clock != nil {
+		if n, ok := r.deps.Clock.(interface{ ServerNow() time.Time }); ok {
+			return n.ServerNow()
+		}
+	}
+	return time.Now()
+}
+
 // drain uploads pending WAL batches over the socket, one ack-confirmed packet
 // at a time (semantics carried over from the old uploader loop: bounded per
 // tick, same-sequence retry on failure, server dedups on agent_id+sequence).
 // All WAL access happens here, on the session goroutine, so the store never
 // sees concurrent claims.
 func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
+	// The sequence-floor barrier (schema 8). Until the server has pushed a
+	// floor for this session's epoch and the agent has durably applied it, no
+	// packet may be claimed or sent — the server enforces the same ordering on
+	// its side and treats an early packet as a protocol error. A zero-epoch
+	// session (a credential enrolled before schema 8) has no barrier: the
+	// server is required not to push floors to it, so gating would stall every
+	// legacy install forever.
+	if r.floor == nil && r.opts.EnrollmentEpoch != 0 {
+		return nil
+	}
 	for i := 0; i < maxBatchesPerDrain; i++ {
 		batch, ok, err := r.deps.Outbox.NextBatch(r.opts.ServerName, batchItems)
 		if err != nil {
@@ -759,6 +1026,16 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-
 				return wire.Ack{}, err
 			}
 		case ack := <-ackCh:
+			if ack.HighestSequence < seq {
+				// A lower-water ack cannot confirm this claim: accepting it would
+				// delete a packet the server never said it stored. It is exactly
+				// what a stale or unsolicited ack looks like (they sit in ackCh
+				// until the next awaitAck reads them), so drop it and keep
+				// waiting for one that names this claim. The claim, the drain and
+				// the allocator are untouched either way.
+				r.logf("ignoring ack with watermark=%d below the in-flight sequence=%d", ack.HighestSequence, seq)
+				continue
+			}
 			return ack, nil
 		case <-timer.C:
 			// A connection that swallows packets without acking is as dead as a
