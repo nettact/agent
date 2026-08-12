@@ -10,7 +10,7 @@ STOP=10
 . /usr/lib/nettact/common.sh
 
 start_service() {
-	local enabled cfg
+	local enabled cfg cleanup
 
 	config_load nettact
 	config_get_bool enabled main enabled 0
@@ -70,7 +70,20 @@ start_service() {
 	procd_open_instance nettact
 	procd_set_param command /bin/sh /usr/lib/nettact/launch.sh
 
-	# Three variables, and no more. DATA_DIR stays in the environment on purpose:
+	# The enrollment token is one-time: after the agent enrolls it clears the
+	# saved UCI token itself, and this variable tells it HOW (the packaging owns
+	# UCI). Only when UCI IS the active config source — a hand-written
+	# /etc/nettact/agent.yaml takes over completely, and its token must not
+	# trigger deletion of an unrelated dormant UCI token — and only in single
+	# mode, where `nettact.main` is a stable path. `@server[N]` indices can
+	# drift if sections are edited, so a multi-server deployment never bakes one
+	# into a later deletion.
+	cleanup=""
+	if nettact_config_is_generated && [ "$(nettact_cfg server_mode single)" = single ] && [ -n "$(nettact_cfg enroll_token)" ]; then
+		cleanup='uci delete nettact.main.enroll_token && uci commit nettact'
+	fi
+
+	# Four variables, and no more. DATA_DIR stays in the environment on purpose:
 	# the agent prefers a file value per key, so a hand-written config that omits
 	# data_dir still keeps its identity on flash instead of landing wherever
 	# procd happens to leave the working directory.
@@ -82,10 +95,17 @@ start_service() {
 	# to a hand-written config too. The same file-over-environment rule means an
 	# operator who does set status_file by hand wins, and the LuCI panel then
 	# shows no live status; that is the documented trade for full control.
+	#
+	# ENROLL_TOKEN_CLEANUP_CMD is an environment variable for the same
+	# file-over-environment reason AND because an older agent binary ignores an
+	# unknown variable but rejects an unknown YAML key through its strict
+	# decoder — so a package update can land ahead of the binary without breaking
+	# the start. An empty value (no token configured) is a no-op for the agent.
 	procd_set_param env \
 		NETTACT_AGENT_CONFIG_FILE="$cfg" \
 		NETTACT_AGENT_DATA_DIR="$NETTACT_DATA_DIR" \
-		NETTACT_AGENT_STATUS_FILE="$NETTACT_STATUS_FILE"
+		NETTACT_AGENT_STATUS_FILE="$NETTACT_STATUS_FILE" \
+		NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD="$cleanup"
 
 	# Retry forever, 10s apart: an agent that cannot reach its server yet is the
 	# normal state during boot, not a reason to give up. The 3600s threshold is

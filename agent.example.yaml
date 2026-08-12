@@ -120,14 +120,23 @@ server_url: http://host:12450
 # the flash.
 #persist_window: 30m
 
-# --- Enrollment token (first run only; the two keys are mutually exclusive) --
-# After first run the saved credential in data_dir is reused and neither is read.
+# --- Enrollment token (first run, or a 401-triggered re-registration) ---------
+# After first run the saved credential in data_dir is reused and the token is not
+# used for enrollment again; it IS still read when the server rejects the session
+# with HTTP 401, to decide whether a *different* (fresh) token is available to
+# re-register with.
 
 # Inline one-time enrollment token. Prefer enroll_token_file over this.
 #enroll_token: "paste-one-time-token-here"
 
 # Path to a file holding the one-time enrollment token (preferred).
 #enroll_token_file: /run/secrets/agent_enroll_token
+
+# Command that clears the saved enrollment token after a successful enrollment.
+# Environment-only (no YAML key), so an older agent binary ignores it instead of
+# failing the strict decode. Must be exactly `uci delete <option> && uci commit
+# <package>` — nothing else — or the agent refuses to start. OpenWrt sets:
+#   NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD='uci delete nettact.main.enroll_token && uci commit nettact'
 
 # --- Local permission policy ------------------------------------------------
 

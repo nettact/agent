@@ -494,8 +494,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 		printf '  binary      %s\n' "$(nettact_bin)"
 		printf '  identity    %s\n' "$NETTACT_DATA_DIR"
 		printf '  LuCI        Services -> NetTact\n'
-		printf '\nThe one-time token is spent; clearing it is optional:\n'
-		printf '  uci delete nettact.main.enroll_token && uci commit nettact\n'
+		printf '\nThe one-time token is spent; the agent clears it from the settings itself.\n'
 		exit 0
 	fi
 	if [ -s "$NETTACT_STATUS_FILE" ]; then saw_status=true; fi

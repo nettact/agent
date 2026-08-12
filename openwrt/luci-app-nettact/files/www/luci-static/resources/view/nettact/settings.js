@@ -254,7 +254,7 @@ return view.extend({
 		};
 
 		o = s.option(form.Value, 'enroll_token', _('Enrollment token'),
-			_('One-time token from the server. It is only used until this router is enrolled; after that it can be cleared.'));
+			_('One-time token from the server. It is used until this router is enrolled; the agent clears it automatically after any successful registration.'));
 		o.depends('server_mode', 'single');
 		o.password = true;
 		o.validate = function (section_id, value) {

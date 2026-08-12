@@ -1,6 +1,8 @@
 package envcfg
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -91,5 +93,107 @@ func TestLoadRejectsOversizedTokenFile(t *testing.T) {
 	}), File{})
 	if err == nil || !strings.Contains(err.Error(), "is too large") {
 		t.Fatalf("oversized token error = %v, want safe size rejection", err)
+	}
+}
+
+func TestTokenHashFromConfig(t *testing.T) {
+	hashOf := func(s string) string {
+		sum := sha256.Sum256([]byte(s))
+		return hex.EncodeToString(sum[:])
+	}
+	base := func(extra map[string]string) map[string]string {
+		m := map[string]string{"NETTACT_AGENT_SERVER_URL": "https://server.example"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("filetok"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{name: "inline-token", env: base(map[string]string{"NETTACT_AGENT_ENROLL_TOKEN": "tok"}), want: hashOf("tok")},
+		{name: "file-token", env: base(map[string]string{"NETTACT_AGENT_ENROLL_TOKEN_FILE": tokenFile}), want: hashOf("filetok")},
+		{name: "no-token", env: base(nil)},
+	} {
+		cfg, err := Load(mapLookup(tc.env), File{})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := cfg.Servers[0].TokenHash; got != tc.want {
+			t.Errorf("%s: TokenHash = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestTokenConsumedFromEnv(t *testing.T) {
+	base := map[string]string{"NETTACT_AGENT_SERVER_URL": "https://server.example"}
+
+	// Absent → no cleanup wired.
+	cfg, err := Load(mapLookup(base), File{})
+	if err != nil {
+		t.Fatalf("Load(no cleanup): %v", err)
+	}
+	if cfg.Servers[0].TokenConsumed != nil {
+		t.Fatal("TokenConsumed set without NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD")
+	}
+
+	// The exact grammar → wired.
+	cfg, err = Load(mapLookup(map[string]string{
+		"NETTACT_AGENT_SERVER_URL":          "https://server.example",
+		"NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD": "uci delete nettact.main.enroll_token && uci commit nettact",
+	}), File{})
+	if err != nil {
+		t.Fatalf("Load(valid cleanup): %v", err)
+	}
+	if cfg.Servers[0].TokenConsumed == nil {
+		t.Fatal("TokenConsumed nil for a valid cleanup command")
+	}
+
+	// Anything outside the exact grammar is a startup error, not a silent no-op.
+	for _, bad := range []string{
+		"rm -rf /",
+		"uci delete $HOME && uci commit nettact",
+		"uci delete nettact.main.enroll_token; touch /tmp/x",
+		"uci delete nettact.main.enroll_token",
+		"uci delete nettact.main.enroll_token && uci commit",
+		"uci delete nettact.main.enroll_token && uci commit nettact extra",
+		"uci commit nettact && uci delete nettact.main.enroll_token",
+	} {
+		if _, err := Load(mapLookup(map[string]string{
+			"NETTACT_AGENT_SERVER_URL":              "https://server.example",
+			"NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD": bad,
+		}), File{}); err == nil {
+			t.Errorf("Load accepted unsafe cleanup command %q", bad)
+		}
+	}
+}
+
+func TestTokenCleanupGrammar(t *testing.T) {
+	for _, ok := range []string{
+		"uci delete nettact.main.enroll_token && uci commit nettact",
+		"uci delete nettact.enroll_token && uci commit nettact",
+	} {
+		if !tokenCleanupRe.MatchString(ok) {
+			t.Errorf("grammar rejected %q", ok)
+		}
+	}
+	for _, bad := range []string{
+		"rm -rf /",
+		"uci delete nettact.main.enroll_token",
+		"uci delete nettact.main.enroll_token && uci commit",
+		"uci delete x; uci commit nettact",
+		"uci delete x && uci commit nettact && rm -rf /",
+		"uci delete x && uci commit nettact --verbose",
+		"uci delete x && echo hi && uci commit nettact",
+	} {
+		if tokenCleanupRe.MatchString(bad) {
+			t.Errorf("grammar accepted %q", bad)
+		}
 	}
 }

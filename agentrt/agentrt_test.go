@@ -2,6 +2,8 @@ package agentrt
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -267,5 +270,188 @@ func TestRevokedCredentialOutcomeDependsOnDeletion(t *testing.T) {
 				t.Fatalf("revoked credential still on disk: %+v", creds)
 			}
 		})
+	}
+}
+
+// TestAuthRejectedReenrollsWithADifferentToken pins the 401 self-heal: a refused
+// credential is dead, and when the configured INLINE token differs from the one
+// that enrolled this credential (or the credential predates the field, so the
+// match is unknowable) the runner deletes the credential and re-enrolls with it.
+// The same token, or no inline token, must NOT escalate — the runner keeps
+// retrying the credential exactly as before.
+func TestAuthRejectedReenrollsWithADifferentToken(t *testing.T) {
+	hashOf := func(s string) string {
+		sum := sha256.Sum256([]byte(s))
+		return hex.EncodeToString(sum[:])
+	}
+	// inlineHash mirrors envcfg: no inline token → "", else the sha256. (hashOf
+	// of "" is a real hash, and a "no token" config must not look configured.)
+	inlineHash := func(s string) string {
+		if s == "" {
+			return ""
+		}
+		return hashOf(s)
+	}
+
+	for _, tc := range []struct {
+		name            string
+		consumedHash    string
+		configuredToken string
+		wantReenroll    bool
+	}{
+		{name: "different-token", consumedHash: hashOf("old"), configuredToken: "new", wantReenroll: true},
+		{name: "legacy-credential", consumedHash: "", configuredToken: "fresh", wantReenroll: true},
+		{name: "same-token", consumedHash: hashOf("t"), configuredToken: "t"},
+		{name: "no-inline-token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := agentDataDir(t)
+			if err := identity.SaveCredential(dataDir, "default", identity.Credential{
+				AgentID: "agent-old", SiteID: "site-old", AgentToken: "old-token",
+				ConsumedTokenHash: tc.consumedHash,
+			}); err != nil {
+				t.Fatalf("save credential: %v", err)
+			}
+
+			// Every upgrade is refused, so no session can ever open; whether the
+			// agent escalates is decided purely by the hook.
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "no", http.StatusUnauthorized)
+			}))
+			t.Cleanup(srv.Close)
+
+			var enrolls atomic.Int32
+			enroller := func(_ context.Context, req protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
+				enrolls.Add(1)
+				return protoenroll.EnrollResponse{AgentID: "agent-new", SiteID: "site-new", AgentToken: "new-token"}, nil
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			errCh := make(chan error, 1)
+			go func() { errCh <- Run(ctx, Config{
+				Servers: []ServerConfig{{
+					Name:        "default",
+					URL:         srv.URL,
+					TokenHash:   inlineHash(tc.configuredToken),
+					TokenSource: func(context.Context) (string, error) { return tc.configuredToken, nil },
+					Enroller:    enroller,
+				}},
+				DataDir: dataDir, WireFormat: "json",
+				Policy: permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
+			}) }()
+
+			// Run must never return in this scenario: it either keeps retrying the
+			// credential or re-enrolls once and then retries the new one. The
+			// assertions below watch for the escalation side effects instead.
+			defer func() {
+				select {
+				case err := <-errCh:
+					t.Errorf("Run returned %v; want it to keep running", err)
+				default:
+				}
+			}()
+
+			// Wait on the PERSISTED credential, not the enroller's entry: the
+			// enroller increments its counter before SaveCredential runs, so a
+			// counter poll can race ahead of the write and read a half-updated
+			// agent.json.
+			waitForPersisted := func() bool {
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					creds, err := identity.LoadCredentials(dataDir)
+					if err == nil {
+						if c, ok := creds["default"]; ok && c.AgentID == "agent-new" {
+							return true
+						}
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return false
+			}
+
+			if tc.wantReenroll {
+				if !waitForPersisted() {
+					t.Fatal("re-enrollment never persisted despite a different configured token")
+				}
+				// The new credential must be on disk, carrying the consumed hash of
+				// the token that enrolled it — so a later 401 no longer escalates.
+				creds, err := identity.LoadCredentials(dataDir)
+				if err != nil {
+					t.Fatalf("load credentials: %v", err)
+				}
+				got := creds["default"]
+				if got.AgentID != "agent-new" {
+					t.Fatalf("credential after re-enroll = %+v, want agent-new", got)
+				}
+				if got.ConsumedTokenHash != hashOf(tc.configuredToken) {
+					t.Fatalf("consumed_token_hash = %q, want %q", got.ConsumedTokenHash, hashOf(tc.configuredToken))
+				}
+			} else {
+				// A grace period long enough for a re-enrollment to have happened
+				// if it were going to; the credential must be untouched.
+				time.Sleep(300 * time.Millisecond)
+				if enrolls.Load() != 0 {
+					t.Fatalf("enrolled %d time(s) with the same/no token; want none", enrolls.Load())
+				}
+				creds, err := identity.LoadCredentials(dataDir)
+				if err != nil {
+					t.Fatalf("load credentials: %v", err)
+				}
+				if got := creds["default"]; got.AgentID != "agent-old" {
+					t.Fatalf("credential changed to %+v; want the original kept", got)
+				}
+			}
+		})
+	}
+}
+
+// TestEnrollServerConsumesTheToken runs the enrollment path directly and asserts
+// the two side effects that make self-heal coherent: the saved credential
+// records the consumed token's hash, and TokenConsumed is called after the
+// exchange succeeds (so the OpenWrt package can clear the UCI enroll_token).
+func TestEnrollServerConsumesTheToken(t *testing.T) {
+	dataDir := agentDataDir(t)
+	key, err := identity.LoadOrCreateKey(dataDir)
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+	var consumedCalled atomic.Int32
+	rt := &serverRuntime{cfg: ServerConfig{
+		Name: "default",
+		TokenSource: func(context.Context) (string, error) {
+			return "the-one-time-token", nil
+		},
+		TokenConsumed: func() error {
+			consumedCalled.Add(1)
+			return nil
+		},
+		// The default Enroller would POST to a server; inject one.
+		Enroller: func(_ context.Context, req protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
+			if req.EnrollmentToken != "the-one-time-token" {
+				t.Errorf("enrollment token = %q, want the one from TokenSource", req.EnrollmentToken)
+			}
+			return protoenroll.EnrollResponse{AgentID: "agent-x", SiteID: "site-x", AgentToken: "tok"}, nil
+		},
+	}}
+	env := runEnv{cfg: Config{DataDir: dataDir}, key: key, hostname: "test", platformID: "test"}
+
+	cred, err := enrollServer(context.Background(), env, rt)
+	if err != nil {
+		t.Fatalf("enrollServer: %v", err)
+	}
+	if consumedCalled.Load() != 1 {
+		t.Fatalf("TokenConsumed called %d times, want 1", consumedCalled.Load())
+	}
+	sum := sha256.Sum256([]byte("the-one-time-token"))
+	if cred.ConsumedTokenHash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("ConsumedTokenHash = %q, want the hash of the used token", cred.ConsumedTokenHash)
+	}
+	saved, err := identity.LoadCredentials(dataDir)
+	if err != nil {
+		t.Fatalf("load credentials: %v", err)
+	}
+	if saved["default"].ConsumedTokenHash != cred.ConsumedTokenHash {
+		t.Fatalf("saved credential lost the consumed hash: %+v", saved["default"])
 	}
 }

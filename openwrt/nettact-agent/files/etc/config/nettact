@@ -43,7 +43,9 @@ config nettact 'main'
 
 	# One-time enrollment token. It is used only until enrollment succeeds;
 	# after that /etc/nettact/data/agent.json holds the real credential and this
-	# is ignored. Safe to clear once the router shows as enrolled.
+	# is ignored — and the agent clears it from this file automatically on the
+	# next successful registration (including a 401-triggered re-registration),
+	# so it never lingers here as a spent secret.
 	option enroll_token ''
 
 	# A file holding the one-time token instead of the token itself. Mutually

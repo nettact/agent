@@ -62,6 +62,20 @@ type Credential struct {
 	AgentID    string `json:"agent_id"`
 	SiteID     string `json:"site_id"`
 	AgentToken string `json:"agent_token"`
+
+	// ConsumedTokenHash is the sha256 of the one-time enrollment token this
+	// credential was last enrolled with, or "" for a credential written before
+	// the field existed (every legacy install). The 401-recovery supervisor
+	// compares it against the currently configured token to tell a *different*
+	// (possibly fresh) token apart from the one that already enrolled this
+	// agent: equal hashes mean the configured token is the consumed one and must
+	// not be tried again.
+	//
+	// It is additive to the v2 format: an older binary ignores the key on read
+	// (json.Unmarshal skips unknown fields) and drops it on write (its struct
+	// has no such field), which merely reverts that credential to the legacy
+	// "unknown" classification — never a hard failure.
+	ConsumedTokenHash string `json:"consumed_token_hash,omitempty"`
 }
 
 // credentialFile is the on-disk shape of agent.json.

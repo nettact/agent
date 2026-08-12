@@ -2,6 +2,7 @@ package conn
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -701,6 +702,74 @@ func TestOnRetryReportsDelayAndCause(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("OnRetry never fired for a server that refuses every dial")
+	}
+}
+
+// TestOnAuthRejectedEscalation: a 401 on the upgrade is normally a non-terminal
+// retry (see TestOnRetryReportsDelayAndCause), but OnAuthRejected returning true
+// tells Run to abandon the credential and return ErrAuthRejected so a supervisor
+// can re-enroll; false (or an absent hook) keeps the pre-hook retry running.
+func TestOnAuthRejectedEscalation(t *testing.T) {
+	deps, _, _, _ := newTestDeps(t)
+
+	// A server that refuses the upgrade: every dial fails, nothing ever connects.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no", http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+
+	for _, tc := range []struct {
+		name     string
+		escalate bool
+		setHook  bool
+	}{
+		{name: "escalate", escalate: true, setHook: true},
+		{name: "keep-retrying", setHook: true},
+		{name: "no-hook"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := testOptions(srv.URL, wire.SubprotocolJSON)
+			var hookCalls atomic.Int32
+			if tc.setHook {
+				opts.OnAuthRejected = func() bool {
+					hookCalls.Add(1)
+					return tc.escalate
+				}
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			errCh := make(chan error, 1)
+			go func() { errCh <- Run(ctx, opts, deps) }()
+
+			if tc.escalate {
+				// Run must stop retrying and hand the decision back up.
+				select {
+				case err := <-errCh:
+					if !errors.Is(err, ErrAuthRejected) {
+						t.Fatalf("Run = %v, want ErrAuthRejected", err)
+					}
+					if hookCalls.Load() == 0 {
+						t.Fatal("OnAuthRejected never called before escalation")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Run did not return ErrAuthRejected for a server that 401s every dial")
+				}
+				return
+			}
+
+			// The non-escalating cases keep retrying; the hook must still have been
+			// consulted, and Run must not return before we cancel it.
+			if tc.setHook {
+				waitFor(t, "OnAuthRejected consulted", func() bool { return hookCalls.Load() > 0 })
+			}
+			select {
+			case err := <-errCh:
+				t.Fatalf("Run returned %v; want it to keep retrying a refused credential", err)
+			case <-time.After(300 * time.Millisecond):
+				// still retrying, as expected
+			}
+		})
 	}
 }
 

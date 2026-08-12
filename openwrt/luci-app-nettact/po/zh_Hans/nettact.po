@@ -48,9 +48,9 @@ msgid "Enrollment token"
 msgstr "注册令牌"
 
 msgid ""
-"One-time token from the server. It is only used until this router is "
-"enrolled; after that it can be cleared."
-msgstr "服务器签发的一次性令牌。注册成功后即不再使用，可以清空。"
+"One-time token from the server. It is used until this router is enrolled; "
+"the agent clears it automatically after any successful registration."
+msgstr "服务器签发的一次性令牌。注册成功后即不再使用，agent 会在任何一次注册成功后自动清除它。"
 
 msgid "Enrollment token file"
 msgstr "注册令牌文件"

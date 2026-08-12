@@ -133,6 +133,19 @@ type Options struct {
 	// the failure and the sleep.
 	OnRetry func(err error, retryIn time.Duration)
 
+	// OnAuthRejected, if non-nil, is called when the server refuses this agent's
+	// credential on the upgrade request (HTTP 401/403), right after the runner
+	// has quiesced that server's monitoring. Return true to abandon the
+	// credential — Run returns ErrAuthRejected for a supervisor to re-enroll;
+	// return false (or leave the hook nil) to keep retrying the credential, the
+	// pre-hook behaviour, because a 401 can be transient and nothing is gained
+	// by deleting a credential no token exists to replace.
+	//
+	// Must be fast and non-blocking: it runs on the session goroutine, and it is
+	// the one place a supervisor is allowed to look at whether re-enrollment has
+	// something to use without consulting the credential itself.
+	OnAuthRejected func() bool
+
 	// Test knobs. Zero values select the production defaults above; only tests
 	// (same package) can set them, so the production surface stays minimal.
 	dialTimeout time.Duration
@@ -383,6 +396,15 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// probing third parties on its behalf forever.
 		if errors.Is(err, ErrAuthRejected) {
 			r.quiesce("the server refused this agent's credential")
+			// A refused credential is normally NOT terminal — the fix is at the
+			// server end and needs no restart here — but the hook gives the
+			// supervisor the one place to say "a fresh token is available; abandon
+			// this dead credential and re-enroll". Only that verdict makes it
+			// terminal; without it (or with the hook absent) the loop falls through
+			// to the retry exactly as before.
+			if r.opts.OnAuthRejected != nil && r.opts.OnAuthRejected() {
+				return fmt.Errorf("server refused this agent's credential; a fresh token is available for re-enrollment: %w", err)
+			}
 		}
 		if time.Since(start) > stableSession {
 			bo.reset()

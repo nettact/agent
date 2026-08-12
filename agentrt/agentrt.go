@@ -247,6 +247,23 @@ type ServerConfig struct {
 	// ErrEnroll.
 	TokenSource func(ctx context.Context) (string, error)
 
+	// TokenHash is the sha256 of the configured enrollment token — inline or
+	// file — or "" when none is set. It is computed at config load WITHOUT
+	// invoking TokenSource — TokenSource may have side effects (the desktop's
+	// own server mints a token) and is documented to run only when no
+	// credential exists. The 401-recovery hook compares it against the
+	// credential's recorded ConsumedTokenHash to decide whether a DIFFERENT
+	// (possibly fresh) token is configured.
+	TokenHash string
+
+	// TokenConsumed, if non-nil, is called after an enrollment that used a token
+	// succeeds — the exchange returned, so the server has already consumed the
+	// token in the same transaction that issued the response. It lets the source
+	// that supplied the one-time token clear it from wherever it was stored; on
+	// OpenWrt this deletes the UCI enroll_token. Best-effort: a failure is
+	// logged and never fails the enrollment, since the token is spent either way.
+	TokenConsumed func() error
+
 	// Enroller performs the enrollment exchange for a signed request. Nil selects
 	// the HTTP POST to URL/api/v1/enroll (standalone, and the desktop's external
 	// servers). The desktop injects a direct registry call for its own server so
@@ -937,6 +954,19 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				AgentVersion:  Version,
 				Permissions:   rt.report,
 			},
+			OnAuthRejected: func() bool {
+				// Escalate only when a configured INLINE token is not the one this
+				// credential was enrolled with — or the credential predates the
+				// ConsumedTokenHash field, so it is unknowable and worth a try
+				// (the legacy transition: try once, and report enroll_rejected if
+				// the leftover token is spent). Comparing the load-time TokenHash
+				// instead of calling TokenSource keeps this side-effect-free and
+				// inside the "invoked only when no credential exists" contract;
+				// the persisted hash makes the verdict survive restarts, so a
+				// consumed token can never be mistaken for a fresh one.
+				return rt.cfg.TokenHash != "" &&
+					(cred.ConsumedTokenHash == "" || rt.cfg.TokenHash != cred.ConsumedTokenHash)
+			},
 			OnSession: func(up bool) {
 				// The outbox learns the edge before anything else does. On the
 				// router builds this is what decides whether telemetry reaches
@@ -1010,32 +1040,46 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !errors.Is(err, ErrRevoked) {
-			return err
+		if errors.Is(err, ErrRevoked) {
+			// Revocation is definitive — the server closed with 4004, so the
+			// credential is dead and deleting it is correct. The ed25519 key is
+			// kept: with a console-issued reinstall token (AGENT-006) the next
+			// enrollment rejoins under the SAME agent_id and keeps its history;
+			// without one it registers a brand-new agent. Every other server's
+			// credential is untouched — being deleted at one server says nothing
+			// about the rest.
+			if derr := identity.DeleteCredential(env.cfg.DataDir, rt.cfg.Name); derr != nil {
+				// The stale credential is still on disk (permissions, antivirus lock,
+				// read-only FS), so looping would reload it and be revoked again.
+				return fmt.Errorf("delete revoked credential: %w", derr)
+			}
+			// The cached target list goes with it. The session has already stopped
+			// probing (conn quiesces on the revoke close code); this is what stops a
+			// restart from resurrecting the list. Best-effort on purpose: a cache the
+			// agent cannot delete is still bound to the credential just deleted, so
+			// the binding check refuses to restore it anyway — this only keeps the
+			// file from lingering.
+			if derr := desiredstate.Delete(env.cfg.DataDir, rt.cfg.Name); derr != nil {
+				log.Printf("[%s] could not drop the cached config of the revoked credential: %v", rt.cfg.Name, derr)
+			}
+			cred, enrolled = identity.Credential{}, false
+			log.Printf("[%s] agent was deleted on the server; re-enrolling", rt.cfg.Name)
+			continue
 		}
-
-		// On revocation the credential is dead; delete it so the loop enrolls
-		// fresh. The ed25519 key is kept: with a console-issued reinstall token
-		// (AGENT-006) the next enrollment rejoins under the SAME agent_id and keeps
-		// its history; without one it registers a brand-new agent. Every other
-		// server's credential is untouched — being deleted at one server says
-		// nothing about the rest.
-		if derr := identity.DeleteCredential(env.cfg.DataDir, rt.cfg.Name); derr != nil {
-			// The stale credential is still on disk (permissions, antivirus lock,
-			// read-only FS), so looping would reload it and be revoked again.
-			return fmt.Errorf("delete revoked credential: %w", derr)
+		if errors.Is(err, conn.ErrAuthRejected) {
+			// A refused credential is NOT necessarily dead — a 401 can be
+			// transient (a reverse proxy, a server mid-restart) — so do not
+			// delete it yet. Re-enter enrollment with the configured token and
+			// let the outcome decide: a SUCCESSFUL enrollment overwrites the
+			// persisted credential (SaveCredential writes the same server key),
+			// while a spent or mistyped token leaves the old identity on disk for
+			// a restart to recover. The cached target list was already dropped by
+			// conn's quiesce on the refusal.
+			enrolled = false
+			log.Printf("[%s] the server refused this agent's credential; trying re-enrollment with the configured token", rt.cfg.Name)
+			continue
 		}
-		// The cached target list goes with it. The session has already stopped
-		// probing (conn quiesces on the revoke close code); this is what stops a
-		// restart from resurrecting the list. Best-effort on purpose: a cache the
-		// agent cannot delete is still bound to the credential just deleted, so the
-		// binding check refuses to restore it anyway — this only keeps the file
-		// from lingering.
-		if derr := desiredstate.Delete(env.cfg.DataDir, rt.cfg.Name); derr != nil {
-			log.Printf("[%s] could not drop the cached config of the revoked credential: %v", rt.cfg.Name, derr)
-		}
-		cred, enrolled = identity.Credential{}, false
-		log.Printf("[%s] agent was deleted on the server; re-enrolling", rt.cfg.Name)
+		return err
 	}
 }
 
@@ -1081,7 +1125,24 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		// this is meant to open.
 		return identity.Credential{}, fmt.Errorf("enroll: %w: %w", err, ErrEnroll)
 	}
-	cred := identity.Credential{AgentID: resp.AgentID, SiteID: resp.SiteID, AgentToken: resp.AgentToken}
+	sum := sha256.Sum256([]byte(token))
+	cred := identity.Credential{
+		AgentID:           resp.AgentID,
+		SiteID:            resp.SiteID,
+		AgentToken:        resp.AgentToken,
+		ConsumedTokenHash: hex.EncodeToString(sum[:]),
+	}
+	// The one-time token is spent the moment the exchange returned — the server
+	// consumes it in the same transaction that issued the response — so this is
+	// the one point where "clear the saved token" is exactly correct, covering
+	// both the success and the ErrLocalState paths below. Best-effort: a failure
+	// leaves an inert token in settings (the persisted hash makes the next 401
+	// recognise it as consumed) and never fails the enrollment.
+	if rt.cfg.TokenConsumed != nil {
+		if err := rt.cfg.TokenConsumed(); err != nil {
+			log.Printf("[%s] enrollment succeeded but could not clear the saved enrollment token: %v", rt.cfg.Name, err)
+		}
+	}
 	if err := identity.SaveCredential(env.cfg.DataDir, rt.cfg.Name, cred); err != nil {
 		// Wrapped so the status file can say what actually happened. The exchange
 		// SUCCEEDED here — the server issued a credential and marked the one-time

@@ -8,11 +8,15 @@ package envcfg
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -189,7 +193,7 @@ func loadServers(lookup Lookup, file File, errs *[]error) []agentrt.ServerConfig
 		if e.TLSInsecure != nil {
 			sc.Insecure = *e.TLSInsecure
 		}
-		sc.TokenSource = entryTokenSource(label, e, errs)
+		sc.TokenSource, sc.TokenHash = entryTokenSource(label, e, errs)
 
 		if e.Permissions != nil {
 			granted := parsePermissions(label+".permissions", e.Permissions.csv(), errs)
@@ -225,7 +229,8 @@ func singleServer(lookup Lookup, errs *[]error) agentrt.ServerConfig {
 			sc.Insecure = b
 		}
 	}
-	sc.TokenSource = loadTokenSource(lookup, errs)
+	sc.TokenSource, sc.TokenHash = loadTokenSource(lookup, errs)
+	sc.TokenConsumed = loadTokenConsumed(lookup, errs)
 	return sc
 }
 
@@ -257,33 +262,36 @@ func validServerName(name string) error {
 // the file is read now rather than at enrollment time (so a bad path fails at
 // startup, when someone is watching), and neither being set is not an error —
 // the entry may already hold a credential, and the runner only asks for a token
-// when it does not.
-func entryTokenSource(label string, e serverEntryFile, errs *[]error) func(context.Context) (string, error) {
+// when it does not. The second return is the configured token's sha256 for the
+// 401-recovery hook ("" when no token is set).
+func entryTokenSource(label string, e serverEntryFile, errs *[]error) (func(context.Context) (string, error), string) {
 	tokSet := e.EnrollToken != nil
 	fileSet := e.EnrollTokenFile != nil
 	if tokSet && fileSet {
 		*errs = append(*errs, fmt.Errorf("%s: enroll_token and enroll_token_file are mutually exclusive", label))
-		return nil
+		return nil, ""
 	}
 	if fileSet {
 		token, err := readTokenFile(strings.TrimSpace(*e.EnrollTokenFile))
 		if err != nil {
 			*errs = append(*errs, fmt.Errorf("%s.enroll_token_file: %w", label, err))
-			return nil
+			return nil, ""
 		}
-		return func(context.Context) (string, error) { return token, nil }
+		// Hashed like an inline token so the 401-recovery hook sees a fresh file
+		// swapped in after a credential starts being refused.
+		return func(context.Context) (string, error) { return token, nil }, inlineTokenHash(token)
 	}
 	if tokSet {
 		token := strings.TrimSpace(*e.EnrollToken)
 		if token == "" {
 			*errs = append(*errs, fmt.Errorf("%s: enroll_token is set but empty", label))
-			return nil
+			return nil, ""
 		}
-		return func(context.Context) (string, error) { return token, nil }
+		return func(context.Context) (string, error) { return token, nil }, inlineTokenHash(token)
 	}
 	return func(context.Context) (string, error) {
 		return "", fmt.Errorf("%s: first enrollment needs enroll_token or enroll_token_file: %w", label, agentrt.ErrNoEnrollmentToken)
-	}
+	}, ""
 }
 
 // readTokenFile reads and validates an enrollment-token file. The read is
@@ -535,16 +543,17 @@ func intVar(lookup Lookup, name string, def, lo, hi int, errs *[]error) int {
 // never contents — an open/read failure carries no token bytes, and "permission
 // denied" is the difference between a one-line fix and a blind restart loop (the
 // container image runs as a non-root user, so a secret file written 0600 by root
-// is unreadable to it). Returns a TokenSource yielding the resolved token, or nil
-// when neither is set (agentrt then errors only if a first-run enrollment is
-// actually needed).
-func loadTokenSource(lookup Lookup, errs *[]error) func(context.Context) (string, error) {
+// is unreadable to it). It returns a TokenSource yielding the resolved token (nil
+// when neither is set — agentrt then errors only if a first-run enrollment is
+// actually needed) and that token's sha256 for the 401-recovery hook ("" when
+// no token is configured).
+func loadTokenSource(lookup Lookup, errs *[]error) (func(context.Context) (string, error), string) {
 	tokV, tokSet := lookup("NETTACT_AGENT_ENROLL_TOKEN")
 	fileV, fileSet := lookup("NETTACT_AGENT_ENROLL_TOKEN_FILE")
 
 	if tokSet && fileSet {
 		*errs = append(*errs, errors.New("NETTACT_AGENT_ENROLL_TOKEN and NETTACT_AGENT_ENROLL_TOKEN_FILE are mutually exclusive"))
-		return nil
+		return nil, ""
 	}
 
 	if fileSet {
@@ -552,22 +561,69 @@ func loadTokenSource(lookup Lookup, errs *[]error) func(context.Context) (string
 		token, err := readTokenFile(path)
 		if err != nil {
 			*errs = append(*errs, fmt.Errorf("NETTACT_AGENT_ENROLL_TOKEN_FILE: %w", err))
-			return nil
+			return nil, ""
 		}
-		return func(context.Context) (string, error) { return token, nil }
+		// The file's value is hashed like an inline token so the 401-recovery
+		// hook sees it: a fresh file swapped in after a credential starts being
+		// refused is exactly the "different token" the hook escalates on.
+		return func(context.Context) (string, error) { return token, nil }, inlineTokenHash(token)
 	}
 
 	if tokSet {
 		token := strings.TrimSpace(tokV)
 		if token == "" {
 			*errs = append(*errs, errors.New("NETTACT_AGENT_ENROLL_TOKEN is set but empty"))
-			return nil
+			return nil, ""
 		}
-		return func(context.Context) (string, error) { return token, nil }
+		return func(context.Context) (string, error) { return token, nil }, inlineTokenHash(token)
 	}
 
 	// Neither set: enrollment can only proceed from a pre-existing credential.
 	return func(context.Context) (string, error) {
 		return "", fmt.Errorf("first run requires NETTACT_AGENT_ENROLL_TOKEN or NETTACT_AGENT_ENROLL_TOKEN_FILE: %w", agentrt.ErrNoEnrollmentToken)
+	}, ""
+}
+
+// inlineTokenHash is the sha256 of an enrollment token (inline or file), or ""
+// when there is none. The 401-recovery supervisor compares it against a
+// credential's recorded ConsumedTokenHash to tell a configured token that
+// DIFFERS from the one that enrolled the agent.
+func inlineTokenHash(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// tokenCleanupRe is the ONLY command shape the agent will run as root after an
+// enrollment consumes a token: `uci delete <option> && uci commit <package>`.
+// Executing a config-supplied string with /bin/sh -c is only defensible while
+// the string is guaranteed to be exactly this shape — the variable parts admit
+// no shell metacharacter — so anything else fails at startup, when someone is
+// watching, instead of at runtime.
+var tokenCleanupRe = regexp.MustCompile(`^uci delete [A-Za-z0-9@._-]+ && uci commit [A-Za-z0-9_-]+$`)
+
+// loadTokenConsumed wires the post-enrollment token cleanup. The command arrives
+// as an ENVIRONMENT VARIABLE, never a YAML key: an older agent binary ignores an
+// unknown NETTACT_AGENT_* variable but rejects an unknown YAML key through the
+// strict decoder, and the OpenWrt package scripts and the agent binary update
+// independently — so a new package paired with an old binary must not fail to
+// start. Empty means no cleanup (the packaging does not configure one); a
+// non-empty value outside tokenCleanupRe is a startup error.
+func loadTokenConsumed(lookup Lookup, errs *[]error) func() error {
+	cmd, set := lookup("NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD")
+	if !set || strings.TrimSpace(cmd) == "" {
+		return nil
+	}
+	cmd = strings.TrimSpace(cmd)
+	if !tokenCleanupRe.MatchString(cmd) {
+		*errs = append(*errs, errors.New("NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD must be of the exact form `uci delete <option> && uci commit <package>`"))
+		return nil
+	}
+	return func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return exec.CommandContext(ctx, "/bin/sh", "-c", cmd).Run()
 	}
 }

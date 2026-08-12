@@ -39,8 +39,9 @@ Settings (environment variable — YAML key):
   NETTACT_AGENT_SERVER_URL          server base URL, e.g. http://host:12450 (required)  — server_url
   NETTACT_AGENT_DATA_DIR            agent state directory (default ./agent-data)         — data_dir
   NETTACT_AGENT_STATUS_FILE         write a JSON connection-status file here (default: off) — status_file
-  NETTACT_AGENT_ENROLL_TOKEN        one-time enrollment token (first run only)           — enroll_token
+  NETTACT_AGENT_ENROLL_TOKEN        one-time enrollment token; re-read to classify a 401 recovery   — enroll_token
   NETTACT_AGENT_ENROLL_TOKEN_FILE   path to the enrollment token (preferred; exclusive)  — enroll_token_file
+  NETTACT_AGENT_ENROLL_TOKEN_CLEANUP_CMD  clear the saved token after enrollment (env only) — (none)
   NETTACT_AGENT_TLS_INSECURE        skip TLS verification (default false)                — tls_insecure
   NETTACT_AGENT_UPLOAD_INTERVAL     WAL drain cadence (default 30s)                      — upload_interval
   NETTACT_AGENT_WIRE_FORMAT         protobuf (default) | json                            — wire_format
