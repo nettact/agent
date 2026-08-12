@@ -48,7 +48,7 @@ func TestTCPProbeErrorClassDetail(t *testing.T) {
 		Params: pcfg.ProbeParams{Port: port, TimeoutMs: 3000}}
 
 	var okRes Result
-	c.probe(context.Background(), time.Now().UTC(), target, time.Now().Add(time.Minute), &okRes)
+	c.probe(context.Background(), target, time.Now().Add(time.Minute), &okRes)
 	ec := metricByKind(okRes, telemetry.TCPErrorClass)
 	if ec == nil || ec.Value != float64(telemetry.ProbeReasonNone) {
 		t.Fatalf("success error_class = %+v, want None", ec)
@@ -59,7 +59,7 @@ func TestTCPProbeErrorClassDetail(t *testing.T) {
 
 	ln.Close()
 	var failRes Result
-	c.probe(context.Background(), time.Now().UTC(), target, time.Now().Add(time.Minute), &failRes)
+	c.probe(context.Background(), target, time.Now().Add(time.Minute), &failRes)
 	ec = metricByKind(failRes, telemetry.TCPErrorClass)
 	if ec == nil || ec.Value != float64(telemetry.ProbeReasonRefused) {
 		t.Fatalf("refused error_class = %+v, want Refused", ec)

@@ -87,7 +87,7 @@ func (c *TCPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result
 		return Result{}, nil
 	}
 	var res Result
-	c.probe(ctx, time.Now().UTC(), t, gateWaitDeadline(sp.NextDue, tcpTimeout(t.Params)), &res)
+	c.probe(ctx, t, gateWaitDeadline(sp.NextDue, tcpTimeout(t.Params)), &res)
 	return res, nil
 }
 
@@ -187,7 +187,7 @@ func (c *TCPCollector) flowOutcome(monitorID string, configSerial int, attempted
 // segment's latency is emitted only when THAT segment succeeded — a failure is
 // never recorded as a zero-latency sample; probe.tcp.error_class carries the
 // reason and probe.tcp.ok the overall outcome (both every cycle).
-func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTarget, gateDeadline time.Time, res *Result) {
+func (c *TCPCollector) probe(ctx context.Context, t pcfg.ProbeTarget, gateDeadline time.Time, res *Result) {
 	timeout := tcpTimeout(t.Params)
 	// The cycle's slot is acquired HERE — inside probe — so the fan-out path can
 	// hand it back before its concurrent flow dials (each of which acquires its
@@ -206,6 +206,10 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 			c.gate.Release()
 		}
 	}()
+	// Stamped where the measurement happens: AFTER the wait for a slot, not when
+	// the pass that scheduled it began — a target that waited out a saturated
+	// budget must not stamp its samples at the queue-entry time.
+	now := time.Now().UTC()
 	port := strconv.Itoa(t.Params.Port)
 	labels := map[string]string{"port": port}
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
@@ -547,15 +551,31 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	haveTLS := false
 	var tlsErr error
 	if connectOK && t.Params.TLS {
-		tconn := tls.Client(conn, &tls.Config{
-			ServerName:         t.Target,
-			InsecureSkipVerify: t.Params.IgnoreTLS,
-		})
-		h0 := time.Now()
-		tlsErr = tconn.HandshakeContext(cctx)
-		tlsMs = msSince(h0)
-		conn = tconn
-		haveTLS = tlsErr == nil
+		// The handshake is another socket operation: a single-flow cycle still
+		// holds its slot here, but a fan-out cycle handed it back before the flow
+		// dials, so the handshake reacquires admission to stay inside the
+		// machine-wide budget. A handshake the budget refuses is skipped — the
+		// connect verdict stands, the TLS segment is simply not measured.
+		tlsAdmitted := true
+		if !gateHeld {
+			dl, _ := cctx.Deadline()
+			if gate := c.gate; gate.Acquire(cctx, dl) == AdmittedOK {
+				defer c.gate.Release()
+			} else {
+				tlsAdmitted = false
+			}
+		}
+		if tlsAdmitted {
+			tconn := tls.Client(conn, &tls.Config{
+				ServerName:         t.Target,
+				InsecureSkipVerify: t.Params.IgnoreTLS,
+			})
+			h0 := time.Now()
+			tlsErr = tconn.HandshakeContext(cctx)
+			tlsMs = msSince(h0)
+			conn = tconn
+			haveTLS = tlsErr == nil
+		}
 	}
 	if conn != nil {
 		_ = conn.Close()

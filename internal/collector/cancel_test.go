@@ -162,10 +162,10 @@ func TestTCPProbeAbortedResultDropped(t *testing.T) {
 	c := NewTCPCollector(netguard.New(probepolicy.Policy{}, true), nil, nil)
 	ctx := cancelledCtx()
 	var res Result
-	c.probe(ctx, time.Now().UTC(), pcfg.ProbeTarget{
+	c.probe(ctx, pcfg.ProbeTarget{
 		MonitorID: "t1", Kind: "tcp", Target: "192.0.2.1", Params: pcfg.ProbeParams{Port: 443},
 	}, time.Now().Add(time.Minute), &res)
-	c.probe(ctx, time.Now().UTC(), pcfg.ProbeTarget{
+	c.probe(ctx, pcfg.ProbeTarget{
 		MonitorID: "t2", Kind: "tcp", Target: "tcp-cancel.example", Params: pcfg.ProbeParams{Port: 443},
 	}, time.Now().Add(time.Minute), &res)
 	assertNoSamples(t, res)
