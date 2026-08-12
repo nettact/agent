@@ -398,6 +398,14 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 
 	bo := &backoff{base: opts.backoffBase, cap: opts.backoffCap}
 	for {
+		// A rotation accepted in memory but not yet on disk is retried on every
+		// session attempt: the credential file is the only thing that survives
+		// a restart, so the window between the server's commit and this write
+		// is the one gap a crash can still widen. The retry is free when
+		// nothing is pending.
+		if err := r.persistRotation(); err != nil {
+			r.logf("retry persist of the rotated credential: %v", err)
+		}
 		start := time.Now()
 		err := r.session(ctx)
 		// The session is gone, so nothing is draining the outbox's memory tier
@@ -409,6 +417,11 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 			r.logf("flush outbox after session end: %v", ferr)
 		}
 		if ctx.Err() != nil {
+			// One last chance for a pending rotation before the process goes
+			// away; the next start reads whatever landed on disk.
+			if err := r.persistRotation(); err != nil {
+				r.logf("persist of the rotated credential at shutdown: %v", err)
+			}
 			return nil // shutdown: the session already sent the close frame
 		}
 		// Application close codes that make reconnecting pointless (or actively
@@ -500,6 +513,16 @@ type runner struct {
 	appliedDiagSerial uint64
 	haveDiagSerial    bool
 	lastSnapshotAt    time.Time
+	// rotEpoch/rotToken hold a rotation this runner accepted but has not yet
+	// durably persisted (rotToken empty = nothing pending). The server commits
+	// the rotation before the result reaches us and the old token dies at the
+	// challenge's expiry, so the accepted rotation is kept in memory even when
+	// the disk write fails, and persistRotation retries it at the top of every
+	// session attempt until it lands. A restart that happens before the write
+	// landed still converges while the server's rotation window is open — the
+	// server re-issues the same result idempotently for the old token.
+	rotEpoch uint64
+	rotToken string
 
 	// appliedGame/appliedDiag are the blocks currently INSTALLED on their own
 	// axes, kept so the cache stores what this agent is running rather than
@@ -888,17 +911,16 @@ func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 		// the challenge's expiry, so a failed disk write must not strand this
 		// process reconnecting with a dying credential while the accepted
 		// result is discarded. The in-memory identity carries the session
-		// forward; a restart that lands on the stale on-disk credential
-		// converges through the server's rotation window, which re-issues the
-		// same result idempotently.
+		// forward, and the pending rotation is retried at the top of every
+		// session attempt until it lands (see persistRotation). A restart
+		// before the write landed converges through the server's rotation
+		// window, which re-issues the same result idempotently.
 		r.opts.Token = res.AgentToken
 		r.opts.EnrollmentEpoch = res.NewEpoch
 		r.opts.Hello.EnrollmentEpoch = res.NewEpoch
-		if r.deps.PersistRotation == nil {
-			return fmt.Errorf("server rotated the credential to epoch %d but no persistence hook is wired", res.NewEpoch)
-		}
-		if err := r.deps.PersistRotation(res.NewEpoch, res.AgentToken); err != nil {
-			r.logf("persist rotated credential to epoch %d: %v (running on the in-memory credential; a restart re-drives the rotation)", res.NewEpoch, err)
+		r.rotEpoch, r.rotToken = res.NewEpoch, res.AgentToken
+		if err := r.persistRotation(); err != nil {
+			r.logf("persist rotated credential to epoch %d: %v (in-memory credential in force; retrying on every reconnect)", res.NewEpoch, err)
 		}
 		return fmt.Errorf("credential rotated to epoch %d; reconnecting under the new identity: %w", res.NewEpoch, errEpochRotated)
 	default:
@@ -912,6 +934,26 @@ func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 		}
 		return fmt.Errorf("epoch rotation %s: %s", res.Status, reason)
 	}
+}
+
+// persistRotation durably writes the pending rotation, clearing the pending
+// state once it lands. It is idempotent and cheap when nothing is pending, so
+// callers retry it freely — the session loop calls it before every dial and at
+// shutdown. A missing hook is an error on every call, which surfaces the
+// wiring bug in the session log rather than silently running unpersisted.
+func (r *runner) persistRotation() error {
+	if r.rotToken == "" {
+		return nil
+	}
+	if r.deps.PersistRotation == nil {
+		return fmt.Errorf("no persistence hook is wired for the rotated credential (epoch %d)", r.rotEpoch)
+	}
+	if err := r.deps.PersistRotation(r.rotEpoch, r.rotToken); err != nil {
+		return err
+	}
+	r.logf("persisted the rotated credential (epoch %d)", r.rotEpoch)
+	r.rotEpoch, r.rotToken = 0, ""
+	return nil
 }
 
 // anchoredNow is the session's best reading of the server's current time, for
