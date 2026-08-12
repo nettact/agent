@@ -348,10 +348,13 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 				blockedOnce sync.Once
 				blockedErr  *netguard.BlockedError
 				wg          sync.WaitGroup
-				mu          sync.Mutex
 			)
 			// out[i] is written by exactly one goroutine (its own index), so no lock
-			// guards it; the shared TLS-candidate conn takes mu.
+			// guards it. The TLS candidate conn is selected AFTER Wait from the
+			// lowest-index successful flow, so it is deterministic across cycles —
+			// whichever goroutine happened to finish first must not decide which path
+			// a TLS handshake rides (each pinned source port can traverse a different
+			// ECMP member).
 			out := make([]struct {
 				attempted bool
 				bad       bool
@@ -359,6 +362,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 				ms        float64
 				reason    int
 				detail    string
+				conn      net.Conn
 			}, fanout)
 			for i := 0; i < fanout; i++ {
 				// A flow that could not start before the cycle's deadline is not
@@ -374,6 +378,16 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 					defer wg.Done()
 					fctx, fcancel := context.WithTimeout(cctx, tcpTimeout(t.Params))
 					defer fcancel()
+					// Each flow dial is accounted against the machine-wide probe
+					// budget like every other socket operation: without this a
+					// fan-out would burst fanout × targets concurrent dials past
+					// max_probe_concurrency. A flow the budget refuses is skipped
+					// (no measurement), exactly as a truncated ICMP cycle is.
+					dl, _ := fctx.Deadline()
+					if gate := c.gate; gate.Acquire(fctx, dl) != AdmittedOK {
+						return
+					}
+					defer c.gate.Release()
 					c0 := time.Now()
 					fconn, ferr := c.guard.DialSourcePort(fctx, "tcp", net.JoinHostPort(dst, port), ports[i], t.Target)
 					ms := msSince(c0)
@@ -400,25 +414,29 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 					out[i].attempted = true
 					out[i].ok = true
 					out[i].ms = ms
-					mu.Lock()
-					// The TLS candidate is the FIRST successful flow's connection,
-					// whichever flow that is: connectOK requires every attempted flow
-					// to succeed, so a non-nil conn is guaranteed whenever connectOK is
-					// true. Pinning it to flow 0 would leave conn nil — and the later
-					// tls.Client(nil, …) panicking, which the runner does not recover —
-					// when flow 0 failed to bind locally while the rest succeeded.
-					if conn == nil {
-						conn = fconn
-					} else {
-						_ = fconn.Close()
-					}
-					mu.Unlock()
+					out[i].conn = fconn
 				}(i)
 			}
 			wg.Wait()
 			if blockedErr != nil {
 				res.Blocked = append(res.Blocked, blockedFromErr(t, blockedErr))
 				return
+			}
+			// Deterministic TLS candidate: the LOWEST-index successful flow's
+			// connection. connectOK requires every attempted flow to succeed, so a
+			// non-nil conn is guaranteed whenever connectOK is true — and flow 0
+			// failing to bind locally while the rest succeed can never leave conn nil
+			// (which would make the later tls.Client(nil, …) panic, and the runner
+			// does not recover panics).
+			for i := range out {
+				if out[i].conn == nil {
+					continue
+				}
+				if conn == nil {
+					conn = out[i].conn
+				} else {
+					_ = out[i].conn.Close()
+				}
 			}
 			for i, o := range out {
 				if o.attempted {

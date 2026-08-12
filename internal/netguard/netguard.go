@@ -347,8 +347,13 @@ func (g *Guard) DialSourcePort(ctx context.Context, network, address string, sou
 	if _, perr := netip.ParseAddr(host); perr == nil {
 		auth = nil
 	}
-	if dec := g.checkAddr(auth, a); !dec.Allowed {
-		return nil, &BlockedError{Target: addrHost, Matched: dec.Matched}
+	// checkAddr has no bypass short-circuit (that lives in CheckAddr): a
+	// FullAccess guard must allow a pinned fan-out dial to loopback/link-local
+	// exactly as an ordinary guarded dial would, so the bypass is honored here.
+	if !g.bypass {
+		if dec := g.checkAddr(auth, a); !dec.Allowed {
+			return nil, &BlockedError{Target: addrHost, Matched: dec.Matched}
+		}
 	}
 	d := &net.Dialer{
 		LocalAddr: &net.TCPAddr{Port: sourcePort},
