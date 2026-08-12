@@ -883,19 +883,23 @@ func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 		if _, err := r.deps.Outbox.SetEpoch(r.opts.ServerName, res.NewEpoch); err != nil {
 			r.logf("set outbox epoch %d: %v", res.NewEpoch, err)
 		}
+		// The runner's own identity moves BEFORE the durable credential write.
+		// The server has already committed the rotation: the old token dies at
+		// the challenge's expiry, so a failed disk write must not strand this
+		// process reconnecting with a dying credential while the accepted
+		// result is discarded. The in-memory identity carries the session
+		// forward; a restart that lands on the stale on-disk credential
+		// converges through the server's rotation window, which re-issues the
+		// same result idempotently.
+		r.opts.Token = res.AgentToken
+		r.opts.EnrollmentEpoch = res.NewEpoch
+		r.opts.Hello.EnrollmentEpoch = res.NewEpoch
 		if r.deps.PersistRotation == nil {
 			return fmt.Errorf("server rotated the credential to epoch %d but no persistence hook is wired", res.NewEpoch)
 		}
 		if err := r.deps.PersistRotation(res.NewEpoch, res.AgentToken); err != nil {
-			return fmt.Errorf("persist rotated credential: %w", err)
+			r.logf("persist rotated credential to epoch %d: %v (running on the in-memory credential; a restart re-drives the rotation)", res.NewEpoch, err)
 		}
-		// The runner's own copy of the identity moves last, so the session Run
-		// opens next presents the rotated credential: the new bearer token on
-		// the upgrade request and the new epoch in the Hello and in the floor
-		// validation.
-		r.opts.Token = res.AgentToken
-		r.opts.EnrollmentEpoch = res.NewEpoch
-		r.opts.Hello.EnrollmentEpoch = res.NewEpoch
 		return fmt.Errorf("credential rotated to epoch %d; reconnecting under the new identity: %w", res.NewEpoch, errEpochRotated)
 	default:
 		// Denied, retry and any unknown status share one shape: this session's

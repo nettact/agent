@@ -1085,14 +1085,22 @@ func (s *Store) fastForwardLocked(watermark uint64) error {
 // rotates — or a session-start reconcile finds the cursor behind the
 // credential after a crash — every sequence issued under the old epoch is
 // dead. But the DATA is not: the groups belong to the same agent and are
-// still owed to the server. The cursor therefore resets to "nothing ever
-// acked" (acked=0, so the whole backlog becomes pending again) and the
-// in-flight claim is abandoned outright — it may only ever be re-served under
-// its own sequence, and that sequence cannot be renumbered in place to belong
-// to the new epoch. Everything is re-claimed under FRESH sequences once the
-// server applies its floor for the new epoch (see ApplyFloor), which is the
-// schema-8 barrier that makes "fresh" mean "above everything the server has
-// durably accepted for this agent".
+// still owed to the server. The in-flight claim is therefore abandoned
+// outright — it may only ever be re-served under its own sequence, and that
+// sequence cannot be renumbered in place to belong to the new epoch. Every
+// still-undelivered group — claimed or not — sits above the acked watermark,
+// so clearing the claim alone re-opens the owed backlog; everything is then
+// re-claimed under FRESH sequences once the server applies its floor for the
+// new epoch (see ApplyFloor), which is the schema-8 barrier that makes
+// "fresh" mean "above everything the server has durably accepted for this
+// agent".
+//
+// The acked watermark deliberately does NOT reset. Delivered groups were
+// dropped from the live index at ack time, but their lines can physically
+// survive in a segment file another server still references; the restart
+// rebuild keeps every line with gid > acked. Resetting acked would resurrect
+// that acknowledged history under new sequences after a restart — the exact
+// replay the epoch is supposed to make impossible.
 //
 // A failed state write leaves the in-memory epoch change standing: the
 // caller's session still runs under the new epoch, and a restart re-runs the
@@ -1110,7 +1118,6 @@ func (s *Store) SetEpoch(server string, epoch uint64) (int, error) {
 		return 0, nil
 	}
 	c.epoch = epoch
-	c.acked = 0
 	c.claim = nil
 	requeued := pendingRowsLocked(server, s.disk, s.mem)
 	if err := s.saveStateLocked(); err != nil {

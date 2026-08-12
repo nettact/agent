@@ -1150,7 +1150,6 @@ func (s *Store) SetEpoch(server string, epoch uint64) (int, error) {
 		return 0, nil
 	}
 	c.epoch = epoch
-	c.acked = 0
 	c.claim = nil
 	requeued := pendingRowsLocked(server, s.disk, s.mem)
 	if !s.persist {
