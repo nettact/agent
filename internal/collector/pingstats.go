@@ -5,7 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
+	"math"
 	"net"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -80,13 +83,22 @@ func pingStats(rtts []time.Duration) (avgMs, minMs, maxMs, jitterMs float64, hav
 // "other". syscall.Errno exists on every platform and no Unix errno reaches the
 // 10000 range, so the extra comparisons are safe without build tags.
 const (
-	wsaeNetUnreach  = syscall.Errno(10051) // WSAENETUNREACH
-	wsaeConnAborted = syscall.Errno(10053) // WSAECONNABORTED (aborted mid-exchange)
-	wsaeConnReset   = syscall.Errno(10054) // WSAECONNRESET
-	wsaeTimedOut    = syscall.Errno(10060) // WSAETIMEDOUT
-	wsaeConnRefused = syscall.Errno(10061) // WSAECONNREFUSED
-	wsaeHostUnreach = syscall.Errno(10065) // WSAEHOSTUNREACH
+	wsaeAddrInUse    = syscall.Errno(10048) // WSAEADDRINUSE (the local source port is taken)
+	wsaeNetUnreach   = syscall.Errno(10051) // WSAENETUNREACH
+	wsaeConnAborted  = syscall.Errno(10053) // WSAECONNABORTED (aborted mid-exchange)
+	wsaeConnReset    = syscall.Errno(10054) // WSAECONNRESET
+	wsaeTimedOut     = syscall.Errno(10060) // WSAETIMEDOUT
+	wsaeConnRefused  = syscall.Errno(10061) // WSAECONNREFUSED
+	wsaeHostUnreach  = syscall.Errno(10065) // WSAEHOSTUNREACH
 )
+
+// isAddrInUse reports whether err is a local bind failure (the source port is
+// already taken). Both errno spellings are matched — syscall.EADDRINUSE on Unix,
+// WSAEADDRINUSE on Windows — and errors.Is unwraps *net.OpError /
+// *os.SyscallError to reach the Errno, so a wrapped dial error still matches.
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, wsaeAddrInUse)
+}
 
 // classifyNetError maps a network-level error (TCP connect, HTTP transport, or a
 // DNS system-resolver failure) to a stable telemetry.ProbeReason* code, shared by
@@ -269,6 +281,68 @@ func pingReasonRank(code int) int {
 	}
 }
 
+// classifySizeSweep classifies whether ICMP loss rises with payload size, from the
+// smallest and largest swept sizes the cycle actually sent. The caller picks those
+// two sizes and passes their per-size loss percentages and echo counts. Codes:
+//
+//	2 = insufficient evidence — either compared size had fewer than two echoes sent
+//	1 = size-correlated — large payloads lose far more than small ones (the
+//	    physical-layer fingerprint: optics / CRC / FEC / ASIC / policer)
+//	0 = flat — loss not size-correlated (the congestion / queuing signature)
+//
+// The rule is deliberately conservative so a noisy small-sample uptick can never
+// be read as physical-layer degradation: correlation requires the large size to
+// lose at least twice the small's rate, OR at least 25 points more, AND at least
+// 20% on its own.
+func classifySizeSweep(lossSmall, lossLarge float64, countSmall, countLarge int) int {
+	if countSmall < 2 || countLarge < 2 {
+		return 2
+	}
+	if lossLarge >= math.Max(2.0*lossSmall, lossSmall+25.0) && lossLarge >= 20.0 {
+		return 1
+	}
+	return 0
+}
+
+// sizeSweepSample reduces a cycle's per-size tally to the probe.icmp.size_sweep
+// sample's value and label set. It returns ok=false when the cycle carries no
+// evidence — no swept size was actually attempted — in which case the caller
+// emits no sample: a classification over nothing would be a fabricated verdict.
+func sizeSweepSample(sweep []sizeSweepFact) (code int, labels map[string]string, ok bool) {
+	var (
+		sSmall, sLarge   int
+		sentS, sentL     int
+		recvS, recvL     int
+		haveSmall, haveLarge bool
+	)
+	for _, f := range sweep {
+		if f.Sent == 0 {
+			continue // only sizes actually sent are evidence
+		}
+		if !haveSmall || f.Size < sSmall {
+			sSmall, sentS, recvS, haveSmall = f.Size, f.Sent, f.Received, true
+		}
+		if !haveLarge || f.Size > sLarge {
+			sLarge, sentL, recvL, haveLarge = f.Size, f.Sent, f.Received, true
+		}
+	}
+	if !haveSmall || !haveLarge {
+		return 0, nil, false
+	}
+	lossSmall := float64(sentS-recvS) / float64(sentS) * 100.0
+	lossLarge := float64(sentL-recvL) / float64(sentL) * 100.0
+	code = classifySizeSweep(lossSmall, lossLarge, sentS, sentL)
+	labels = map[string]string{
+		telemetry.SizeSmallLabel:  strconv.Itoa(sSmall),
+		telemetry.SizeLargeLabel:  strconv.Itoa(sLarge),
+		telemetry.LossSmallLabel:  fmt.Sprintf("%.1f", lossSmall),
+		telemetry.LossLargeLabel:  fmt.Sprintf("%.1f", lossLarge),
+		telemetry.CountSmallLabel: strconv.Itoa(sentS),
+		telemetry.CountLargeLabel: strconv.Itoa(sentL),
+	}
+	return code, labels, true
+}
+
 // pingCycleResult is one ICMP probe cycle summarized: the loss and the RTT
 // distribution over the received echoes. Emitted as several Metric rows sharing
 // one TS+Target+MonitorID (loss + sent + samples always; avg/min/max only when
@@ -295,6 +369,22 @@ type pingCycleResult struct {
 	// Detail is the raw underlying cause behind Reason (OS error text, IP_STATUS
 	// name); empty when Reason is None or the platform could not say more.
 	Detail string
+	// Sweep carries the per-size tally of a size-sweeping cycle (ProbeParams.SizeSweep),
+	// one entry per swept size in pcfg.SweepSizes order. Nil when the sweep is off or
+	// the result was built without running echoes (the synthetic-failure paths): those
+	// never emit a size_sweep sample, because a classification over nothing would be a
+	// fabricated verdict about the target.
+	Sweep []sizeSweepFact
+}
+
+// sizeSweepFact is one swept size's tally within a single cycle: how many echoes
+// of that size were actually attempted and how many came back. A sweeping cycle
+// round-robins its echoes across pcfg.SweepSizes, so each swept size gets a sample
+// the size-correlation classifier (classifySizeSweep) can compare.
+type sizeSweepFact struct {
+	Size     int
+	Sent     int
+	Received int
 }
 
 // appendICMPMetrics emits the shared ICMP metric set for one cycle result. loss,
@@ -330,6 +420,24 @@ func appendICMPMetrics(res *Result, now time.Time, monitorID string, configSeria
 		)
 		if r.HaveJitter {
 			res.Metrics = append(res.Metrics, mk(telemetry.ICMPJitter, r.JitterMs, telemetry.UnitMs))
+		}
+	}
+	// A size-sweeping cycle (ProbeParams.SizeSweep) adds one size_sweep sample with
+	// the size-correlation classification and the compared sizes' evidence as labels.
+	// The facts ride on their own label map: the shared labels the other cycle
+	// metrics alias must never pick them up.
+	if len(r.Sweep) > 0 {
+		if code, sl, ok := sizeSweepSample(r.Sweep); ok {
+			merged := make(map[string]string, len(labels)+len(sl))
+			for k, v := range labels {
+				merged[k] = v
+			}
+			for k, v := range sl {
+				merged[k] = v
+			}
+			ss := mk(telemetry.ICMPSizeSweep, float64(code), telemetry.UnitCode)
+			ss.Labels = merged
+			res.Metrics = append(res.Metrics, ss)
 		}
 	}
 }

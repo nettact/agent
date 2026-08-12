@@ -101,6 +101,20 @@ func pacingDeadline(sp scheduledProbe) time.Time {
 // the sender could not classify the failure, since a class is never fabricated.
 type echoFunc func(ctx context.Context, seq int, timeout time.Duration) (rtt time.Duration, reason int, detail string, received bool)
 
+// sweepSize is the payload size echo seq of a cycle should carry. With the size
+// sweep off it is the target's fixed PacketSize; on, it round-robins across
+// pcfg.SweepSizes(params). It is the single mapping both halves of a sweeping
+// cycle agree on: the closure that builds each echo derives the payload from it
+// (seq == the loop index), and pingLoop tallies per-size facts by the same
+// formula, so what the platform sent and what the tally counts can never drift.
+func sweepSize(params pcfg.ProbeParams, seq int) int {
+	sizes := pcfg.SweepSizes(params)
+	if !params.SizeSweep || len(sizes) == 0 {
+		return params.PacketSize
+	}
+	return sizes[seq%len(sizes)]
+}
+
 // pingLoop runs one ICMP cycle for a target and returns its loss percentage and
 // the RTT distribution (avg/min/max/jitter) over the received echoes. It is the
 // single implementation of the cycle contract described above, so the platform
@@ -146,6 +160,23 @@ type echoFunc func(ctx context.Context, seq int, timeout time.Duration) (rtt tim
 func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, gate *ProbeGate, echo echoFunc) pingCycleResult {
 	count := pcfg.PingCount(params)
 	timeout := pcfg.PingEchoTimeout(params)
+
+	// A size-sweeping cycle (ProbeParams.SizeSweep) round-robins its echoes across
+	// the swept payload sizes — echo i carries sizes[i % len(sizes)] — so each size
+	// gets as many echoes as a normal cycle gives the whole target and the per-size
+	// loss comparison the sweep exists for can be drawn. The tally below is kept in
+	// the same SweepSizes order and indexed the same way sweepSize indexes, so the
+	// sent/received facts and the payload each echo actually carried agree by
+	// construction. Aggregate loss/rtt stay over ALL echoes, unchanged.
+	var sweep []sizeSweepFact
+	if params.SizeSweep {
+		if sizes := pcfg.SweepSizes(params); len(sizes) > 0 {
+			sweep = make([]sizeSweepFact, len(sizes))
+			for i, s := range sizes {
+				sweep[i].Size = s
+			}
+		}
+	}
 
 	pctx := ctx
 	var deadline time.Time
@@ -203,6 +234,14 @@ func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, g
 		}
 		sent++
 		received = ok
+		if sweep != nil {
+			f := sweep[i%len(sweep)]
+			f.Sent++
+			if received {
+				f.Received++
+			}
+			sweep[i%len(sweep)] = f
+		}
 		if received {
 			rtts = append(rtts, rtt)
 			continue
@@ -212,7 +251,7 @@ func pingLoop(ctx context.Context, params pcfg.ProbeParams, nextDue time.Time, g
 	}
 
 	got := len(rtts)
-	r := pingCycleResult{Sent: sent, Received: got}
+	r := pingCycleResult{Sent: sent, Received: got, Sweep: sweep}
 	if sent > 0 {
 		r.Loss = float64(sent-got) / float64(sent) * 100.0
 	}

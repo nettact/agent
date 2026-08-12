@@ -38,6 +38,7 @@ type gwTestPlatform struct {
 	mu     sync.Mutex
 	pinged string
 	pings  int
+	sizes  []int // payload size of each echo, in send order
 }
 
 func (p *gwTestPlatform) Interfaces(platform.IfaceQuery) ([]platform.IfaceInfo, error) {
@@ -48,6 +49,7 @@ func (p *gwTestPlatform) Ping(_ context.Context, target string, opts platform.Pi
 	seq := p.pings
 	p.pings++
 	p.pinged = target
+	p.sizes = append(p.sizes, opts.PayloadSize)
 	p.mu.Unlock()
 
 	rtt := 3 * time.Millisecond
@@ -82,6 +84,13 @@ func (p *gwTestPlatform) lastPinged() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pinged
+}
+
+// payloadSizes is the payload size of each echo in send order.
+func (p *gwTestPlatform) payloadSizes() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]int(nil), p.sizes...)
 }
 
 // defaultVia is one interface's preferred IPv4 default route, as the OS's route

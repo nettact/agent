@@ -195,8 +195,11 @@ func pickPingAddr(vetted []netip.Addr) netip.Addr {
 // loss and never to the latency distribution — lives in pingLoop, which the
 // in-tunnel path shares.
 func pingCycle(ctx context.Context, p platform.Platform, target string, params pcfg.ProbeParams, nextDue time.Time, gate *ProbeGate) pingCycleResult {
-	return pingLoop(ctx, params, nextDue, gate, func(ectx context.Context, _ int, timeout time.Duration) (time.Duration, int, string, bool) {
-		pr, err := p.Ping(ectx, target, platform.PingOptions{Timeout: timeout, PayloadSize: params.PacketSize})
+	return pingLoop(ctx, params, nextDue, gate, func(ectx context.Context, seq int, timeout time.Duration) (time.Duration, int, string, bool) {
+		// A size-sweeping cycle derives the echo's payload from its sequence
+		// number (round-robin across the swept sizes); otherwise the fixed
+		// PacketSize. pingLoop tallies per-size facts by the same mapping.
+		pr, err := p.Ping(ectx, target, platform.PingOptions{Timeout: timeout, PayloadSize: sweepSize(params, seq)})
 		if err != nil {
 			// The pinger could not run this echo at all. It still counts as lost,
 			// but with no class of its own: inventing one would put words in the

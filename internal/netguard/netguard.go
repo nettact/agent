@@ -290,6 +290,69 @@ func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []net
 	return nil, lastErr
 }
 
+// DialSourcePort dials a literal ip:port address from a pinned local source port
+// — the TCP source-port fan-out path. It exists because a fan-out's five-tuple
+// must be reproducible across cycles: ECMP/LAG hashing keys on the full tuple, so
+// a deterministic source port is what keeps each flow hitting the same member
+// every cycle, which is the entire basis for telling a stable bad subset apart
+// from uniform loss. No ephemeral-port dialer can give that, and re-dialing
+// through DialContext would both lose the pin and re-run the hostname path.
+//
+// It keeps the SAME fail-closed semantics every other guard dial has:
+//   - address MUST be a literal IP (the vetted destination a fan-out dials); a
+//     hostname is refused with a *BlockedError rather than resolved, because a
+//     fan-out deliberately dials ONE vetted address and has no business
+//     re-resolving a name that was vetted upstream.
+//   - the literal is full-checked via CheckAddr (a literal has no hostname
+//     authorization to carry, so auth stays nil — the same treatment DialContext
+//     gives a literal-IP dial), and the Control backstop re-runs the same full
+//     check on the settled syscall address.
+//   - the connection tears down with an RST instead of a FIN (SO_LINGER {1,0}),
+//     so no TIME_WAIT tuple parks the source port. A fan-out's ports must repeat
+//     every cycle; a FIN close would leave each in TIME_WAIT (120s on Windows)
+//     where a pinned port refuses to rebind (WSAEADDRINUSE), and the flow count
+//     would silently shrink after the first cycle. The probe sends no data, so
+//     an aborted teardown costs nothing.
+//
+// A bind failure (the source port is locally in use) is returned as-is; callers
+// skip that flow rather than treating it as a verdict about the target.
+func (g *Guard) DialSourcePort(ctx context.Context, network, address string, sourcePort int) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	a, perr := netip.ParseAddr(host)
+	if perr != nil {
+		return nil, &BlockedError{Target: host, Matched: "literal address required"}
+	}
+	a = a.Unmap()
+	if dec := g.CheckAddr(a); !dec.Allowed {
+		return nil, &BlockedError{Target: host, Matched: dec.Matched}
+	}
+	d := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: net.IP(a.AsSlice()), Port: sourcePort},
+		Control:   g.controlSourcePort(nil),
+	}
+	return d.DialContext(ctx, network, address)
+}
+
+// controlSourcePort returns the Dialer.Control for a pinned-source-port dial: the
+// same policy backstop a literal dial gets, plus SO_LINGER {1,0} so the connection
+// tears down with an RST instead of a FIN — see DialSourcePort for why.
+func (g *Guard) controlSourcePort(auth []bool) func(network, address string, c syscall.RawConn) error {
+	backstop := g.control(auth)
+	return func(network, address string, c syscall.RawConn) error {
+		if err := backstop(network, address, c); err != nil {
+			return err
+		}
+		var serr error
+		if err := c.Control(func(fd uintptr) { serr = setLingerRST(fd) }); err != nil {
+			return err
+		}
+		return serr
+	}
+}
+
 // checkHost applies the hostname pre-resolution check (bypass authorizes all).
 //
 // Across layers: a conclusive deny in ANY layer denies, and the name counts as

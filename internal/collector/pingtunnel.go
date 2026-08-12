@@ -52,17 +52,26 @@ func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, pa
 		network, proto, echoType = "ping6", ipv6.ICMPTypeEchoRequest.Protocol(), icmp.Type(ipv6.ICMPTypeEchoRequest)
 	}
 
-	payload := icmpEchoPayload
-	if params.PacketSize > len(payload) {
-		// Pad to the requested payload size so a size-sensitive path (MTU, fragmentation)
-		// is exercised the same way the platform pinger would.
-		payload = append(append([]byte(nil), payload...), make([]byte, params.PacketSize-len(payload))...)
-	}
-
 	return pingLoop(ctx, params, nextDue, gate, func(ectx context.Context, seq int, timeout time.Duration) (time.Duration, int, string, bool) {
+		// A size-sweeping cycle derives the echo's payload from its sequence
+		// number (round-robin across the swept sizes); otherwise the fixed
+		// PacketSize. The reply is matched on sequence + payload, so the payload
+		// must be built per-echo here, not once for the cycle.
+		payload := tunnelPayload(sweepSize(params, seq))
 		rtt, reason, detail := tunnelPingOnce(ectx, d, network, proto, echoType, addr.String(), seq, payload, timeout)
 		return rtt, reason, detail, reason == telemetry.ProbeReasonNone
 	})
+}
+
+// tunnelPayload is the echo payload for a tunnel ping of the given size: the
+// fixed probe marker padded to size, so a size-sensitive path (MTU,
+// fragmentation) is exercised the same way the platform pinger would. The marker
+// is never mutated; padding copies.
+func tunnelPayload(size int) []byte {
+	if size <= len(icmpEchoPayload) {
+		return icmpEchoPayload
+	}
+	return append(append([]byte(nil), icmpEchoPayload...), make([]byte, size-len(icmpEchoPayload))...)
 }
 
 // tunnelPingOnce sends one echo and waits for its reply. A fresh socket per echo

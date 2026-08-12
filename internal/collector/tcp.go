@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/nettact/agent/internal/netguard"
@@ -23,6 +26,23 @@ type TCPCollector struct {
 	guard   *netguard.Guard
 	proxies *proxydial.Manager
 	*probeRunner
+	// flowPrev keeps each monitor's previous fan-out cycle's per-flow failure
+	// flags, keyed by monitorID, so a deterministic bad subset (bad_stable) is
+	// distinguishable from a flapping one (bad_new) across consecutive cycles —
+	// the reproducibility that pinned source ports exist to create. The config
+	// serial the history was measured under travels with it: a material config
+	// edit re-derives the flow ports (the serial is in the seed), so the new set
+	// starts a fresh history rather than being compared against a different port
+	// set. Cycles run on separate goroutines, hence the mutex.
+	flowPrev   map[string]flowPrevState
+	flowPrevMu sync.Mutex
+}
+
+// flowPrevState is one monitor's previous fan-out cycle: the per-flow failure
+// flags in flow-plan order, and the config serial that cycle ran under.
+type flowPrevState struct {
+	serial int
+	bad    []bool
 }
 
 // NewTCPCollector builds the collector. gate is the machine-wide probe budget —
@@ -30,6 +50,7 @@ type TCPCollector struct {
 func NewTCPCollector(guard *netguard.Guard, proxies *proxydial.Manager, gate *ProbeGate) *TCPCollector {
 	return &TCPCollector{
 		guard: guard, proxies: proxies,
+		flowPrev: map[string]flowPrevState{},
 		probeRunner: newProbeRunner(pcfg.DefaultTCPInterval, gate),
 	}
 }
@@ -87,6 +108,86 @@ func tcpTimeout(p pcfg.ProbeParams) time.Duration {
 		return time.Duration(p.TimeoutMs) * time.Millisecond
 	}
 	return pcfg.DefaultTCPTimeout
+}
+
+// flowPorts derives a fan-out cycle's source ports: base..base+n-1 where base is
+// deterministic in the target, so the same flow set repeats every cycle. That
+// stability is what makes a bad subset reproducible — ECMP/LAG hashing keys on
+// the full five-tuple, so the same source port hits the same member every time,
+// and a bad member shows up as the same flows failing cycle after cycle. The
+// config serial is in the seed, so a material config edit (even one that leaves
+// the target and port untouched) starts a fresh, unrelated port set.
+func flowPorts(targetIP string, port int, monitorID string, configSerial, n int) []int {
+	h := fnv.New32a()
+	h.Write([]byte(fmt.Sprintf("%s:%d:%s:%d", targetIP, port, monitorID, configSerial)))
+	base := 10000 + int(h.Sum32()%22000)
+	out := make([]int, n)
+	for i := range out {
+		out[i] = base + i
+	}
+	return out
+}
+
+// classifyFlowFanout classifies one fan-out cycle's per-flow outcomes into the
+// probe.tcp.flow_fanout code. Codes:
+//
+//	4 = insufficient — fewer than two flows ran (could not bind enough source
+//	    ports, or the cycle's budget cut it short)
+//	3 = all flows failed — target unreachable, not merely degraded
+//	2 = member-level — a deterministic bad subset (bad_stable>0) while some flows
+//	    stay clean: the ECMP/LAG member fault the fan-out exists to find
+//	1 = uniform — no deterministic bad subset (all clean, or failures flapping
+//	    across flows)
+//
+// bad_stable / bad_new come from the one-cycle history flowOutcome keeps; this
+// function only folds the counts.
+func classifyFlowFanout(flows, badStable, badNew int) int {
+	switch {
+	case flows < 2:
+		return 4
+	case badStable == flows && badNew == 0:
+		return 3
+	case badStable > 0 && badStable+badNew < flows:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// flowOutcome folds one cycle's per-flow outcomes into the flow_fanout facts and
+// advances the monitor's history. attempted[i] reports that flow i actually bound
+// a source port and dialed; bad[i] that the dial failed. It returns the
+// classification code plus the label counts (flows / bad_stable / bad_new / ok)
+// per the contract in protocol/telemetry. A flow that did not run this cycle
+// carries no verdict, so it is absent from every count; the ok count therefore
+// also rises when a flow was clean this cycle and was not measured (or was clean)
+// last cycle.
+func (c *TCPCollector) flowOutcome(monitorID string, configSerial int, attempted, bad []bool) (code, flows, badStable, badNew, okCount int) {
+	c.flowPrevMu.Lock()
+	defer c.flowPrevMu.Unlock()
+	prev, have := c.flowPrev[monitorID]
+	if !have || prev.serial != configSerial {
+		prev = flowPrevState{}
+	}
+	next := make([]bool, len(attempted))
+	for i := range attempted {
+		if !attempted[i] {
+			continue
+		}
+		flows++
+		prevBad := i < len(prev.bad) && prev.bad[i]
+		next[i] = bad[i]
+		switch {
+		case bad[i] && prevBad:
+			badStable++
+		case bad[i]:
+			badNew++
+		case !prevBad:
+			okCount++
+		}
+	}
+	c.flowPrev[monitorID] = flowPrevState{serial: configSerial, bad: next}
+	return classifyFlowFanout(flows, badStable, badNew), flows, badStable, badNew, okCount
 }
 
 // probe runs one TCP cycle: it times DNS resolution, the pure TCP connect, and
@@ -188,20 +289,164 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	// the address the proxy reaches) or the hostname under remote mode. The guard's
 	// per-address fallback does not apply here: the proxy owns the connection attempt,
 	// so only the first vetted address is offered.
+	//
+	// A source-port FAN-OUT (ProbeParams.FlowFanout >= 2, direct dial only) replaces
+	// the single connect with FlowFanout connects from deterministic pinned source
+	// ports against ONE vetted literal destination. Aggregate semantics: probe.tcp.ok
+	// is 1 only when every flow succeeded; connect_ms is the mean over successful
+	// flows (emitted when at least one succeeded); error_class carries the first
+	// failing flow's reason; TLS still runs on flow 0 only. The per-flow outcomes
+	// feed probe.tcp.flow_fanout below.
+	fanout := t.Params.FlowFanout
+	fanoutOn := fanout >= 2 && proxy == nil // a proxied local endpoint belongs to the tunnel and cannot be pinned
+
 	addr := net.JoinHostPort(t.Target, port)
-	c0 := time.Now()
-	var conn net.Conn
-	var dialErr error
-	switch {
-	case proxy != nil:
-		conn, dialErr = proxy.DialContext(cctx, "tcp", proxyTargetAddress(proxy, t.Target, port, vetted))
-	case literal:
-		conn, dialErr = c.guard.DialContext(cctx, "tcp", addr)
-	default:
-		conn, dialErr = c.guard.DialVettedAddrs(cctx, "tcp", vetted, port, t.Target)
+	var (
+		conn          net.Conn
+		connectOK     bool
+		connectMs     float64
+		haveConnectMs bool
+		errClass      = telemetry.ProbeReasonNone
+		detail        string
+		atTarget      = true // a direct dial is always about the target
+		fanoutCode    int
+		fanoutLabels  map[string]string
+	)
+	if fanoutOn {
+		// The destination every flow dials: the vetted literal. A literal target is
+		// already one; a hostname pins the fan-out to its first vetted address. The
+		// per-address fallback has no place here — a stable five-tuple is the whole
+		// point (ECMP/LAG hashing), so every flow must hit the same destination.
+		dst := t.Target
+		if !literal {
+			dst = vetted[0].String()
+		}
+		ports := flowPorts(dst, t.Params.Port, t.MonitorID, t.ConfigSerial, fanout)
+		var (
+			firstBad     = telemetry.ProbeReasonNone
+			firstBadIdx  = -1
+			firstDetail  string
+			bindErr      error
+			attempted    = make([]bool, fanout)
+			bad          = make([]bool, fanout)
+			successFlows int
+			msSum        float64
+		)
+		for i := 0; i < fanout; i++ {
+			// A flow that could not start before the cycle's deadline is not
+			// evidence: it is excluded rather than counted bad, so budget exhaustion
+			// can never fabricate a deterministic bad subset. A flow that STARTED and
+			// ran out of the cycle's budget is a failure, exactly as a single dial
+			// that times out is.
+			if cctx.Err() != nil {
+				break
+			}
+			c0 := time.Now()
+			fconn, ferr := c.guard.DialSourcePort(cctx, "tcp", net.JoinHostPort(dst, port), ports[i])
+			ms := msSince(c0)
+			if ferr != nil {
+				var be *netguard.BlockedError
+				if errors.As(ferr, &be) {
+					res.Blocked = append(res.Blocked, blockedFromErr(t, be))
+					return
+				}
+				if isAddrInUse(ferr) {
+					// The local source port is taken: this flow never happened, so it
+					// is neither a flow nor a verdict about the target. Its error is
+					// remembered in case nothing else ran.
+					if bindErr == nil {
+						bindErr = ferr
+					}
+					continue
+				}
+				attempted[i] = true
+				bad[i] = true
+				if firstBadIdx < 0 {
+					firstBad, firstBadIdx, firstDetail = classifyNetError(ferr), i, errText(ferr)
+				}
+				continue
+			}
+			attempted[i] = true
+			successFlows++
+			msSum += ms
+			if i == 0 {
+				conn = fconn // flow 0's connection is the TLS candidate
+			} else {
+				_ = fconn.Close()
+			}
+		}
+		flows := 0
+		for _, a := range attempted {
+			if a {
+				flows++
+			}
+		}
+		connectOK = flows > 0 && successFlows == flows
+		if successFlows > 0 {
+			connectMs = msSum / float64(successFlows)
+			haveConnectMs = true
+		}
+		switch {
+		case firstBadIdx >= 0:
+			errClass, detail = firstBad, firstDetail
+		case flows == 0 && bindErr != nil:
+			// Nothing bound at all: the only failure is local, and it is still a
+			// failure — classified from the bind error rather than a fabricated
+			// verdict about the target.
+			errClass, detail = classifyNetError(bindErr), errText(bindErr)
+		}
+		code, flowsN, badStable, badNew, okN := c.flowOutcome(t.MonitorID, t.ConfigSerial, attempted, bad)
+		fanoutCode = code
+		fanoutLabels = make(map[string]string, len(labels)+4)
+		for k, v := range labels {
+			fanoutLabels[k] = v
+		}
+		fanoutLabels[telemetry.FlowFanoutFlowsLabel] = strconv.Itoa(flowsN)
+		fanoutLabels[telemetry.FlowFanoutBadStableLabel] = strconv.Itoa(badStable)
+		fanoutLabels[telemetry.FlowFanoutBadNewLabel] = strconv.Itoa(badNew)
+		fanoutLabels[telemetry.FlowFanoutOKLabel] = strconv.Itoa(okN)
+	} else {
+		var dialErr error
+		c0 := time.Now()
+		switch {
+		case proxy != nil:
+			conn, dialErr = proxy.DialContext(cctx, "tcp", proxyTargetAddress(proxy, t.Target, port, vetted))
+		case literal:
+			conn, dialErr = c.guard.DialContext(cctx, "tcp", addr)
+		default:
+			conn, dialErr = c.guard.DialVettedAddrs(cctx, "tcp", vetted, port, t.Target)
+		}
+		connectMs = msSince(c0)
+		connectOK = dialErr == nil
+		haveConnectMs = connectOK
+
+		// A literal-IP connect can still hit a policy block (surfaced by the guard).
+		var be *netguard.BlockedError
+		if errors.As(dialErr, &be) {
+			res.Blocked = append(res.Blocked, blockedFromErr(t, be))
+			return
+		}
+		// A proxied target configured for a fan-out cannot pin its local endpoint: it
+		// runs single-flow and reports the unsupported code 0 with nothing bound.
+		if fanout >= 2 {
+			fanoutCode = 0
+			fanoutLabels = make(map[string]string, len(labels)+4)
+			for k, v := range labels {
+				fanoutLabels[k] = v
+			}
+			fanoutLabels[telemetry.FlowFanoutFlowsLabel] = "0"
+			fanoutLabels[telemetry.FlowFanoutBadStableLabel] = "0"
+			fanoutLabels[telemetry.FlowFanoutBadNewLabel] = "0"
+			fanoutLabels[telemetry.FlowFanoutOKLabel] = "0"
+		}
+		if !connectOK {
+			// The failing dial is classified proxy-aware: a dead or rejecting proxy
+			// must not be reported as a closed service — that is the distinction the
+			// whole proxy_* family exists to preserve.
+			errClass, atTarget = classifyProxyAwareError(dialErr, proxy != nil)
+			detail = errText(dialErr)
+		}
 	}
-	connectMs := msSince(c0)
-	connectOK := dialErr == nil
 
 	// Phase 3 — optional TLS handshake over the live connection, timed alone.
 	var tlsMs float64
@@ -222,30 +467,15 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		_ = conn.Close()
 	}
 
-	// A literal-IP connect can still hit a policy block (surfaced by the guard).
-	var be *netguard.BlockedError
-	if errors.As(dialErr, &be) {
-		res.Blocked = append(res.Blocked, blockedFromErr(t, be))
-		return
-	}
-
 	overallOK := connectOK && tlsErr == nil
 	if !overallOK && ctx.Err() != nil {
 		return // connect/handshake aborted by the cancelled run, not the service
 	}
-	errClass := telemetry.ProbeReasonNone
-	detail := ""
-	// atTarget records whether the failure is the target's. For a proxied probe a
-	// dead or rejecting proxy must not be reported as a closed service — that is the
-	// distinction the whole proxy_* family exists to preserve.
-	atTarget := true
-	switch {
-	case !connectOK:
-		errClass, atTarget = classifyProxyAwareError(dialErr, proxy != nil)
-		detail = errText(dialErr)
-	case tlsErr != nil:
-		// The failing phase IS the handshake, so a TLS error the classifier cannot
-		// refine still lands in the TLS family (expired/untrusted/hostname otherwise).
+	// A TLS failure overrides the connect-phase classification (it can only happen
+	// when the connect succeeded): the failing phase IS the handshake, so an error
+	// the classifier cannot refine still lands in the TLS family (expired/untrusted/
+	// hostname otherwise).
+	if connectOK && tlsErr != nil {
 		errClass = telemetry.ProbeReasonTLS
 		if code, tlsShaped := classifyTLSError(tlsErr); tlsShaped {
 			errClass = code
@@ -270,11 +500,18 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	if haveDNS {
 		res.Metrics = append(res.Metrics, mk(telemetry.TCPDNSms, dnsMs, telemetry.UnitMs))
 	}
-	if connectOK {
+	if haveConnectMs {
 		res.Metrics = append(res.Metrics, mk(telemetry.TCPConnectMs, connectMs, telemetry.UnitMs))
 	}
 	if haveTLS {
 		res.Metrics = append(res.Metrics, mk(telemetry.TCPTLSms, tlsMs, telemetry.UnitMs))
+	}
+	// The fan-out classification rides on every cycle where it applies (code 0 for a
+	// proxied target), on its own label map carrying the shared port plus the counts.
+	if fanout >= 2 {
+		ff := mk(telemetry.TCPFlowFanout, float64(fanoutCode), telemetry.UnitCode)
+		ff.Labels = fanoutLabels
+		res.Metrics = append(res.Metrics, ff)
 	}
 	if !overallOK {
 		msg := "TCP connect failed: " + addr

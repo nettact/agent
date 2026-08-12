@@ -1,7 +1,11 @@
 package netguard
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/netip"
+	"strconv"
 	"testing"
 
 	"github.com/nettact/agent/probepolicy"
@@ -211,4 +215,114 @@ func TestPerLayerNameAuthorization(t *testing.T) {
 	if dec := denied.checkAddr(denied.hostAuth("api.example.com"), resolved); dec.Allowed {
 		t.Fatal("a deny in the narrowing was overridden by the floor's name authorization")
 	}
+}
+
+// TestDialSourcePortPinsLocalPort proves DialSourcePort binds the requested local
+// source port instead of an ephemeral one — the property the TCP fan-out's
+// reproducible five-tuple is built on. The guard is a bypass, so the only thing
+// under test is the pinning.
+func TestDialSourcePortPinsLocalPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	// Grab a local source port that is free right now, then hand it to the dialer.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	src := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	g := New(probepolicy.Policy{}, true) // bypass: CheckAddr and the Control backstop allow everything
+	conn, err := g.DialSourcePort(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), src)
+	if err != nil {
+		t.Fatalf("DialSourcePort: %v", err)
+	}
+	defer conn.Close()
+	local, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("LocalAddr = %T, want *net.TCPAddr", conn.LocalAddr())
+	}
+	if local.Port != src {
+		t.Fatalf("bound source port = %d, want %d (an ephemeral port would not be pinned)", local.Port, src)
+	}
+}
+
+// TestDialSourcePortRejectsHostname pins the literal-only contract: a fan-out
+// deliberately dials ONE vetted address, so a hostname is refused with a
+// *BlockedError rather than resolved — no DNS ever happens.
+func TestDialSourcePortRejectsHostname(t *testing.T) {
+	g := New(probepolicy.Policy{}, true)
+	_, err := g.DialSourcePort(context.Background(), "tcp", "localhost:80", 12345)
+	var be *BlockedError
+	if !errors.As(err, &be) {
+		t.Fatalf("DialSourcePort(localhost:80) = %v, want a *BlockedError", err)
+	}
+	if be.Matched != "literal address required" {
+		t.Fatalf("BlockedError.Matched = %q, want %q", be.Matched, "literal address required")
+	}
+}
+
+// TestDialSourcePortEnforcesPolicy: a literal dial must clear the SAME full
+// CheckAddr a plain literal dial gets, before any bind. The default policy denies
+// loopback, so a 127.0.0.1 dial is refused outright.
+func TestDialSourcePortEnforcesPolicy(t *testing.T) {
+	g := New(probepolicy.Default(), false)
+	_, err := g.DialSourcePort(context.Background(), "tcp", "127.0.0.1:80", 12345)
+	var be *BlockedError
+	if !errors.As(err, &be) {
+		t.Fatalf("DialSourcePort(127.0.0.1:80) = %v, want a *BlockedError", err)
+	}
+	if be.Target != "127.0.0.1" {
+		t.Fatalf("BlockedError.Target = %q, want 127.0.0.1 (a literal may be named)", be.Target)
+	}
+}
+
+// TestDialSourcePortAllowsVettedLiteral: a literal the policy DOES allow dials
+// through — the CheckAddr gate and the Control backstop both pass it. This pins
+// that the enforcement test above is a real check, not an always-block.
+func TestDialSourcePortAllowsVettedLiteral(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	g := New(pol(t, probepolicy.ModeAllowlist, []string{"ip:127.0.0.1"}, nil), false)
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	src := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	conn, err := g.DialSourcePort(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), src)
+	if err != nil {
+		t.Fatalf("DialSourcePort(allowlisted 127.0.0.1) = %v, want success", err)
+	}
+	conn.Close()
 }
