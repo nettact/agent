@@ -311,6 +311,10 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		atTarget      = true // a direct dial is always about the target
 		fanoutCode    int
 		fanoutLabels  map[string]string
+		// noMeasurement marks a fan-out cycle in which no flow actually reached
+		// the target (every source-port bind failed locally, or the cycle budget
+		// expired first). Such a cycle emits no availability verdict at all.
+		noMeasurement bool
 	)
 	if fanoutOn {
 		// The destination every flow dials: the vetted literal. A literal target is
@@ -326,53 +330,110 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 			firstBad     = telemetry.ProbeReasonNone
 			firstBadIdx  = -1
 			firstDetail  string
-			bindErr      error
 			attempted    = make([]bool, fanout)
 			bad          = make([]bool, fanout)
 			successFlows int
 			msSum        float64
 		)
-		for i := 0; i < fanout; i++ {
-			// A flow that could not start before the cycle's deadline is not
-			// evidence: it is excluded rather than counted bad, so budget exhaustion
-			// can never fabricate a deterministic bad subset. A flow that STARTED and
-			// ran out of the cycle's budget is a failure, exactly as a single dial
-			// that times out is.
-			if cctx.Err() != nil {
-				break
-			}
-			c0 := time.Now()
-			fconn, ferr := c.guard.DialSourcePort(cctx, "tcp", net.JoinHostPort(dst, port), ports[i])
-			ms := msSince(c0)
-			if ferr != nil {
-				var be *netguard.BlockedError
-				if errors.As(ferr, &be) {
-					res.Blocked = append(res.Blocked, blockedFromErr(t, be))
-					return
+		// The flows dial CONCURRENTLY, not sequentially: a silently-dropped SYN on
+		// one bad ECMP member (a full per-flow timeout) must not consume the shared
+		// cycle deadline and starve every later flow — if the bad member happened to
+		// be flow 0, sequential dials would collapse the fan-out to one sample per
+		// cycle and the deterministic bad subset would never be observed. Each flow
+		// is independently bounded by the single-dial timeout, so the whole fan-out
+		// completes within roughly one tcpTimeout (the cycle deadline) no matter how
+		// many members are silently dropping SYNs.
+		{
+			var (
+				blockedOnce sync.Once
+				blockedErr  *netguard.BlockedError
+				wg          sync.WaitGroup
+				mu          sync.Mutex
+			)
+			// out[i] is written by exactly one goroutine (its own index), so no lock
+			// guards it; the shared TLS-candidate conn takes mu.
+			out := make([]struct {
+				attempted bool
+				bad       bool
+				ok        bool
+				ms        float64
+				reason    int
+				detail    string
+			}, fanout)
+			for i := 0; i < fanout; i++ {
+				// A flow that could not start before the cycle's deadline is not
+				// evidence: it is excluded rather than counted bad, so budget
+				// exhaustion can never fabricate a deterministic bad subset. A flow
+				// that STARTED and ran out of its own budget is a failure, exactly as
+				// a single dial that times out is.
+				if cctx.Err() != nil {
+					break
 				}
-				if isAddrInUse(ferr) {
-					// The local source port is taken: this flow never happened, so it
-					// is neither a flow nor a verdict about the target. Its error is
-					// remembered in case nothing else ran.
-					if bindErr == nil {
-						bindErr = ferr
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					fctx, fcancel := context.WithTimeout(cctx, tcpTimeout(t.Params))
+					defer fcancel()
+					c0 := time.Now()
+					fconn, ferr := c.guard.DialSourcePort(fctx, "tcp", net.JoinHostPort(dst, port), ports[i], t.Target)
+					ms := msSince(c0)
+					if ferr != nil {
+						var be *netguard.BlockedError
+						if errors.As(ferr, &be) {
+							blockedOnce.Do(func() { blockedErr = be })
+							return
+						}
+						if isAddrInUse(ferr) {
+							// The local source port is taken: this flow never happened,
+							// so it is neither a flow nor a verdict about the target —
+							// it is simply skipped. If every flow lands here, the cycle
+							// reports no measurement at all rather than an outage (see
+							// noMeasurement).
+							return
+						}
+						out[i].attempted = true
+						out[i].bad = true
+						out[i].reason = classifyNetError(ferr)
+						out[i].detail = errText(ferr)
+						return
 					}
-					continue
-				}
-				attempted[i] = true
-				bad[i] = true
-				if firstBadIdx < 0 {
-					firstBad, firstBadIdx, firstDetail = classifyNetError(ferr), i, errText(ferr)
-				}
-				continue
+					out[i].attempted = true
+					out[i].ok = true
+					out[i].ms = ms
+					mu.Lock()
+					// The TLS candidate is the FIRST successful flow's connection,
+					// whichever flow that is: connectOK requires every attempted flow
+					// to succeed, so a non-nil conn is guaranteed whenever connectOK is
+					// true. Pinning it to flow 0 would leave conn nil — and the later
+					// tls.Client(nil, …) panicking, which the runner does not recover —
+					// when flow 0 failed to bind locally while the rest succeeded.
+					if conn == nil {
+						conn = fconn
+					} else {
+						_ = fconn.Close()
+					}
+					mu.Unlock()
+				}(i)
 			}
-			attempted[i] = true
-			successFlows++
-			msSum += ms
-			if i == 0 {
-				conn = fconn // flow 0's connection is the TLS candidate
-			} else {
-				_ = fconn.Close()
+			wg.Wait()
+			if blockedErr != nil {
+				res.Blocked = append(res.Blocked, blockedFromErr(t, blockedErr))
+				return
+			}
+			for i, o := range out {
+				if o.attempted {
+					attempted[i] = true
+				}
+				if o.bad {
+					bad[i] = true
+					if firstBadIdx < 0 {
+						firstBad, firstBadIdx, firstDetail = o.reason, i, o.detail
+					}
+				}
+				if o.ok {
+					successFlows++
+					msSum += o.ms
+				}
 			}
 		}
 		flows := 0
@@ -381,6 +442,13 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 				flows++
 			}
 		}
+		// If nothing was actually attempted — every derived source port was locally
+		// in use, or the cycle deadline expired before any flow started — no
+		// connection ever reached the target, so the condition is LOCAL, not a
+		// verdict about the service. The cycle reports no availability sample at
+		// all (see the emission below) rather than fabricating an outage from a
+		// bind error.
+		noMeasurement = flows == 0
 		connectOK = flows > 0 && successFlows == flows
 		if successFlows > 0 {
 			connectMs = msSum / float64(successFlows)
@@ -389,11 +457,6 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		switch {
 		case firstBadIdx >= 0:
 			errClass, detail = firstBad, firstDetail
-		case flows == 0 && bindErr != nil:
-			// Nothing bound at all: the only failure is local, and it is still a
-			// failure — classified from the bind error rather than a fabricated
-			// verdict about the target.
-			errClass, detail = classifyNetError(bindErr), errText(bindErr)
 		}
 		code, flowsN, badStable, badNew, okN := c.flowOutcome(t.MonitorID, t.ConfigSerial, attempted, bad)
 		fanoutCode = code
@@ -493,10 +556,17 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 	if errClass != telemetry.ProbeReasonNone {
 		ec.Labels = withDetail(labels, detail)
 	}
-	res.Metrics = append(res.Metrics,
-		mk(telemetry.TCPOK, ok, telemetry.UnitBool),
-		ec,
-	)
+	if !noMeasurement {
+		// A no-measurement cycle (every fan-out flow failed to bind a local source
+		// port) carries no ok/error verdict at all: emitting ok=0 here would feed a
+		// purely local resource conflict into service availability as a false
+		// outage. The round simply carries no availability sample, which the
+		// detector reads as "no verdict", not "down".
+		res.Metrics = append(res.Metrics,
+			mk(telemetry.TCPOK, ok, telemetry.UnitBool),
+			ec,
+		)
+	}
 	if haveDNS {
 		res.Metrics = append(res.Metrics, mk(telemetry.TCPDNSms, dnsMs, telemetry.UnitMs))
 	}
@@ -513,7 +583,7 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		ff.Labels = fanoutLabels
 		res.Metrics = append(res.Metrics, ff)
 	}
-	if !overallOK {
+	if !overallOK && !noMeasurement {
 		msg := "TCP connect failed: " + addr
 		if !atTarget {
 			// Naming the egress path in the message matters: the operator reading this

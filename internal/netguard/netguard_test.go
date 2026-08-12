@@ -247,7 +247,7 @@ func TestDialSourcePortPinsLocalPort(t *testing.T) {
 	probe.Close()
 
 	g := New(probepolicy.Policy{}, true) // bypass: CheckAddr and the Control backstop allow everything
-	conn, err := g.DialSourcePort(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), src)
+	conn, err := g.DialSourcePort(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), src, "127.0.0.1")
 	if err != nil {
 		t.Fatalf("DialSourcePort: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestDialSourcePortPinsLocalPort(t *testing.T) {
 // *BlockedError rather than resolved — no DNS ever happens.
 func TestDialSourcePortRejectsHostname(t *testing.T) {
 	g := New(probepolicy.Policy{}, true)
-	_, err := g.DialSourcePort(context.Background(), "tcp", "localhost:80", 12345)
+	_, err := g.DialSourcePort(context.Background(), "tcp", "localhost:80", 12345, "localhost")
 	var be *BlockedError
 	if !errors.As(err, &be) {
 		t.Fatalf("DialSourcePort(localhost:80) = %v, want a *BlockedError", err)
@@ -281,7 +281,7 @@ func TestDialSourcePortRejectsHostname(t *testing.T) {
 // loopback, so a 127.0.0.1 dial is refused outright.
 func TestDialSourcePortEnforcesPolicy(t *testing.T) {
 	g := New(probepolicy.Default(), false)
-	_, err := g.DialSourcePort(context.Background(), "tcp", "127.0.0.1:80", 12345)
+	_, err := g.DialSourcePort(context.Background(), "tcp", "127.0.0.1:80", 12345, "127.0.0.1")
 	var be *BlockedError
 	if !errors.As(err, &be) {
 		t.Fatalf("DialSourcePort(127.0.0.1:80) = %v, want a *BlockedError", err)
@@ -320,7 +320,7 @@ func TestDialSourcePortAllowsVettedLiteral(t *testing.T) {
 	src := probe.Addr().(*net.TCPAddr).Port
 	probe.Close()
 
-	conn, err := g.DialSourcePort(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), src)
+	conn, err := g.DialSourcePort(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), src, "127.0.0.1")
 	if err != nil {
 		t.Fatalf("DialSourcePort(allowlisted 127.0.0.1) = %v, want success", err)
 	}

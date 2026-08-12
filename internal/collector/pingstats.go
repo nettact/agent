@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -298,7 +297,7 @@ func classifySizeSweep(lossSmall, lossLarge float64, countSmall, countLarge int)
 	if countSmall < 2 || countLarge < 2 {
 		return 2
 	}
-	if lossLarge >= math.Max(2.0*lossSmall, lossSmall+25.0) && lossLarge >= 20.0 {
+	if lossLarge >= 20.0 && (lossLarge >= 2.0*lossSmall || lossLarge >= lossSmall+25.0) {
 		return 1
 	}
 	return 0

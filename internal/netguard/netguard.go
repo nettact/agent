@@ -303,10 +303,15 @@ func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []net
 //     hostname is refused with a *BlockedError rather than resolved, because a
 //     fan-out deliberately dials ONE vetted address and has no business
 //     re-resolving a name that was vetted upstream.
-//   - the literal is full-checked via CheckAddr (a literal has no hostname
-//     authorization to carry, so auth stays nil — the same treatment DialContext
-//     gives a literal-IP dial), and the Control backstop re-runs the same full
-//     check on the settled syscall address.
+//   - the literal is checked via the per-layer authorization carried by host —
+//     the hostname the address was vetted under, so a host: allowlist grant
+//     covers its resolved IPs exactly as DialVettedAddrs does. A literal-IP
+//     target passes its own address as host, which is detected as a literal and
+//     given NIL authorization: host selectors accept numeric LDH labels, so
+//     hostAuth would otherwise let a host:203.0.113.7 selector authorize a
+//     literal that matches no ip:/cidr:/scope: selector — a weaker check than a
+//     plain literal dial gets. The literal path therefore stays on the full
+//     address check.
 //   - the connection tears down with an RST instead of a FIN (SO_LINGER {1,0}),
 //     so no TIME_WAIT tuple parks the source port. A fan-out's ports must repeat
 //     every cycle; a FIN close would leave each in TIME_WAIT (120s on Windows)
@@ -314,24 +319,40 @@ func (g *Guard) DialVettedAddrs(ctx context.Context, network string, addrs []net
 //     would silently shrink after the first cycle. The probe sends no data, so
 //     an aborted teardown costs nothing.
 //
+// Only the source PORT is pinned: LocalAddr.IP stays unspecified so the OS picks
+// a local interface. Binding the destination address as the local address would
+// fail with address-not-available for any target that is not itself a local
+// interface — the fan-out dials remote targets, so the pin must be port-only.
+//
 // A bind failure (the source port is locally in use) is returned as-is; callers
 // skip that flow rather than treating it as a verdict about the target.
-func (g *Guard) DialSourcePort(ctx context.Context, network, address string, sourcePort int) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(address)
+func (g *Guard) DialSourcePort(ctx context.Context, network, address string, sourcePort int, host string) (net.Conn, error) {
+	addrHost, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
-	a, perr := netip.ParseAddr(host)
+	a, perr := netip.ParseAddr(addrHost)
 	if perr != nil {
-		return nil, &BlockedError{Target: host, Matched: "literal address required"}
+		return nil, &BlockedError{Target: addrHost, Matched: "literal address required"}
 	}
 	a = a.Unmap()
-	if dec := g.CheckAddr(a); !dec.Allowed {
-		return nil, &BlockedError{Target: host, Matched: dec.Matched}
+	// The destination is a VETTED literal: a hostname target's resolved address
+	// was already policy-approved upstream, so the dial carries the same per-layer
+	// name authorization DialVettedAddrs uses (a host: allowlist grants its
+	// resolved IPs). A LITERAL target (host == its own address) carries none: host
+	// selectors accept numeric LDH labels, so a selector like host:203.0.113.7
+	// would authorize that literal string and skip the ip:/cidr:/scope: allow
+	// check a literal is supposed to face. nil restores the full address check.
+	auth := g.hostAuth(host)
+	if _, perr := netip.ParseAddr(host); perr == nil {
+		auth = nil
+	}
+	if dec := g.checkAddr(auth, a); !dec.Allowed {
+		return nil, &BlockedError{Target: addrHost, Matched: dec.Matched}
 	}
 	d := &net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: net.IP(a.AsSlice()), Port: sourcePort},
-		Control:   g.controlSourcePort(nil),
+		LocalAddr: &net.TCPAddr{Port: sourcePort},
+		Control:   g.controlSourcePort(auth),
 	}
 	return d.DialContext(ctx, network, address)
 }

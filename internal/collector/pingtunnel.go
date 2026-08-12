@@ -64,14 +64,25 @@ func tunnelPingCycle(ctx context.Context, d *proxydial.Dialer, target string, pa
 }
 
 // tunnelPayload is the echo payload for a tunnel ping of the given size: the
-// fixed probe marker padded to size, so a size-sensitive path (MTU,
-// fragmentation) is exercised the same way the platform pinger would. The marker
-// is never mutated; padding copies.
+// probe marker repeated (and truncated) to EXACTLY size bytes, so a size-sensitive
+// path (MTU, fragmentation) is exercised the same way the platform pinger would.
+// The exact-size guarantee matters for a size-sweeping cycle: the reply is matched
+// on sequence + payload, and the sweep labels describe the bytes actually on the
+// wire — a configured size below the marker length must produce a payload of that
+// size, not the full marker. The marker is never mutated; the result is a fresh
+// slice.
 func tunnelPayload(size int) []byte {
-	if size <= len(icmpEchoPayload) {
-		return icmpEchoPayload
+	if size <= 0 {
+		size = len(icmpEchoPayload)
 	}
-	return append(append([]byte(nil), icmpEchoPayload...), make([]byte, size-len(icmpEchoPayload))...)
+	if size > 65500 { // IPv4 datagram ceiling, mirroring the platform pinger
+		size = 65500
+	}
+	buf := make([]byte, size)
+	for i := 0; i < size; i++ {
+		buf[i] = icmpEchoPayload[i%len(icmpEchoPayload)]
+	}
+	return buf
 }
 
 // tunnelPingOnce sends one echo and waits for its reply. A fresh socket per echo

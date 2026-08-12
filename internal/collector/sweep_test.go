@@ -28,8 +28,9 @@ func TestClassifySizeSweep(t *testing.T) {
 		{"flat, both losing equally", 10, 10, 2, 2, 0},
 		{"correlated: large is 2x small", 40, 90, 2, 2, 1},
 		{"correlated: large exactly 2x small", 50, 100, 2, 2, 1},
+		{"correlated: 2x small counts even when +25 does not", 20, 40, 2, 2, 1},
 		{"correlated: large exceeds small by 25", 0, 26, 2, 2, 1},
-		{"below the +25 bar", 30, 40, 2, 2, 0}, // max(60, 55) = 60 > 40
+		{"below both bars", 30, 40, 2, 2, 0}, // 40 < 2×30=60 and 40 < 30+25=55
 		{"large under 20% is never correlated", 0, 19, 2, 2, 0},
 		{"one echo per size is not evidence", 0, 100, 1, 1, 2},
 		{"missing small count", 0, 100, 1, 2, 2},
@@ -76,7 +77,7 @@ func TestPingCycleSizeSweepRoundRobinsPayloads(t *testing.T) {
 	if want := pcfg.PingCount(params); r.Sent != want || r.Received != want {
 		t.Fatalf("cycle sent %d/%d, want %d echoes (PacketCount x len(sizes))", r.Sent, r.Received, want)
 	}
-	wantSizes := []int{64, 512, 1400, 64, 512, 1400}
+	wantSizes := []int{64, 512, 1372, 64, 512, 1372}
 	if got := p.payloadSizes(); !slices.Equal(got, wantSizes) {
 		t.Fatalf("payload sizes = %v, want %v (round-robin across the sweep)", got, wantSizes)
 	}
@@ -97,7 +98,7 @@ func TestPingCycleSizeSweepRoundRobinsPayloads(t *testing.T) {
 // as a normal cycle's do.
 func TestPingCycleSizeSweepLossPerSize(t *testing.T) {
 	stubCycleClock(t)
-	// recv drops echo indices 2 and 5, which are the two 1400B echoes.
+	// recv drops echo indices 2 and 5, which are the two 1372B echoes.
 	p := &gwTestPlatform{recv: func(seq int) bool { return seq%3 != 2 }}
 	params := pcfg.ProbeParams{SizeSweep: true, PacketCount: 2}
 	r := pingCycle(context.Background(), p, "1.1.1.1", params, time.Now().Add(30*time.Second), nil)
@@ -110,14 +111,14 @@ func TestPingCycleSizeSweepLossPerSize(t *testing.T) {
 	want := []sizeSweepFact{
 		{Size: 64, Sent: 2, Received: 2},
 		{Size: 512, Sent: 2, Received: 2},
-		{Size: 1400, Sent: 2, Received: 0},
+		{Size: 1372, Sent: 2, Received: 0},
 	}
 	for i := range want {
 		if r.Sweep[i] != want[i] {
 			t.Fatalf("size %d tally = %+v, want %+v", i, r.Sweep[i], want[i])
 		}
 	}
-	// And the tally reduces to a size-correlated verdict: 100% at 1400B vs 0% at
+	// And the tally reduces to a size-correlated verdict: 100% at 1372B vs 0% at
 	// 64B.
 	code, _, ok := sizeSweepSample(r.Sweep)
 	if !ok || code != 1 {
@@ -137,7 +138,7 @@ func TestAppendICMPMetricsSizeSweepEvidence(t *testing.T) {
 		Sweep: []sizeSweepFact{
 			{Size: 64, Sent: 2, Received: 2},
 			{Size: 512, Sent: 2, Received: 2},
-			{Size: 1400, Sent: 2, Received: 0},
+			{Size: 1372, Sent: 2, Received: 0},
 		},
 	}
 	appendICMPMetrics(&res, now, "m1", 3, "1.1.1.1", telemetry.LayerInternet,
@@ -147,11 +148,11 @@ func TestAppendICMPMetricsSizeSweepEvidence(t *testing.T) {
 		t.Fatal("a sweeping cycle emitted no probe.icmp.size_sweep sample")
 	}
 	if ss.Value != 1 {
-		t.Fatalf("size_sweep = %v, want 1 (1400B lost 100%%, small sizes 0%%)", ss.Value)
+		t.Fatalf("size_sweep = %v, want 1 (1372B lost 100%%, small sizes 0%%)", ss.Value)
 	}
 	want := map[string]string{
 		telemetry.SizeSmallLabel:  "64",
-		telemetry.SizeLargeLabel:  "1400",
+		telemetry.SizeLargeLabel:  "1372",
 		telemetry.LossSmallLabel:  "0.0",
 		telemetry.LossLargeLabel:  "100.0",
 		telemetry.CountSmallLabel: "2",
@@ -193,14 +194,14 @@ func TestSizeSweepSampleInsufficientEvidence(t *testing.T) {
 	// One echo per compared size is code 2 (insufficient), not a size verdict.
 	code, _, ok := sizeSweepSample([]sizeSweepFact{
 		{Size: 64, Sent: 1, Received: 0},
-		{Size: 1400, Sent: 1, Received: 0},
+		{Size: 1372, Sent: 1, Received: 0},
 	})
 	if !ok || code != 2 {
 		t.Fatalf("sizeSweepSample over one-echo sizes = %d (ok=%v), want 2", code, ok)
 	}
 	// A size that was never attempted is not evidence at all.
 	if _, _, ok := sizeSweepSample([]sizeSweepFact{
-		{Size: 64, Sent: 0}, {Size: 512, Sent: 0}, {Size: 1400, Sent: 0},
+		{Size: 64, Sent: 0}, {Size: 512, Sent: 0}, {Size: 1372, Sent: 0},
 	}); ok {
 		t.Fatal("a cycle that sent no swept echo must not produce a sample")
 	}
