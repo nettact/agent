@@ -154,7 +154,7 @@ func TestTCPFanOutAllFlowsSucceed(t *testing.T) {
 
 	now := time.Now().UTC()
 	var res Result
-	c.probe(context.Background(), now, target, &res)
+	c.probe(context.Background(), now, target, time.Now().Add(time.Minute), &res)
 
 	ok := metricByKind(res, telemetry.TCPOK)
 	if ok == nil || ok.Value != 1 {
@@ -194,7 +194,7 @@ func TestTCPFanOutAllFlowsSucceed(t *testing.T) {
 	// Cycle 2 under the same config: the first cycle's history is all-clean, so
 	// the verdict and counts repeat.
 	var res2 Result
-	c.probe(context.Background(), time.Now().UTC(), target, &res2)
+	c.probe(context.Background(), time.Now().UTC(), target, time.Now().Add(time.Minute), &res2)
 	ff2 := metricByKind(res2, telemetry.TCPFlowFanout)
 	if ff2.Value != 1 || ff2.Labels[telemetry.FlowFanoutBadStableLabel] != "0" ||
 		ff2.Labels[telemetry.FlowFanoutBadNewLabel] != "0" || ff2.Labels[telemetry.FlowFanoutOKLabel] != "3" {

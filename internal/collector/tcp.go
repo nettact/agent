@@ -76,27 +76,18 @@ func (c *TCPCollector) Collect(ctx context.Context) (Result, error) {
 }
 
 // runTarget probes one target on its own goroutine, under a slot from the
-// machine-wide budget.
+// machine-wide budget (acquired inside probe — the fan-out path hands it back
+// before its concurrent flow dials).
 func (c *TCPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Result, func(*Result)) {
 	t := sp.Target
-	timeout := tcpTimeout(t.Params)
-	if gate := c.gate; gate.Acquire(ctx, gateWaitDeadline(sp.NextDue, timeout)) != AdmittedOK {
-		// Cancelled (shutdown or a superseded generation) or shut out by the
-		// budget. Either way nothing was measured, and a fabricated connect
-		// failure would replay from the WAL as a false service outage.
-		return Result{}, nil
-	}
-	defer c.gate.Release()
 	// A pass aborted by run cancellation (agent shutdown) must not fabricate
 	// connect failures — they would replay from the WAL as a false service
 	// outage on the next start (probe drops its own aborted result too).
 	if ctx.Err() != nil {
 		return Result{}, nil
 	}
-	// Stamped where the measurement happens: after the wait for a slot, not when
-	// the pass that scheduled it began.
 	var res Result
-	c.probe(ctx, time.Now().UTC(), t, &res)
+	c.probe(ctx, time.Now().UTC(), t, gateWaitDeadline(sp.NextDue, tcpTimeout(t.Params)), &res)
 	return res, nil
 }
 
@@ -196,8 +187,25 @@ func (c *TCPCollector) flowOutcome(monitorID string, configSerial int, attempted
 // segment's latency is emitted only when THAT segment succeeded — a failure is
 // never recorded as a zero-latency sample; probe.tcp.error_class carries the
 // reason and probe.tcp.ok the overall outcome (both every cycle).
-func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTarget, res *Result) {
+func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTarget, gateDeadline time.Time, res *Result) {
 	timeout := tcpTimeout(t.Params)
+	// The cycle's slot is acquired HERE — inside probe — so the fan-out path can
+	// hand it back before its concurrent flow dials (each of which acquires its
+	// own slot). Acquired in runTarget, the slot would be held for the whole
+	// probe and the flows would re-acquire under it: N+1 slots for N dials, which
+	// self-starves completely at a budget of 1.
+	if gate := c.gate; gate.Acquire(ctx, gateDeadline) != AdmittedOK {
+		// Cancelled (shutdown or a superseded generation) or shut out by the
+		// budget. Either way nothing was measured, and a fabricated connect
+		// failure would replay from the WAL as a false service outage.
+		return
+	}
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			c.gate.Release()
+		}
+	}()
 	port := strconv.Itoa(t.Params.Port)
 	labels := map[string]string{"port": port}
 	mk := func(kind telemetry.MetricKind, v float64, unit string) telemetry.Metric {
@@ -317,6 +325,11 @@ func (c *TCPCollector) probe(ctx context.Context, now time.Time, t pcfg.ProbeTar
 		noMeasurement bool
 	)
 	if fanoutOn {
+		// Hand the cycle's slot back to the budget: the concurrent flow dials
+		// below each acquire their own, so the cycle must not hold N+1 slots for
+		// N dials (see the gateHeld note at the acquisition above).
+		c.gate.Release()
+		gateHeld = false
 		// The destination every flow dials: the vetted literal. A literal target is
 		// already one; a hostname pins the fan-out to its first vetted address. The
 		// per-address fallback has no place here — a stable five-tuple is the whole
