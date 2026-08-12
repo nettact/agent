@@ -397,6 +397,14 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 	r.restoreProbeConfig()
 
 	bo := &backoff{base: opts.backoffBase, cap: opts.backoffCap}
+	// Every exit path from the loop below — shutdown during a backoff sleep
+	// included — gets one final chance to land a pending rotation on disk, so
+	// the next start reads the rotated credential instead of the dying old one.
+	defer func() {
+		if err := r.persistRotation(); err != nil {
+			r.logf("persist of the rotated credential at shutdown: %v", err)
+		}
+	}()
 	for {
 		// A rotation accepted in memory but not yet on disk is retried on every
 		// session attempt: the credential file is the only thing that survives
@@ -417,11 +425,6 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 			r.logf("flush outbox after session end: %v", ferr)
 		}
 		if ctx.Err() != nil {
-			// One last chance for a pending rotation before the process goes
-			// away; the next start reads whatever landed on disk.
-			if err := r.persistRotation(); err != nil {
-				r.logf("persist of the rotated credential at shutdown: %v", err)
-			}
 			return nil // shutdown: the session already sent the close frame
 		}
 		// Application close codes that make reconnecting pointless (or actively
