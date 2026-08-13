@@ -304,7 +304,7 @@ func TestFileNeverContainsProxyMaterial(t *testing.T) {
 // on-disk cache under the new token — the lazy re-key that keeps an offline
 // restart restorable without ever rewriting the cache mid-rotation.
 func TestBindingRebindUpdatesLiveFingerprint(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	const server = "default"
 
 	b := Bind(dir, server, "old-token", "agent_a", "site_default")
@@ -331,7 +331,7 @@ func TestBindingRebindUpdatesLiveFingerprint(t *testing.T) {
 // the new token with SetPrev(old fingerprint) must still restore the cache the
 // old token wrote.
 func TestBindingSetPrevAdmitsOldCache(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	const server = "default"
 
 	old := Bind(dir, server, "old-token", "agent_a", "site_default")
@@ -359,7 +359,7 @@ func TestBindingSetPrevAdmitsOldCache(t *testing.T) {
 // own identity, not the token fingerprint — so consecutive rotations cannot
 // strand the cache out of the admissible set.
 func TestRebindReKeysByIdentityAcrossGenerations(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	const server = "default"
 
 	// The cache the agent's oldest credential wrote.

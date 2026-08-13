@@ -965,11 +965,12 @@ func (r *runner) persistRotation() error {
 	// Re-key the desired-state cache only once the credential is durable:
 	// re-keying before that would let a crash restart with the OLD credential
 	// while the cache already speaks the NEW token, which the old binding
-	// cannot admit. A failed re-key is non-fatal — the credential records the
-	// old fingerprint, so a restart still restores the old-keyed cache.
+	// cannot admit. A failed re-key returns an error so the pending rotation is
+	// retained and retried — the credential write above is idempotent, so the
+	// retry re-runs only the re-key.
 	if r.deps.Desired != nil {
 		if err := r.deps.Desired.Rebind(r.rotToken); err != nil {
-			r.logf("re-key desired-state cache to epoch %d: %v", r.rotEpoch, err)
+			return fmt.Errorf("re-key desired-state cache to epoch %d: %w", r.rotEpoch, err)
 		}
 	}
 	r.logf("persisted the rotated credential (epoch %d)", r.rotEpoch)

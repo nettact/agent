@@ -186,23 +186,32 @@ func (b *Binding) Rebind(newToken string) error {
 		return nil
 	}
 	next := Fingerprint(newToken)
-	if next != b.fingerprint {
-		b.prev = b.fingerprint
-		b.fingerprint = next
+	if next == b.fingerprint {
+		return nil
 	}
-	return b.rekeyDisk()
+	// Re-key every ADMISSIBLE snapshot to the new token BEFORE advancing the
+	// in-memory previous fingerprint. A snapshot is admissible when it carries
+	// either the current or the previous fingerprint (and matching ids) — which
+	// is exactly what Load would already accept. Re-keying first means a cache
+	// stranded on the previous token (a crash window with no intervening save)
+	// is carried forward to the new generation instead of being orphaned by the
+	// prev overwrite below. A snapshot on neither fingerprint — foreign, or
+	// older than the previous credential — is never touched.
+	if err := b.rekeyTo(next); err != nil {
+		return err
+	}
+	b.prev = b.fingerprint
+	b.fingerprint = next
+	return nil
 }
 
-// rekeyDisk rewrites this server's snapshot to the binding's current
-// fingerprint, guarded by IDENTITY (agent and site ids), not by fingerprint.
-// The fingerprint axis is the wrong guard: a rotation can strand the cache
-// several tokens back — a digest-gated Save never re-keyed it across
-// consecutive rotations — but it is still this agent's own configuration, so
-// re-keying it is safe and necessary. A foreign snapshot (different ids — a
-// re-pointed server) is never touched; it stays discarded and the on-connect
-// push re-establishes it. Idempotent: a snapshot already at the current
-// fingerprint is a no-op, so a retry after a failed write is safe.
-func (b *Binding) rekeyDisk() error {
+// rekeyTo rewrites this server's snapshot to `target` when it is admissible:
+// its ids match this binding and its fingerprint is the binding's current or
+// previous one. Anything else (a foreign snapshot, or one older than the
+// previous credential) is left as-is — Load would reject it, and re-keying it
+// would promote stale or foreign configuration with a potentially higher
+// ConfigVersion. Idempotent: a snapshot already at `target` is a no-op.
+func (b *Binding) rekeyTo(target string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -211,10 +220,16 @@ func (b *Binding) rekeyDisk() error {
 		return err
 	}
 	s, ok := doc[b.server]
-	if !ok || s.AgentID != b.agentID || s.SiteID != b.siteID || s.CredFingerprint == b.fingerprint {
+	if !ok || s.AgentID != b.agentID || s.SiteID != b.siteID {
 		return nil
 	}
-	s.CredFingerprint = b.fingerprint
+	if s.CredFingerprint != b.fingerprint && s.CredFingerprint != b.prev {
+		return nil
+	}
+	if s.CredFingerprint == target {
+		return nil
+	}
+	s.CredFingerprint = target
 	doc[b.server] = s
 	return saveAll(b.dir, doc)
 }
