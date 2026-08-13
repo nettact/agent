@@ -203,6 +203,12 @@ func TestHTTPThroughProxySucceeds(t *testing.T) {
 	if metricByKind(res, telemetry.HTTPLat) == nil {
 		t.Fatal("a successful proxied probe emitted no latency sample")
 	}
+	if metricByKind(res, telemetry.HTTPTotalMs) == nil || metricByKind(res, telemetry.HTTPTTFBMs) == nil {
+		t.Fatal("a successful proxied probe emitted no end-to-end timing")
+	}
+	if got := metricByKind(res, telemetry.HTTPConnectMs); got != nil {
+		t.Fatalf("proxied probe emitted target connect_ms from an unattributable proxy dial: %+v", got)
+	}
 }
 
 // The client cache must be keyed on the proxy GENERATION, or a rotated credential

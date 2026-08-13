@@ -50,6 +50,14 @@ func TestHTTPFanoutUsesStableDistinctSourcePorts(t *testing.T) {
 		if ff == nil || ff.Value != 1 || ff.Labels[telemetry.FlowFanoutFlowsLabel] != "4" || ff.Labels[telemetry.FlowFanoutOKLabel] != "4" {
 			t.Fatalf("cycle %d flow fan-out = %+v, want four clean branches", cycle+1, ff)
 		}
+		for _, kind := range []telemetry.MetricKind{telemetry.HTTPTotalMs, telemetry.HTTPTTFBMs, telemetry.HTTPConnectMs} {
+			if metricByKind(res, kind) == nil {
+				t.Fatalf("cycle %d missing fan-out %s", cycle+1, kind)
+			}
+		}
+		if reused := metricByKind(res, telemetry.HTTPConnectionReused); reused == nil || reused.Value != 0 {
+			t.Fatalf("cycle %d connection_reused = %+v, want 0 with keep-alives disabled", cycle+1, reused)
+		}
 		mu.Lock()
 		got := append([]int(nil), current...)
 		current = nil
@@ -112,5 +120,39 @@ func TestHTTPFanoutClassifiesStableFailingBranch(t *testing.T) {
 	}
 	if ec := metricByKind(second, telemetry.HTTPErrorClass); ec == nil || ec.Value != float64(telemetry.ProbeReasonHTTPStatus) {
 		t.Fatalf("error class = %+v, want HTTP status failure", ec)
+	}
+}
+
+func TestHTTPFanoutTruncatedKeywordBodiesOmitTiming(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\npartial")
+		_ = buf.Flush()
+	}))
+	defer srv.Close()
+
+	c := NewHTTPCollector(testGuard(), nil, true, nil)
+	target := pcfg.ProbeTarget{MonitorID: "http_truncated_fanout", ConfigSerial: 3, Kind: "http", Target: srv.URL,
+		Params: pcfg.ProbeParams{Keyword: "welcome", FlowFanout: 4, MaxRedirects: -1, TimeoutMs: 3000}}
+	res := runHTTPFanoutCycle(c, target)
+
+	if ok := metricByKind(res, telemetry.HTTPOK); ok == nil || ok.Value != 0 {
+		t.Fatalf("http.ok = %+v, want 0", ok)
+	}
+	if ec := metricByKind(res, telemetry.HTTPErrorClass); ec == nil || ec.Value == float64(telemetry.ProbeReasonHTTPKeyword) {
+		t.Fatalf("error class = %+v, want a transport failure", ec)
+	}
+	for _, kind := range []telemetry.MetricKind{
+		telemetry.HTTPTotalMs, telemetry.HTTPTTFBMs, telemetry.HTTPDNSMs,
+		telemetry.HTTPConnectMs, telemetry.HTTPTLSMs, telemetry.HTTPConnectionReused,
+	} {
+		if got := metricByKind(res, kind); got != nil {
+			t.Fatalf("truncated fan-out unexpectedly emitted %s: %+v", kind, got)
+		}
 	}
 }

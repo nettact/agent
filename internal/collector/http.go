@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -29,6 +31,255 @@ const defaultMaxResponseBytes = 1024
 // errTooManyRedirects marks a redirect chain that exceeded the configured limit
 // as a failure (returned from CheckRedirect so Client.Do surfaces an error).
 var errTooManyRedirects = errors.New("too many redirects")
+
+// httpTimingTrace is scoped to one logical Client.Do call (including redirects).
+// The cached Transport is shared by concurrent targets, so measurement state must
+// travel in the request context rather than live on the client or transport.
+type httpTimingTrace struct {
+	mu sync.Mutex
+
+	started time.Time
+
+	firstByte     time.Time
+	haveFirstByte bool
+	gotConn       bool
+	reused        bool
+
+	dnsMs     float64
+	connectMs float64
+	tlsMs     float64
+	haveDNS   bool
+	haveConn  bool
+	haveTLS   bool
+}
+
+type httpTimingSnapshot struct {
+	totalMs float64
+	ttfbMs  float64
+	dnsMs   float64
+	connMs  float64
+	tlsMs   float64
+
+	haveTTFB  bool
+	haveDNS   bool
+	haveConn  bool
+	haveTLS   bool
+	haveReuse bool
+	reused    bool
+}
+
+// httpTimingConn carries the phase work that produced one candidate connection.
+// A Transport can start this dial and then late-bind the request to a different
+// idle connection. Keeping the candidate data on the connection means GotConn,
+// which names the connection actually selected, is the only place that commits
+// it to the request's timing totals.
+type httpTimingConn struct {
+	net.Conn
+	dnsMs       float64
+	connectMs   float64
+	haveDNS     bool
+	haveConnect bool
+
+	ioMu      sync.Mutex
+	ioStarted time.Time
+	ioDone    time.Time
+}
+
+// Read and Write bracket all I/O below the Transport. Before GotConn, HTTPS
+// uses that connection only for its TLS handshake; request bytes are written
+// afterwards. The interval therefore measures the successful TLS handshake on
+// the selected candidate without relying on trace callbacks that carry no
+// connection identity and can belong to a late-binding loser.
+func (c *httpTimingConn) Read(p []byte) (int, error) {
+	c.noteIOStart()
+	n, err := c.Conn.Read(p)
+	c.noteIODone()
+	return n, err
+}
+
+func (c *httpTimingConn) Write(p []byte) (int, error) {
+	c.noteIOStart()
+	n, err := c.Conn.Write(p)
+	c.noteIODone()
+	return n, err
+}
+
+func (c *httpTimingConn) noteIOStart() {
+	c.ioMu.Lock()
+	if c.ioStarted.IsZero() {
+		c.ioStarted = time.Now()
+	}
+	c.ioMu.Unlock()
+}
+
+func (c *httpTimingConn) noteIODone() {
+	c.ioMu.Lock()
+	c.ioDone = time.Now()
+	c.ioMu.Unlock()
+}
+
+func (c *httpTimingConn) tlsMs() (float64, bool) {
+	c.ioMu.Lock()
+	defer c.ioMu.Unlock()
+	if c.ioStarted.IsZero() || c.ioDone.Before(c.ioStarted) {
+		return 0, false
+	}
+	return durationMs(c.ioDone.Sub(c.ioStarted)), true
+}
+
+func selectedHTTPConnTiming(conn net.Conn) (*httpTimingConn, bool) {
+	tlsUsed := false
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		conn = tlsConn.NetConn()
+		tlsUsed = true
+	}
+	timed, _ := conn.(*httpTimingConn)
+	return timed, tlsUsed
+}
+
+func (t *httpTimingTrace) traceRequest(req *http.Request) *http.Request {
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			// Redirect round trips are sequential. Overwriting here deliberately
+			// leaves the connection used by the final response.
+			t.gotConn = true
+			t.reused = info.Reused
+			if info.Reused {
+				return
+			}
+			connTiming, tlsUsed := selectedHTTPConnTiming(info.Conn)
+			if connTiming == nil {
+				return
+			}
+			if connTiming.haveDNS {
+				t.dnsMs += connTiming.dnsMs
+				t.haveDNS = true
+			}
+			if connTiming.haveConnect {
+				t.connectMs += connTiming.connectMs
+				t.haveConn = true
+			}
+			if tlsMs, ok := connTiming.tlsMs(); tlsUsed && ok {
+				t.tlsMs += tlsMs
+				t.haveTLS = true
+			}
+		},
+		GotFirstResponseByte: func() {
+			t.mu.Lock()
+			// The last callback belongs to the final redirect hop.
+			t.firstByte = time.Now()
+			t.haveFirstByte = true
+			t.mu.Unlock()
+		},
+		Got1xxResponse: func(_ int, _ textproto.MIMEHeader) error {
+			t.mu.Lock()
+			// net/http calls GotFirstResponseByte only once per round trip. If an
+			// informational response arrived first, there is no trace hook for the
+			// final response's first byte, so omit TTFB for this hop. A later
+			// redirect hop gets its own GotFirstResponseByte and restores it.
+			t.haveFirstByte = false
+			t.mu.Unlock()
+			return nil
+		},
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+}
+
+func (t *httpTimingTrace) finish() httpTimingSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := httpTimingSnapshot{
+		totalMs: durationMs(time.Since(t.started)),
+		dnsMs:   t.dnsMs, connMs: t.connectMs, tlsMs: t.tlsMs,
+		haveDNS: t.haveDNS, haveConn: t.haveConn, haveTLS: t.haveTLS,
+		haveReuse: t.gotConn, reused: t.reused,
+	}
+	if t.haveFirstByte {
+		s.ttfbMs = durationMs(t.firstByte.Sub(t.started))
+		s.haveTTFB = true
+	}
+	return s
+}
+
+func durationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
+}
+
+// httpDialFunc preserves proxyDialFunc's fail-closed resolve/vet/pin behavior,
+// while splitting the phases whose duration can be attributed to the target.
+// The whole successful DialVettedAddrs call is connect time: failed addresses
+// tried before the winning address still delayed obtaining that new connection.
+func httpDialFunc(guard *netguard.Guard, proxy *proxydial.Dialer) proxydial.DialFunc {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+
+		if a, parseErr := netip.ParseAddr(host); parseErr == nil {
+			if proxy != nil {
+				dec := guard.CheckAddr(a.Unmap())
+				if !dec.Allowed {
+					return nil, &netguard.BlockedError{Target: host, Matched: dec.Matched}
+				}
+				conn, dialErr := proxy.DialContext(ctx, network, address)
+				if dialErr != nil {
+					return nil, dialErr
+				}
+				return &httpTimingConn{Conn: conn}, nil
+			}
+			started := time.Now()
+			conn, dialErr := guard.DialContext(ctx, network, address)
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			return &httpTimingConn{Conn: conn, connectMs: msSince(started), haveConnect: true}, nil
+		}
+
+		if proxy != nil && proxy.ResolvesRemotely() {
+			conn, dialErr := proxy.DialContext(ctx, network, address)
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			return &httpTimingConn{Conn: conn}, nil
+		}
+		hd := guard.CheckHost(host)
+		if hd.Denied {
+			return nil, &netguard.BlockedError{Target: host, Matched: hd.Matched}
+		}
+		resolveStarted := time.Now()
+		vetted, resolveErr := guard.ResolveVetted(ctx, host, hd.NameAuthorized)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		dnsMs := msSince(resolveStarted)
+
+		if proxy != nil {
+			var lastErr error
+			for _, a := range vetted {
+				conn, dialErr := proxy.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
+				if dialErr == nil {
+					return &httpTimingConn{Conn: conn, dnsMs: dnsMs, haveDNS: true}, nil
+				}
+				lastErr = dialErr
+			}
+			if lastErr == nil {
+				lastErr = &netguard.BlockedError{Target: host, FromResolve: true}
+			}
+			return nil, lastErr
+		}
+
+		connectStarted := time.Now()
+		conn, dialErr := guard.DialVettedAddrs(ctx, network, vetted, port, host)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		return &httpTimingConn{Conn: conn, dnsMs: dnsMs, connectMs: msSince(connectStarted),
+			haveDNS: true, haveConnect: true}, nil
+	}
+}
 
 // HTTPCollector performs HTTP/HTTPS availability checks against a
 // server-configured URL set (architecture §4 service layer). Each URL carries
@@ -121,7 +372,7 @@ func (c *HTTPCollector) clientFor(ignoreTLS bool, maxRedirects int, proxy *proxy
 	//
 	// TLS is unaffected by dialing a literal: Transport takes ServerName from the
 	// request URL, not from the dial address.
-	dial := proxyDialFunc(c.guard, proxy)
+	dial := httpDialFunc(c.guard, proxy)
 	tr := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dial,
@@ -333,7 +584,10 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 		}
 
 		client := c.clientFor(t.Params.IgnoreTLS, t.Params.MaxRedirects, proxy)
+		timing := &httpTimingTrace{}
+		req = timing.traceRequest(req)
 		t0 := time.Now()
+		timing.started = t0
 		resp, err := client.Do(req)
 		lat := float64(time.Since(t0).Microseconds()) / 1000.0
 		if err != nil {
@@ -382,6 +636,7 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 		// Read the body only when a keyword match is configured, bounded so a large
 		// response can't blow up agent memory. Otherwise drain a little and close.
 		bodyMatch := true
+		bodyVerdictComplete := true
 		// bodyErr is kept so a body cut short by a reset/truncation is not mistaken
 		// for a content mismatch: reading only part of the body proves nothing about
 		// what the rest contained. Hitting the LimitReader cap is not an error
@@ -396,13 +651,18 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 			buf, bodyErr = io.ReadAll(io.LimitReader(resp.Body, int64(limit)))
 			found := strings.Contains(string(buf), t.Params.Keyword)
 			bodyMatch = found != t.Params.KeywordInvert // invert flips the required condition
+			// Seeing the keyword settles both positive and inverted checks even if
+			// the connection fails later. Without a match, an incomplete body cannot
+			// prove either absence or success of the inverted check.
+			bodyVerdictComplete = bodyErr == nil || found
 		}
+		statusOK := statusAccepted(status, t.Params.AcceptedStatuses)
+		timingSnapshot := timing.finish()
 		resp.Body.Close()
 		cancel()
 
-		statusOK := statusAccepted(status, t.Params.AcceptedStatuses)
 		ok := 0.0
-		if statusOK && bodyMatch {
+		if statusOK && bodyVerdictComplete && bodyMatch {
 			ok = 1.0
 		}
 		// The headers arrived, so a failure here is normally an acceptance failure:
@@ -418,7 +678,7 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 		case !statusOK:
 			errClass = telemetry.ProbeReasonHTTPStatus
 			detail = "HTTP " + strconv.Itoa(status)
-		case !bodyMatch && bodyErr != nil:
+		case !bodyVerdictComplete:
 			errClass = classifyNetError(bodyErr)
 			detail = errText(bodyErr)
 		case !bodyMatch:
@@ -441,8 +701,43 @@ func (c *HTTPCollector) runTarget(ctx context.Context, sp scheduledProbe) (Resul
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPOK, Target: t.Target, Layer: telemetry.LayerService, Value: ok, Unit: telemetry.UnitBool, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 			ec,
 		)
+		// A body read failure can happen after valid response headers arrived. When
+		// it prevents the configured keyword check from reaching a verdict, the
+		// round is still a transport failure and must not publish partial timings.
+		timingEligible := !statusOK || bodyVerdictComplete
+		if timingEligible {
+			res.Metrics = append(res.Metrics, httpTimingMetrics(now, t, timingSnapshot)...)
+		}
 	}
 	return res, nil
+}
+
+func httpTimingMetrics(now time.Time, t pcfg.ProbeTarget, timing httpTimingSnapshot) []telemetry.Metric {
+	mk := func(kind telemetry.MetricKind, value float64, unit string) telemetry.Metric {
+		return telemetry.Metric{TS: now, Kind: kind, Target: t.Target, Layer: telemetry.LayerService,
+			Value: value, Unit: unit, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial}
+	}
+	metrics := []telemetry.Metric{mk(telemetry.HTTPTotalMs, timing.totalMs, telemetry.UnitMs)}
+	if timing.haveTTFB {
+		metrics = append(metrics, mk(telemetry.HTTPTTFBMs, timing.ttfbMs, telemetry.UnitMs))
+	}
+	if timing.haveDNS {
+		metrics = append(metrics, mk(telemetry.HTTPDNSMs, timing.dnsMs, telemetry.UnitMs))
+	}
+	if timing.haveConn {
+		metrics = append(metrics, mk(telemetry.HTTPConnectMs, timing.connMs, telemetry.UnitMs))
+	}
+	if timing.haveTLS {
+		metrics = append(metrics, mk(telemetry.HTTPTLSMs, timing.tlsMs, telemetry.UnitMs))
+	}
+	if timing.haveReuse {
+		reused := 0.0
+		if timing.reused {
+			reused = 1
+		}
+		metrics = append(metrics, mk(telemetry.HTTPConnectionReused, reused, telemetry.UnitBool))
+	}
+	return metrics
 }
 
 type httpFanoutBranch struct {
@@ -450,6 +745,8 @@ type httpFanoutBranch struct {
 	bad       bool
 	status    int
 	latencyMs float64
+	timing    httpTimingSnapshot
+	timingOK  bool
 	reason    int
 	detail    string
 	blocked   *netguard.BlockedError
@@ -478,6 +775,8 @@ func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now t
 	cycleCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	dst := host
+	var dnsMs float64
+	haveDNS := false
 	if a, parseErr := netip.ParseAddr(host); parseErr == nil {
 		dst = a.Unmap().String()
 		if dec := c.guard.CheckAddr(a.Unmap()); !dec.Allowed {
@@ -488,6 +787,7 @@ func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now t
 		if hd.Denied {
 			return Result{Blocked: []BlockedProbe{{MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial, Matched: hd.Matched, Reason: "resolved_denied"}}}
 		}
+		resolveStarted := time.Now()
 		vetted, resolveErr := c.guard.ResolveVetted(cycleCtx, host, hd.NameAuthorized)
 		if resolveErr != nil {
 			var be *netguard.BlockedError
@@ -507,6 +807,8 @@ func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now t
 			// than two attempted branches (for example, local binds all failed).
 			return httpFanoutFailureResult(now, t, reason, errText(resolveErr), "HTTP DNS resolution failed: "+t.Target)
 		}
+		dnsMs = msSince(resolveStarted)
+		haveDNS = true
 		dst = vetted[0].String()
 	}
 
@@ -550,6 +852,10 @@ func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now t
 	firstResponseStatus := 0
 	responseCount := 0
 	latencySum := 0.0
+	var timingSum httpTimingSnapshot
+	ttfbCount := 0
+	connectCount := 0
+	tlsCount := 0
 	for i, branch := range out {
 		attempted[i] = branch.attempted
 		bad[i] = branch.bad
@@ -565,6 +871,24 @@ func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now t
 			}
 			responseCount++
 			latencySum += branch.latencyMs
+			if branch.timingOK {
+				timingSum.totalMs += branch.timing.totalMs
+				timingSum.ttfbMs += branch.timing.ttfbMs
+				timingSum.connMs += branch.timing.connMs
+				timingSum.tlsMs += branch.timing.tlsMs
+				timingSum.haveTTFB = timingSum.haveTTFB || branch.timing.haveTTFB
+				timingSum.haveConn = timingSum.haveConn || branch.timing.haveConn
+				timingSum.haveTLS = timingSum.haveTLS || branch.timing.haveTLS
+				if branch.timing.haveTTFB {
+					ttfbCount++
+				}
+				if branch.timing.haveConn {
+					connectCount++
+				}
+				if branch.timing.haveTLS {
+					tlsCount++
+				}
+			}
 		}
 	}
 	code, flows, badStable, badNew, okCount := c.flowHistory.outcome(t.MonitorID, t.ConfigSerial, attempted, bad)
@@ -605,10 +929,45 @@ func (c *HTTPCollector) runFanout(ctx context.Context, t pcfg.ProbeTarget, now t
 		ff,
 	}}
 	if representativeStatus > 0 {
+		timingCount := 0
+		for _, branch := range out {
+			if branch.status > 0 && branch.timingOK {
+				timingCount++
+			}
+		}
+		if timingCount > 0 {
+			timingSum.totalMs /= float64(timingCount)
+			// Fan-out deliberately disables keep-alives and closes every request, so
+			// connection reuse is an aggregate invariant rather than a branch value.
+			timingSum.haveReuse = true
+			timingSum.reused = false
+		}
+		if ttfbCount > 0 {
+			timingSum.ttfbMs /= float64(ttfbCount)
+		}
+		if connectCount > 0 {
+			timingSum.connMs /= float64(connectCount)
+		}
+		if tlsCount > 0 {
+			timingSum.tlsMs /= float64(tlsCount)
+		}
+		if haveDNS && timingCount > 0 {
+			timingSum.dnsMs = dnsMs
+			timingSum.haveDNS = true
+			// Fan-out resolves once before its concurrent branch requests. Account
+			// that shared prerequisite in each branch-shaped end-to-end duration.
+			timingSum.totalMs += dnsMs
+			if timingSum.haveTTFB {
+				timingSum.ttfbMs += dnsMs
+			}
+		}
 		res.Metrics = append(res.Metrics,
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPStatus, Target: t.Target, Layer: telemetry.LayerService, Value: float64(representativeStatus), Unit: telemetry.UnitCode, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 			telemetry.Metric{TS: now, Kind: telemetry.HTTPLat, Target: t.Target, Layer: telemetry.LayerService, Value: latencySum / float64(responseCount), Unit: telemetry.UnitMs, MonitorID: t.MonitorID, ConfigSerial: t.ConfigSerial},
 		)
+		if timingCount > 0 {
+			res.Metrics = append(res.Metrics, httpTimingMetrics(now, t, timingSum)...)
+		}
 	}
 	if !ok {
 		res.Events = append(res.Events, telemetry.Event{ID: newID(), TS: now, Type: telemetry.EventProbeFailed,
@@ -624,7 +983,12 @@ func (c *HTTPCollector) httpFanoutRequest(ctx context.Context, t pcfg.ProbeTarge
 		ForceAttemptHTTP2:   false,
 		TLSHandshakeTimeout: 10 * time.Second,
 		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
-			return c.guard.DialSourcePort(dialCtx, network, net.JoinHostPort(dst, strconv.Itoa(port)), sourcePort, host)
+			started := time.Now()
+			conn, dialErr := c.guard.DialSourcePort(dialCtx, network, net.JoinHostPort(dst, strconv.Itoa(port)), sourcePort, host)
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			return &httpTimingConn{Conn: conn, connectMs: msSince(started), haveConnect: true}, nil
 		},
 	}
 	if t.Params.IgnoreTLS {
@@ -652,7 +1016,10 @@ func (c *HTTPCollector) httpFanoutRequest(ctx context.Context, t pcfg.ProbeTarge
 			req.Header.Set(k, v)
 		}
 	}
+	timing := &httpTimingTrace{}
+	req = timing.traceRequest(req)
 	t0 := time.Now()
+	timing.started = t0
 	resp, err := client.Do(req)
 	latency := msSince(t0)
 	if err != nil {
@@ -665,8 +1032,8 @@ func (c *HTTPCollector) httpFanoutRequest(ctx context.Context, t pcfg.ProbeTarge
 		}
 		return httpFanoutBranch{attempted: true, bad: true, reason: classifyNetError(err), detail: errText(err)}
 	}
-	defer resp.Body.Close()
 	bodyMatch := true
+	bodyVerdictComplete := true
 	var bodyErr error
 	if t.Params.Keyword != "" {
 		limit := t.Params.MaxResponseBytes
@@ -675,14 +1042,18 @@ func (c *HTTPCollector) httpFanoutRequest(ctx context.Context, t pcfg.ProbeTarge
 		}
 		buf, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(limit)))
 		bodyErr = readErr
-		bodyMatch = strings.Contains(string(buf), t.Params.Keyword) != t.Params.KeywordInvert
+		found := strings.Contains(string(buf), t.Params.Keyword)
+		bodyMatch = found != t.Params.KeywordInvert
+		bodyVerdictComplete = bodyErr == nil || found
 	}
 	statusOK := statusAccepted(resp.StatusCode, t.Params.AcceptedStatuses)
+	timingSnapshot := timing.finish()
+	_ = resp.Body.Close()
 	b := httpFanoutBranch{attempted: true, status: resp.StatusCode, latencyMs: latency}
 	switch {
 	case !statusOK:
 		b.bad, b.reason, b.detail = true, telemetry.ProbeReasonHTTPStatus, "HTTP "+strconv.Itoa(resp.StatusCode)
-	case !bodyMatch && bodyErr != nil:
+	case !bodyVerdictComplete:
 		b.bad, b.reason, b.detail = true, classifyNetError(bodyErr), errText(bodyErr)
 	case !bodyMatch:
 		b.bad, b.reason = true, telemetry.ProbeReasonHTTPKeyword
@@ -692,6 +1063,11 @@ func (c *HTTPCollector) httpFanoutRequest(ctx context.Context, t pcfg.ProbeTarge
 			b.detail = "keyword " + strconv.Quote(t.Params.Keyword) + " not found"
 		}
 	}
+	b.timing = timingSnapshot
+	// A status rejection is already a complete acceptance verdict, even if its
+	// body later truncated. Otherwise a body read error that leaves the keyword
+	// unresolved makes this branch ineligible for timing aggregation.
+	b.timingOK = !statusOK || bodyVerdictComplete
 	return b
 }
 
