@@ -357,11 +357,17 @@ func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string, key 
 			if !ok {
 				return fmt.Errorf("rotate %q: no credential to update", rt.cfg.Name)
 			}
+			// Idempotent: a retry after a partial write (the rename landed, the
+			// trailing chmod failed) must not recompute the previous fingerprint
+			// from the token that is now already the current one — that would
+			// record the wrong old fingerprint and strand a still-old cache.
+			if cur.AgentToken == token && cur.EnrollmentEpoch == epoch {
+				return nil
+			}
 			// Record the fingerprint of the bearer being replaced, so a restart
-			// that lands before the desired-state cache was re-keyed (the live
-			// binding does that lazily, on its next Save) still accepts the old
-			// cache. Written BEFORE the token swap so the "old" value is the
-			// credential actually being retired.
+			// that lands before the desired-state cache was re-keyed still
+			// accepts the old cache. Written BEFORE the token swap so the "old"
+			// value is the credential actually being retired.
 			cur.PrevTokenFingerprint = desiredstate.Fingerprint(cur.AgentToken)
 			cur.AgentToken = token
 			cur.EnrollmentEpoch = epoch

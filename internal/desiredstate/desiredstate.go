@@ -169,24 +169,49 @@ func Bind(dataDir, server, agentToken, agentID, siteID string) *Binding {
 	}
 }
 
-// Rebind moves the binding to a new credential (a controlled rotation). It is
-// IN-MEMORY only: the fingerprint flips to the new token and the previous one
-// is remembered, so Load keeps accepting a cache written under the old token
-// until the next Save re-keys it under the new one. That laziness is the
-// crash-safety — the on-disk cache is never rewritten mid-rotation, and the
-// credential's PrevTokenFingerprint (set by the persistence hook) authorizes
-// the old cache across a restart, so whichever of the two durable writes a
-// crash interrupts, an offline restart still restores the targets.
-func (b *Binding) Rebind(newToken string) {
+// Rebind moves the binding to a new credential (a controlled rotation) and
+// re-keys the on-disk cache to match, eagerly: the snapshot is rewritten under
+// the new token whenever it still carries the binding's previous fingerprint,
+// so consecutive rotations never let the cache drift more than one token
+// behind (a digest-gated Save would otherwise leave it on an arbitrarily old
+// bearer). The re-key is GUARDED — it runs only when the snapshot matches the
+// previous fingerprint AND this binding's agent/site ids, so a foreign or
+// missing snapshot is never authorized; it stays discarded and the on-connect
+// push re-establishes it. The previous fingerprint is remembered so Load keeps
+// accepting the old-keyed cache across a crash that lands between the
+// credential write and this re-key. Returns the save error so the caller's
+// persistence retry can re-attempt; a later call is idempotent.
+func (b *Binding) Rebind(newToken string) error {
 	if b == nil {
-		return
+		return nil
 	}
 	next := Fingerprint(newToken)
-	if next == b.fingerprint {
-		return
+	if next != b.fingerprint {
+		b.prev = b.fingerprint
+		b.fingerprint = next
 	}
-	b.prev = b.fingerprint
-	b.fingerprint = next
+	return b.rekeyDisk(b.prev)
+}
+
+// rekeyDisk rewrites this server's snapshot from `from` to the binding's
+// current fingerprint, only when it actually matches `from` and the binding's
+// ids. A snapshot already at the current fingerprint (a retry after a
+// successful re-key) or one at neither (foreign/missing) is a no-op.
+func (b *Binding) rekeyDisk(from string) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	doc, err := loadLocked(b.dir)
+	if err != nil {
+		return err
+	}
+	s, ok := doc[b.server]
+	if !ok || s.CredFingerprint != from || s.AgentID != b.agentID || s.SiteID != b.siteID {
+		return nil
+	}
+	s.CredFingerprint = b.fingerprint
+	doc[b.server] = s
+	return saveAll(b.dir, doc)
 }
 
 // SetPrev restores the previous credential's fingerprint, re-arming the

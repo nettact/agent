@@ -1139,17 +1139,11 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		// agree on which epoch this identity is on.
 		EnrollmentEpoch: resp.EnrollmentEpoch,
 	}
-	// The one-time token is spent the moment the exchange returned — the server
-	// consumes it in the same transaction that issued the response — so this is
-	// the one point where "clear the saved token" is exactly correct, covering
-	// both the success and the ErrLocalState paths below. Best-effort: a failure
-	// leaves an inert token in settings (the persisted hash makes the next 401
-	// recognise it as consumed) and never fails the enrollment.
-	if rt.cfg.TokenConsumed != nil {
-		if err := rt.cfg.TokenConsumed(); err != nil {
-			log.Printf("[%s] enrollment succeeded but could not clear the saved enrollment token: %v", rt.cfg.Name, err)
-		}
-	}
+	// Persist the credential FIRST — it is the durable recovery path. The cleanup
+	// command's `uci commit` can fire the procd reload trigger on OpenWrt and
+	// restart this very service, so the credential must be on disk before the
+	// token is cleared; otherwise a restart between the two would strand the
+	// machine with a spent token and no credential.
 	if err := identity.SaveCredential(env.cfg.DataDir, rt.cfg.Name, cred); err != nil {
 		// Wrapped so the status file can say what actually happened. The exchange
 		// SUCCEEDED here — the server issued a credential and marked the one-time
@@ -1157,9 +1151,28 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		// overlay, most likely). Reported as a transport failure it would read as
 		// "the server could not be reached", sending someone to check the network
 		// while the retry burns a token that is already gone.
+		//
+		// The token is spent either way, so clear it on this path too — a spent
+		// token can never help a retry, and leaving it would mislead the next
+		// start into retrying a dead token.
+		rt.clearToken()
 		return identity.Credential{}, fmt.Errorf("save credential: %w: %w", err, ErrLocalState)
 	}
+	rt.clearToken()
 	return cred, nil
+}
+
+// clearToken clears the saved enrollment token after a successful exchange.
+// Best-effort on purpose: the token is already spent, so a failure only leaves
+// an inert string in settings (the persisted hash keeps the next 401 from
+// mistaking it for a fresh one) and never fails the enrollment.
+func (rt *serverRuntime) clearToken() {
+	if rt.cfg.TokenConsumed == nil {
+		return
+	}
+	if err := rt.cfg.TokenConsumed(); err != nil {
+		log.Printf("[%s] could not clear the saved enrollment token: %v", rt.cfg.Name, err)
+	}
 }
 
 // sleepCtx waits for d, reporting false if ctx ended first.

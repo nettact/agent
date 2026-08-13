@@ -424,6 +424,14 @@ func TestEnrollServerConsumesTheToken(t *testing.T) {
 		},
 		TokenConsumed: func() error {
 			consumedCalled.Add(1)
+			// The credential must already be durable before the token is cleared:
+			// the cleanup command's `uci commit` can restart the service on OpenWrt
+			// (procd reload), so a token clear that raced ahead of the credential
+			// write would strand the machine. This asserts the write happened first.
+			creds, err := identity.LoadCredentials(dataDir)
+			if err != nil || creds["default"].AgentID != "agent-x" {
+				t.Errorf("credential not persisted before token cleanup: %v, %+v", err, creds)
+			}
 			return nil
 		},
 		// The default Enroller would POST to a server; inject one.

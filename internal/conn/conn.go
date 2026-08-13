@@ -933,15 +933,6 @@ func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 		if err := r.persistRotation(); err != nil {
 			r.logf("persist rotated credential to epoch %d: %v (in-memory credential in force; retrying on every reconnect)", res.NewEpoch, err)
 		}
-		// The live desired-state cache binding follows the credential in memory:
-		// a later DesiredState save writes under the new bearer (the lazy re-key),
-		// and the previous fingerprint stays admissible across the crash window.
-		// The credential the persistence hook just wrote records that previous
-		// fingerprint, so a restart that lands before the next save still restores
-		// the targets.
-		if r.deps.Desired != nil {
-			r.deps.Desired.Rebind(res.AgentToken)
-		}
 		return fmt.Errorf("credential rotated to epoch %d; reconnecting under the new identity: %w", res.NewEpoch, errEpochRotated)
 	default:
 		// Denied, retry and any unknown status share one shape: this session's
@@ -970,6 +961,16 @@ func (r *runner) persistRotation() error {
 	}
 	if err := r.deps.PersistRotation(r.rotEpoch, r.rotToken); err != nil {
 		return err
+	}
+	// Re-key the desired-state cache only once the credential is durable:
+	// re-keying before that would let a crash restart with the OLD credential
+	// while the cache already speaks the NEW token, which the old binding
+	// cannot admit. A failed re-key is non-fatal — the credential records the
+	// old fingerprint, so a restart still restores the old-keyed cache.
+	if r.deps.Desired != nil {
+		if err := r.deps.Desired.Rebind(r.rotToken); err != nil {
+			r.logf("re-key desired-state cache to epoch %d: %v", r.rotEpoch, err)
+		}
 	}
 	r.logf("persisted the rotated credential (epoch %d)", r.rotEpoch)
 	r.rotEpoch, r.rotToken = 0, ""
