@@ -352,3 +352,52 @@ func TestBindingSetPrevAdmitsOldCache(t *testing.T) {
 		t.Fatal("new-token binding restores a foreign cache without the prev hint")
 	}
 }
+
+// TestRebindReKeysByIdentityAcrossGenerations pins the drift fix: a cache left
+// on an old token (a crash window, or a digest-gated Save that never re-keyed
+// it) is still re-keyed by a later rotation because Rebind matches the agent's
+// own identity, not the token fingerprint — so consecutive rotations cannot
+// strand the cache out of the admissible set.
+func TestRebindReKeysByIdentityAcrossGenerations(t *testing.T) {
+	dir := t.TempDir()
+	const server = "default"
+
+	// The cache the agent's oldest credential wrote.
+	if err := Bind(dir, server, "token-A", "agent_a", "site_default").Save(Config{ConfigVersion: 7}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// Simulate a crash window: the new binding admits the old cache via prev,
+	// and no Save re-keyed it (digest unchanged).
+	b := Bind(dir, server, "token-B", "agent_a", "site_default")
+	b.SetPrev(Fingerprint("token-A"))
+	if _, ok := b.Load(); !ok {
+		t.Fatal("prev-admitting load did not restore the old cache")
+	}
+	// A second rotation B -> C must re-key the still-A-keyed cache by identity.
+	if err := b.Rebind("token-C"); err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	// A fresh C binding (no prev hint) restores it — the cache is no longer
+	// stranded on A.
+	cfg, ok := Bind(dir, server, "token-C", "agent_a", "site_default").Load()
+	if !ok || cfg.ConfigVersion != 7 {
+		t.Fatalf("C binding = %+v, ok=%v; want the re-keyed cache", cfg, ok)
+	}
+	// A foreign-identity snapshot is never re-keyed: a snapshot owned by a
+	// different agent_id is left on its own fingerprint.
+	if err := Bind(dir, server, "token-A", "someone_else", "site_default").Save(Config{ConfigVersion: 99}); err != nil {
+		t.Fatalf("save foreign: %v", err)
+	}
+	if err := Bind(dir, server, "token-C", "agent_a", "site_default").Rebind("token-D"); err != nil {
+		t.Fatalf("rebind over foreign: %v", err)
+	}
+	// The foreign snapshot is still restorable under its own (token-A,
+	// someone_else) binding — Rebind did not touch it.
+	if _, ok := Bind(dir, server, "token-A", "someone_else", "site_default").Load(); !ok {
+		t.Fatal("foreign snapshot was dropped by an unrelated Rebind")
+	}
+	// And it was NOT re-keyed to token-D.
+	if _, ok := Bind(dir, server, "token-D", "someone_else", "site_default").Load(); ok {
+		t.Fatal("foreign snapshot was re-keyed by an unrelated Rebind")
+	}
+}

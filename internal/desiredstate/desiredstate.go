@@ -190,14 +190,19 @@ func (b *Binding) Rebind(newToken string) error {
 		b.prev = b.fingerprint
 		b.fingerprint = next
 	}
-	return b.rekeyDisk(b.prev)
+	return b.rekeyDisk()
 }
 
-// rekeyDisk rewrites this server's snapshot from `from` to the binding's
-// current fingerprint, only when it actually matches `from` and the binding's
-// ids. A snapshot already at the current fingerprint (a retry after a
-// successful re-key) or one at neither (foreign/missing) is a no-op.
-func (b *Binding) rekeyDisk(from string) error {
+// rekeyDisk rewrites this server's snapshot to the binding's current
+// fingerprint, guarded by IDENTITY (agent and site ids), not by fingerprint.
+// The fingerprint axis is the wrong guard: a rotation can strand the cache
+// several tokens back — a digest-gated Save never re-keyed it across
+// consecutive rotations — but it is still this agent's own configuration, so
+// re-keying it is safe and necessary. A foreign snapshot (different ids — a
+// re-pointed server) is never touched; it stays discarded and the on-connect
+// push re-establishes it. Idempotent: a snapshot already at the current
+// fingerprint is a no-op, so a retry after a failed write is safe.
+func (b *Binding) rekeyDisk() error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -206,7 +211,7 @@ func (b *Binding) rekeyDisk(from string) error {
 		return err
 	}
 	s, ok := doc[b.server]
-	if !ok || s.CredFingerprint != from || s.AgentID != b.agentID || s.SiteID != b.siteID {
+	if !ok || s.AgentID != b.agentID || s.SiteID != b.siteID || s.CredFingerprint == b.fingerprint {
 		return nil
 	}
 	s.CredFingerprint = b.fingerprint
