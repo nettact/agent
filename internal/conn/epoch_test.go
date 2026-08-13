@@ -463,6 +463,14 @@ func TestRotationDeniedKeepsCredential(t *testing.T) {
 
 	var reqs int32
 	srv := startServer(t, func(ctx context.Context, c *websocket.Conn) {
+		// The agent keeps reconnecting after the denial; once the test has
+		// observed its two requests, further connections are teardown noise.
+		// Bail before reading so a connection closed by the test's cleanup is
+		// never misreported as a handler failure (the background handler runs
+		// off the test goroutine and would otherwise log after completion).
+		if atomic.LoadInt32(&reqs) >= 2 {
+			return
+		}
 		if f, err := srvRead(ctx, c); err != nil || f.Hello == nil {
 			t.Errorf("hello: %+v err=%v", f, err)
 			return
@@ -597,6 +605,168 @@ func TestRotationPersistRetriedUntilSuccess(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("PersistRotation call %d never arrived", want)
 		}
+	}
+	waitFor(t, "the rotated session connected", func() bool { return atomic.LoadInt32(&conns) >= 2 })
+}
+
+// TestUnsolicitedRotationResultReissues pins the P2 review fix: the server
+// re-issues a committed rotation's result without a prior challenge (the
+// phase-1 crash-recovery path — the agent persisted the old credential before
+// the result arrived). The agent must accept it, persist the new credential
+// and reconnect under it, instead of rejecting an "unrequested" result and
+// retrying forever.
+func TestUnsolicitedRotationResultReissues(t *testing.T) {
+	deps, _, _, _ := newTestDeps(t)
+	type rotated struct {
+		epoch uint64
+		token string
+	}
+	rotCh := make(chan rotated, 1)
+	deps.SignChallenge = func(challenge []byte) []byte { return append([]byte("sig:"), challenge...) }
+	deps.PersistRotation = func(epoch uint64, token string) error {
+		rotCh <- rotated{epoch, token}
+		return nil
+	}
+
+	var conns int32
+	srv := startTokenServer(t, []string{"test-token", "rotated-token"}, func(ctx context.Context, c *websocket.Conn) {
+		n := atomic.AddInt32(&conns, 1)
+		hello, err := srvRead(ctx, c)
+		if err != nil || hello.Hello == nil {
+			t.Errorf("hello: %+v err=%v", hello, err)
+			return
+		}
+		if n == 1 {
+			if hello.Hello.EnrollmentEpoch != 5 {
+				t.Errorf("first Hello epoch = %d, want 5", hello.Hello.EnrollmentEpoch)
+				return
+			}
+			// No challenge, no floor — the result alone. The agent must accept it.
+			if err := srvWrite(ctx, c, wire.Frame{EpochRotationResult: &wire.EpochRotationResult{
+				Status: wire.RotationOK, NewEpoch: 6, AgentToken: "rotated-token",
+			}}); err != nil {
+				t.Errorf("write re-issued result: %v", err)
+				return
+			}
+			_, _ = srvRead(ctx, c) // hold until the agent ends the session
+			return
+		}
+		if hello.Hello.EnrollmentEpoch != 6 {
+			t.Errorf("second Hello epoch = %d, want 6 (the re-issued credential)", hello.Hello.EnrollmentEpoch)
+			return
+		}
+		_, _ = srvRead(ctx, c)
+	})
+
+	cancel := runAgent(t, epochOptions(srv.URL, wire.SubprotocolJSON, 5), deps)
+	defer cancel()
+
+	select {
+	case got := <-rotCh:
+		if got.epoch != 6 || got.token != "rotated-token" {
+			t.Fatalf("PersistRotation(%d, %q), want (6, rotated-token)", got.epoch, got.token)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PersistRotation never called — the re-issued result was rejected")
+	}
+	waitFor(t, "the rotated session connected", func() bool { return atomic.LoadInt32(&conns) >= 2 })
+}
+
+// TestConflictChallengeRotatesWithoutAckWait pins the P2 review fix: a
+// sequence-conflict challenge that arrives while the agent is blocked awaiting
+// a packet's ack must be handled inline (the server withholds the ack and
+// challenges instead), so the agent rotates on the SAME session rather than
+// waiting out the ack timeout and reconnecting.
+func TestConflictChallengeRotatesWithoutAckWait(t *testing.T) {
+	deps, outbox, _, _ := newTestDeps(t)
+	type rotated struct {
+		epoch uint64
+		token string
+	}
+	rotCh := make(chan rotated, 1)
+	deps.SignChallenge = func(challenge []byte) []byte { return append([]byte("sig:"), challenge...) }
+	deps.PersistRotation = func(epoch uint64, token string) error {
+		rotCh <- rotated{epoch, token}
+		return nil
+	}
+	// An in-flight claim: the agent will drain it and then block in awaitAck.
+	if _, err := outbox.SetEpoch(testServer, 5); err != nil {
+		t.Fatalf("SetEpoch: %v", err)
+	}
+	if _, err := outbox.Append(wal.Records{Metrics: []telemetry.Metric{{
+		TS: time.Now().UTC(), Kind: telemetry.AgentUptime, Target: "agent", Value: 42,
+	}}}, testServer); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	var reqSeen int32
+	var conns int32
+	srv := startTokenServer(t, []string{"test-token", "rotated-token"}, func(ctx context.Context, c *websocket.Conn) {
+		n := atomic.AddInt32(&conns, 1)
+		hello, err := srvRead(ctx, c)
+		if err != nil || hello.Hello == nil {
+			t.Errorf("hello: %+v err=%v", hello, err)
+			return
+		}
+		if n == 1 {
+			if err := srvWrite(ctx, c, wire.Frame{SequenceFloor: &wire.SequenceFloor{
+				EnrollmentEpoch: 5, SequenceFloor: 0,
+			}}); err != nil {
+				t.Errorf("write floor: %v", err)
+				return
+			}
+			if f, err := srvRead(ctx, c); err != nil || f.SequenceFloorApplied == nil {
+				t.Errorf("applied: %+v err=%v", f, err)
+				return
+			}
+			pkt, err := srvRead(ctx, c)
+			if err != nil || pkt.Packet == nil {
+				t.Errorf("packet: %+v err=%v", pkt, err)
+				return
+			}
+			// The conflict: challenge instead of an ack. The agent is blocked in
+			// awaitAck and must answer on this same connection.
+			if err := srvWrite(ctx, c, wire.Frame{EpochRotationChallenge: &wire.EpochRotationChallenge{
+				Challenge: "chal-conflict", Reason: "sequence_conflict", ExpiresAt: time.Now().Add(time.Minute),
+			}}); err != nil {
+				t.Errorf("write challenge: %v", err)
+				return
+			}
+			req, err := srvRead(ctx, c)
+			if err != nil || req.EpochRotationRequest == nil {
+				t.Errorf("rotation request after the in-flight challenge: %+v err=%v", req, err)
+				return
+			}
+			atomic.StoreInt32(&reqSeen, 1)
+			if err := srvWrite(ctx, c, wire.Frame{EpochRotationResult: &wire.EpochRotationResult{
+				Status: wire.RotationOK, NewEpoch: 6, AgentToken: "rotated-token",
+			}}); err != nil {
+				t.Errorf("write result: %v", err)
+				return
+			}
+			_, _ = srvRead(ctx, c)
+			return
+		}
+		if hello.Hello.EnrollmentEpoch != 6 {
+			t.Errorf("second Hello epoch = %d, want 6", hello.Hello.EnrollmentEpoch)
+			return
+		}
+		_, _ = srvRead(ctx, c)
+	})
+
+	cancel := runAgent(t, epochOptions(srv.URL, wire.SubprotocolJSON, 5), deps)
+	defer cancel()
+
+	// The rotation request must arrive on the first connection — the inline
+	// handling — well before any ack-timeout-driven reconnect could.
+	waitFor(t, "the rotation request on the same session", func() bool { return atomic.LoadInt32(&reqSeen) == 1 })
+	select {
+	case got := <-rotCh:
+		if got.epoch != 6 || got.token != "rotated-token" {
+			t.Fatalf("PersistRotation(%d, %q), want (6, rotated-token)", got.epoch, got.token)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PersistRotation never called")
 	}
 	waitFor(t, "the rotated session connected", func() bool { return atomic.LoadInt32(&conns) >= 2 })
 }

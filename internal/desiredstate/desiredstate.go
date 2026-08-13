@@ -242,6 +242,32 @@ func Delete(dataDir, server string) error {
 	return saveAll(dataDir, doc)
 }
 
+// Rebind re-keys this server's cached snapshot under a new credential. A
+// controlled epoch rotation keeps the same agent and the same configuration
+// the server told it to run — only the bearer fingerprint the snapshot is
+// stored under changes. Re-keying (rather than forgetting) is what lets an
+// offline restart after a rotation restore its targets instead of going silent
+// until the server's next on-connect push; a missing or foreign snapshot is a
+// no-op, because the on-connect push re-establishes it anyway.
+func Rebind(dataDir, server, newToken, agentID, siteID string) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	doc, err := loadLocked(dataDir)
+	if err != nil {
+		return err
+	}
+	s, ok := doc[server]
+	if !ok {
+		return nil
+	}
+	s.CredFingerprint = Fingerprint(newToken)
+	s.AgentID = agentID
+	s.SiteID = siteID
+	doc[server] = s
+	return saveAll(dataDir, doc)
+}
+
 // Prune drops the entries of every server not named in keep, and reports how
 // many it removed. Same contract as identity.PruneCredentials: only a caller
 // whose configuration is the complete and authoritative server list may use it.

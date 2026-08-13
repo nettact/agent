@@ -298,3 +298,35 @@ func TestFileNeverContainsProxyMaterial(t *testing.T) {
 		t.Fatalf("proxy_id = %v, want the pin preserved", got)
 	}
 }
+
+// TestRebindReKeysSnapshot pins the rotation fix: re-keying a cached snapshot
+// under the new token keeps it restorable after a rotation, so an offline
+// restart restores its targets instead of refusing a foreign-credential cache.
+func TestRebindReKeysSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	const server = "default"
+	oldToken, newToken := "old-token", "new-token"
+
+	b := Bind(dir, server, oldToken, "agent_a", "site_default")
+	if err := b.Save(Config{ConfigVersion: 7, ProbeTargets: []pcfg.ProbeTarget{{Target: "192.168.1.1"}}}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	if err := Rebind(dir, server, newToken, "agent_a", "site_default"); err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+
+	// The old binding must now miss (foreign credential), and the new one must
+	// restore the same configuration.
+	if _, ok := b.Load(); ok {
+		t.Fatal("old-token binding still restores after a re-key")
+	}
+	nb := Bind(dir, server, newToken, "agent_a", "site_default")
+	cfg, ok := nb.Load()
+	if !ok {
+		t.Fatal("new-token binding does not restore the re-keyed snapshot")
+	}
+	if cfg.ConfigVersion != 7 || len(cfg.ProbeTargets) != 1 || cfg.ProbeTargets[0].Target != "192.168.1.1" {
+		t.Fatalf("restored config = %+v", cfg)
+	}
+}

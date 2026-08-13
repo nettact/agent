@@ -733,7 +733,7 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 	// preserves the old loop's fast-startup behavior. (It stays behind the
 	// floor barrier: until the server pushes a SequenceFloor for this epoch,
 	// drain is a no-op.)
-	if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh); err != nil {
+	if err := r.drain(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(r.deps.DrainInterval)
@@ -765,7 +765,7 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 				return fmt.Errorf("write monitor status: %w", err)
 			}
 		case <-ticker.C:
-			if err := r.drain(ctx, sessionCtx, c, ackCh, pushCh, errCh); err != nil {
+			if err := r.drain(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh); err != nil {
 				return err
 			}
 		}
@@ -783,7 +783,15 @@ func (r *runner) applyControl(ctx, sessionCtx context.Context, c wire.Conn, f wi
 	case f.EpochRotationChallenge != nil:
 		return r.applyRotationChallenge(ctx, sessionCtx, c, f.EpochRotationChallenge, pushCh, errCh, ctrlCh)
 	default: // EpochRotationResult
-		return fmt.Errorf("server sent an epoch rotation result with no rotation in flight")
+		// A result with no in-flight rotation here is the server RE-ISSUING a
+		// committed rotation the agent missed (the phase-1 crash-recovery path):
+		// the agent persisted the old credential before the result ever arrived,
+		// and the server answers its next reconnect with the same idempotent
+		// result. Accept it like a solicited one — persist and reconnect.
+		if f.EpochRotationResult == nil {
+			return fmt.Errorf("server sent an invalid control frame")
+		}
+		return r.applyRotationResult(f.EpochRotationResult)
 	}
 }
 
@@ -978,7 +986,7 @@ func (r *runner) anchoredNow() time.Time {
 // tick, same-sequence retry on failure, server dedups on agent_id+sequence).
 // All WAL access happens here, on the session goroutine, so the store never
 // sees concurrent claims.
-func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error) error {
+func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	// The sequence-floor barrier (schema 8). Until the server has pushed a
 	// floor for this session's epoch and the agent has durably applied it, no
 	// packet may be claimed or sent — the server enforces the same ordering on
@@ -1020,7 +1028,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {
 			return fmt.Errorf("write packet seq=%d: %w", batch.Sequence, err)
 		}
-		ack, err := r.awaitAck(ctx, sessionCtx, c, ackCh, pushCh, errCh, batch.Sequence)
+		ack, err := r.awaitAck(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh, batch.Sequence)
 		if err != nil {
 			// The batch stays tagged in the WAL and is re-sent under the SAME
 			// sequence by the next session, so nothing is lost or double-counted.
@@ -1061,7 +1069,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 // consuming pushCh while it waits — the deadlock guard: if pushes queued up
 // unconsumed, the reader would block sending to pushCh and the ack could never
 // be read off the wire.
-func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
+func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
 	timer := time.NewTimer(r.opts.ackTimeout)
 	defer timer.Stop()
 	for {
@@ -1072,6 +1080,16 @@ func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-
 			return wire.Ack{}, err
 		case f := <-pushCh:
 			if err := r.applyPush(ctx, sessionCtx, c, f); err != nil {
+				return wire.Ack{}, err
+			}
+		case f := <-ctrlCh:
+			// A control frame while a claim is in flight is the schema-8 recovery
+			// path: a sequence-conflict rotation challenge (the server withholds
+			// the ack and challenges instead) must be answered here, not after the
+			// ack timeout. Applying it inline ends the session with the rotation's
+			// verdict (errEpochRotated), which abandons the in-flight claim and
+			// reconnects under the new credential.
+			if err := r.applyControl(ctx, sessionCtx, c, f, pushCh, errCh, ctrlCh); err != nil {
 				return wire.Ack{}, err
 			}
 		case ack := <-ackCh:

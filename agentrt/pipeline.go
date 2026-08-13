@@ -348,7 +348,15 @@ func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string, key 
 			}
 			cur.AgentToken = token
 			cur.EnrollmentEpoch = epoch
-			return identity.SaveCredential(dataDir, rt.cfg.Name, cur)
+			if err := identity.SaveCredential(dataDir, rt.cfg.Name, cur); err != nil {
+				return err
+			}
+			// The credential and the desired-state cache must move together: the
+			// cache is fingerprinted to the bearer, so a rotation that leaves it
+			// under the old token would be refused on the next restart and the
+			// agent would lose its monitoring targets while the server is
+			// unreachable. Re-keying keeps the last configuration restorable.
+			return desiredstate.Rebind(dataDir, rt.cfg.Name, token, cur.AgentID, cur.SiteID)
 		},
 		// Bound to the credential in hand, not merely to the server name: a name
 		// or URL can be re-pointed at a different server, and restoring that
