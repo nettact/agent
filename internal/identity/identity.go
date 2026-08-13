@@ -89,6 +89,13 @@ type Credential struct {
 	// schema-8 server then skips the floor barrier for that agent until its next
 	// enrollment or rotation, and nothing breaks.
 	EnrollmentEpoch uint64 `json:"enrollment_epoch,omitempty"`
+
+	// PrevTokenFingerprint is the SHA-256 of the bearer token this credential
+	// replaced (set when a controlled rotation retires the old token). It lets
+	// the desired-state cache accept a snapshot written under the old bearer
+	// after a crash interrupted the rotation between the credential write and
+	// the cache re-key. Additive to the v2 format, like the two above.
+	PrevTokenFingerprint string `json:"prev_token_fingerprint,omitempty"`
 }
 
 // credentialFile is the on-disk shape of agent.json.

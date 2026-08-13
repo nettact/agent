@@ -299,34 +299,56 @@ func TestFileNeverContainsProxyMaterial(t *testing.T) {
 	}
 }
 
-// TestRebindReKeysSnapshot pins the rotation fix: re-keying a cached snapshot
-// under the new token keeps it restorable after a rotation, so an offline
-// restart restores its targets instead of refusing a foreign-credential cache.
-func TestRebindReKeysSnapshot(t *testing.T) {
+// TestBindingRebindUpdatesLiveFingerprint pins the rotation fix: the live
+// binding's Rebind flips its fingerprint in memory so the NEXT Save re-keys the
+// on-disk cache under the new token — the lazy re-key that keeps an offline
+// restart restorable without ever rewriting the cache mid-rotation.
+func TestBindingRebindUpdatesLiveFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	const server = "default"
-	oldToken, newToken := "old-token", "new-token"
 
-	b := Bind(dir, server, oldToken, "agent_a", "site_default")
+	b := Bind(dir, server, "old-token", "agent_a", "site_default")
 	if err := b.Save(Config{ConfigVersion: 7, ProbeTargets: []pcfg.ProbeTarget{{Target: "192.168.1.1"}}}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
+	b.Rebind("new-token")
+	// The next Save writes under the new bearer: a fresh binding for the new
+	// token restores it, and the old token no longer matches.
+	if err := b.Save(Config{ConfigVersion: 8}); err != nil {
+		t.Fatalf("re-save after rebind: %v", err)
+	}
+	if _, ok := Bind(dir, server, "old-token", "agent_a", "site_default").Load(); ok {
+		t.Fatal("old-token binding still restores after the live re-key")
+	}
+	cfg, ok := Bind(dir, server, "new-token", "agent_a", "site_default").Load()
+	if !ok || cfg.ConfigVersion != 8 {
+		t.Fatalf("new-token binding = %+v, ok=%v; want the re-keyed snapshot", cfg, ok)
+	}
+}
 
-	if err := Rebind(dir, server, newToken, "agent_a", "site_default"); err != nil {
-		t.Fatalf("rebind: %v", err)
+// TestBindingSetPrevAdmitsOldCache pins the crash-recovery half: after a
+// rotation's credential write but before the cache re-key, a fresh binding for
+// the new token with SetPrev(old fingerprint) must still restore the cache the
+// old token wrote.
+func TestBindingSetPrevAdmitsOldCache(t *testing.T) {
+	dir := t.TempDir()
+	const server = "default"
+
+	old := Bind(dir, server, "old-token", "agent_a", "site_default")
+	if err := old.Save(Config{ConfigVersion: 7, ProbeTargets: []pcfg.ProbeTarget{{Target: "192.168.1.1"}}}); err != nil {
+		t.Fatalf("save: %v", err)
 	}
 
-	// The old binding must now miss (foreign credential), and the new one must
-	// restore the same configuration.
-	if _, ok := b.Load(); ok {
-		t.Fatal("old-token binding still restores after a re-key")
-	}
-	nb := Bind(dir, server, newToken, "agent_a", "site_default")
+	// A restart with the rotated credential: the new binding must accept the
+	// old-fingerprint cache via SetPrev.
+	nb := Bind(dir, server, "new-token", "agent_a", "site_default")
+	nb.SetPrev(Fingerprint("old-token"))
 	cfg, ok := nb.Load()
-	if !ok {
-		t.Fatal("new-token binding does not restore the re-keyed snapshot")
+	if !ok || cfg.ConfigVersion != 7 {
+		t.Fatalf("prev-admitting load = %+v, ok=%v; want the old cache", cfg, ok)
 	}
-	if cfg.ConfigVersion != 7 || len(cfg.ProbeTargets) != 1 || cfg.ProbeTargets[0].Target != "192.168.1.1" {
-		t.Fatalf("restored config = %+v", cfg)
+	// Without the prev hint the same cache is foreign and refused.
+	if _, ok := Bind(dir, server, "new-token", "agent_a", "site_default").Load(); ok {
+		t.Fatal("new-token binding restores a foreign cache without the prev hint")
 	}
 }

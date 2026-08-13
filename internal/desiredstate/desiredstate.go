@@ -145,8 +145,15 @@ type Binding struct {
 	dir         string
 	server      string
 	fingerprint string
-	agentID     string
-	siteID      string
+	// prev is the fingerprint of the credential that was in force immediately
+	// before this one (set by Rebind during a rotation, or restored from the
+	// credential's PrevTokenFingerprint after a restart). A snapshot written
+	// under prev is still this agent's own configuration — the rotation kept
+	// the same agent and the same targets — so Load accepts it and the next
+	// Save re-keys it under the current token.
+	prev    string
+	agentID string
+	siteID  string
 }
 
 // Bind returns the store handle for one server. A caller with no token yet (a
@@ -160,6 +167,36 @@ func Bind(dataDir, server, agentToken, agentID, siteID string) *Binding {
 		agentID:     agentID,
 		siteID:      siteID,
 	}
+}
+
+// Rebind moves the binding to a new credential (a controlled rotation). It is
+// IN-MEMORY only: the fingerprint flips to the new token and the previous one
+// is remembered, so Load keeps accepting a cache written under the old token
+// until the next Save re-keys it under the new one. That laziness is the
+// crash-safety — the on-disk cache is never rewritten mid-rotation, and the
+// credential's PrevTokenFingerprint (set by the persistence hook) authorizes
+// the old cache across a restart, so whichever of the two durable writes a
+// crash interrupts, an offline restart still restores the targets.
+func (b *Binding) Rebind(newToken string) {
+	if b == nil {
+		return
+	}
+	next := Fingerprint(newToken)
+	if next == b.fingerprint {
+		return
+	}
+	b.prev = b.fingerprint
+	b.fingerprint = next
+}
+
+// SetPrev restores the previous credential's fingerprint, re-arming the
+// old-token acceptance after a restart that landed between a rotation's
+// credential write and its cache re-key.
+func (b *Binding) SetPrev(prevFingerprint string) {
+	if b == nil {
+		return
+	}
+	b.prev = prevFingerprint
 }
 
 // Load returns the persisted configuration for this server, or ok=false when
@@ -184,7 +221,8 @@ func (b *Binding) Load() (Config, bool) {
 	// a token that authenticates to the same server under a different agent record
 	// (a re-enrollment that minted a new agent_id) is just as wrong a target list
 	// to run, and the mismatch is otherwise invisible.
-	if s.CredFingerprint != b.fingerprint || s.AgentID != b.agentID || s.SiteID != b.siteID {
+	fpOK := s.CredFingerprint == b.fingerprint || (b.prev != "" && s.CredFingerprint == b.prev)
+	if !fpOK || s.AgentID != b.agentID || s.SiteID != b.siteID {
 		return Config{}, false
 	}
 	return s.Config, true
@@ -239,32 +277,6 @@ func Delete(dataDir, server string) error {
 		return nil
 	}
 	delete(doc, server)
-	return saveAll(dataDir, doc)
-}
-
-// Rebind re-keys this server's cached snapshot under a new credential. A
-// controlled epoch rotation keeps the same agent and the same configuration
-// the server told it to run — only the bearer fingerprint the snapshot is
-// stored under changes. Re-keying (rather than forgetting) is what lets an
-// offline restart after a rotation restore its targets instead of going silent
-// until the server's next on-connect push; a missing or foreign snapshot is a
-// no-op, because the on-connect push re-establishes it anyway.
-func Rebind(dataDir, server, newToken, agentID, siteID string) error {
-	mu.Lock()
-	defer mu.Unlock()
-
-	doc, err := loadLocked(dataDir)
-	if err != nil {
-		return err
-	}
-	s, ok := doc[server]
-	if !ok {
-		return nil
-	}
-	s.CredFingerprint = Fingerprint(newToken)
-	s.AgentID = agentID
-	s.SiteID = siteID
-	doc[server] = s
 	return saveAll(dataDir, doc)
 }
 

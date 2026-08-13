@@ -320,6 +320,17 @@ func (rt *serverRuntime) sink(res collector.Result) {
 // signs the server's rotation challenge with it, proving possession of the
 // enrolled identity before the server issues a rotated credential.
 func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string, key ed25519.PrivateKey) conn.Deps {
+	// Bound to the credential in hand, not merely to the server name: a name or
+	// URL can be re-pointed at a different server, and restoring that server's
+	// targets under this one would both run the wrong monitors and — because the
+	// staleness guard only ignores strictly lower versions — permanently suppress
+	// the new server's pushes. The previous credential's fingerprint is re-armed
+	// so a cache left under the old bearer after an interrupted rotation still
+	// restores.
+	desired := desiredstate.Bind(dataDir, rt.cfg.Name, cred.AgentToken, cred.AgentID, cred.SiteID)
+	if cred.PrevTokenFingerprint != "" {
+		desired.SetPrev(cred.PrevTokenFingerprint)
+	}
 	return conn.Deps{
 		Outbox:        rt.outbox,
 		Configurables: rt.configurables,
@@ -346,24 +357,22 @@ func (rt *serverRuntime) connDeps(cred identity.Credential, dataDir string, key 
 			if !ok {
 				return fmt.Errorf("rotate %q: no credential to update", rt.cfg.Name)
 			}
+			// Record the fingerprint of the bearer being replaced, so a restart
+			// that lands before the desired-state cache was re-keyed (the live
+			// binding does that lazily, on its next Save) still accepts the old
+			// cache. Written BEFORE the token swap so the "old" value is the
+			// credential actually being retired.
+			cur.PrevTokenFingerprint = desiredstate.Fingerprint(cur.AgentToken)
 			cur.AgentToken = token
 			cur.EnrollmentEpoch = epoch
-			if err := identity.SaveCredential(dataDir, rt.cfg.Name, cur); err != nil {
-				return err
-			}
-			// The credential and the desired-state cache must move together: the
-			// cache is fingerprinted to the bearer, so a rotation that leaves it
-			// under the old token would be refused on the next restart and the
-			// agent would lose its monitoring targets while the server is
-			// unreachable. Re-keying keeps the last configuration restorable.
-			return desiredstate.Rebind(dataDir, rt.cfg.Name, token, cur.AgentID, cur.SiteID)
+			return identity.SaveCredential(dataDir, rt.cfg.Name, cur)
 		},
 		// Bound to the credential in hand, not merely to the server name: a name
 		// or URL can be re-pointed at a different server, and restoring that
 		// server's targets under this one would both run the wrong monitors and —
 		// because the staleness guard only ignores strictly lower versions —
 		// permanently suppress the new server's pushes.
-		Desired:             desiredstate.Bind(dataDir, rt.cfg.Name, cred.AgentToken, cred.AgentID, cred.SiteID),
+		Desired:             desired,
 		Effective:           rt.views.effective,
 		Granted:             rt.views.granted,
 		Supported:           rt.views.supported,
