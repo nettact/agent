@@ -155,6 +155,122 @@ func TestSelectDiskMountsIsStable(t *testing.T) {
 	}
 }
 
+// TestSelectDiskMountsCollapsesDarwinMounts is the macOS counterpart of the
+// bind-collapse test above, and states the server-visible consequence it
+// protects: without collapseDarwinMounts, one 1 TB SSD reports as ~4 TB of
+// disks (every APFS volume restates the whole container) plus a permanently
+// full "/dev".
+func TestSelectDiskMountsCollapsesDarwinMounts(t *testing.T) {
+	// The mount table of a real macOS 15 Apple Silicon machine, captured from
+	// disk.Partitions(false). It motivated collapseDarwinMounts: one 1 TB SSD
+	// reported as the four writable APFS volumes of its boot container plus the
+	// three of its recovery container (each boot-container volume restating the
+	// same 994 GB), and a devfs /dev whose statfs has zero free bytes so
+	// gopsutil reports it 100% full.
+	macOSMounts := []disk.PartitionStat{
+		{Device: "/dev/disk3s1s1", Mountpoint: "/", Fstype: "apfs", Opts: []string{"ro", "journaled", "multilabel"}},
+		{Device: "devfs", Mountpoint: "/dev", Fstype: "devfs", Opts: []string{"rw", "nobrowse", "multilabel"}},
+		{Device: "/dev/disk3s6", Mountpoint: "/System/Volumes/VM", Fstype: "apfs", Opts: []string{"rw", "noexec", "nobrowse", "journaled", "multilabel", "noatime"}},
+		{Device: "/dev/disk3s2", Mountpoint: "/System/Volumes/Preboot", Fstype: "apfs", Opts: []string{"rw", "nobrowse", "journaled", "multilabel"}},
+		{Device: "/dev/disk3s4", Mountpoint: "/System/Volumes/Update", Fstype: "apfs", Opts: []string{"rw", "nobrowse", "journaled", "multilabel"}},
+		{Device: "/dev/disk1s2", Mountpoint: "/System/Volumes/xarts", Fstype: "apfs", Opts: []string{"rw", "noexec", "nobrowse", "journaled", "multilabel", "noatime"}},
+		{Device: "/dev/disk1s1", Mountpoint: "/System/Volumes/iSCPreboot", Fstype: "apfs", Opts: []string{"rw", "nobrowse", "journaled", "multilabel"}},
+		{Device: "/dev/disk1s3", Mountpoint: "/System/Volumes/Hardware", Fstype: "apfs", Opts: []string{"rw", "nobrowse", "journaled", "multilabel"}},
+		{Device: "/dev/disk3s5", Mountpoint: "/System/Volumes/Data", Fstype: "apfs", Opts: []string{"rw", "nobrowse", "journaled", "multilabel"}},
+		{Device: "map auto_home", Mountpoint: "/System/Volumes/Data/home", Fstype: "autofs", Opts: []string{"rw", "nobrowse", "automounted", "multilabel"}},
+	}
+
+	t.Run("boot + recovery container collapse to the Data volume", func(t *testing.T) {
+		got := mountpoints(collapseDarwinMounts(macOSMounts))
+		want := []string{"/System/Volumes/Data"}
+		if !equalStrings(got, want) {
+			t.Errorf("collapseDarwinMounts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("selectDiskMounts drops the devfs phantom 100%", func(t *testing.T) {
+		// selectDiskMounts applies the darwin collapse first, then the read-only
+		// and bind filtering. The whole real table must end as exactly the Data
+		// volume: the ro System volume is dropped, devfs and every system APFS
+		// volume are collapsed away, and the autofs home mount has zero total
+		// (host.go skips those). No mountpoint here may report 100% used.
+		got := mountpoints(selectDiskMounts(macOSMounts))
+		want := []string{"/System/Volumes/Data"}
+		if !equalStrings(got, want) {
+			t.Errorf("selectDiskMounts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("an external single-volume drive is kept", func(t *testing.T) {
+		got := mountpoints(collapseDarwinMounts([]disk.PartitionStat{
+			{Device: "/dev/disk4s2", Mountpoint: "/Volumes/Backup", Fstype: "apfs", Opts: []string{"rw"}},
+		}))
+		want := []string{"/Volumes/Backup"}
+		if !equalStrings(got, want) {
+			t.Errorf("collapseDarwinMounts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a full external macOS install is shown as its Data volume", func(t *testing.T) {
+		got := mountpoints(collapseDarwinMounts([]disk.PartitionStat{
+			{Device: "/dev/disk6s1", Mountpoint: "/System/Volumes/Data", Fstype: "apfs", Opts: []string{"rw"}},
+			{Device: "/dev/disk6s1s1", Mountpoint: "/", Fstype: "apfs", Opts: []string{"ro"}},
+		}))
+		want := []string{"/System/Volumes/Data"}
+		if !equalStrings(got, want) {
+			t.Errorf("collapseDarwinMounts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a recovery-only container is dropped", func(t *testing.T) {
+		got := mountpoints(collapseDarwinMounts([]disk.PartitionStat{
+			{Device: "/dev/disk9s1", Mountpoint: "/System/Volumes/xarts", Fstype: "apfs", Opts: []string{"rw"}},
+			{Device: "/dev/disk9s2", Mountpoint: "/System/Volumes/Hardware", Fstype: "apfs", Opts: []string{"rw"}},
+		}))
+		if len(got) != 0 {
+			t.Errorf("collapseDarwinMounts() = %v, want none", got)
+		}
+	})
+
+	t.Run("a user volume in the boot container still collapses to Data", func(t *testing.T) {
+		got := mountpoints(collapseDarwinMounts([]disk.PartitionStat{
+			{Device: "/dev/disk3s5", Mountpoint: "/System/Volumes/Data", Fstype: "apfs", Opts: []string{"rw"}},
+			{Device: "/dev/disk3s7", Mountpoint: "/Volumes/Extra", Fstype: "apfs", Opts: []string{"rw"}},
+		}))
+		want := []string{"/System/Volumes/Data"}
+		if !equalStrings(got, want) {
+			t.Errorf("collapseDarwinMounts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("non-APFS mounts pass through untouched", func(t *testing.T) {
+		// A Linux table applied to the darwin collapser must be a no-op: the
+		// function keys on fstype == "apfs" and a device string with no container
+		// separator, so nothing here can be regrouped or dropped.
+		in := openWrtRouterMounts
+		got := mountpoints(collapseDarwinMounts(in))
+		if !equalStrings(got, mountpoints(in)) {
+			t.Errorf("collapseDarwinMounts() changed a non-APFS table: got %v, want %v", got, mountpoints(in))
+		}
+	})
+
+	t.Run("apfsContainer strips the volume suffix", func(t *testing.T) {
+		cases := map[string]string{
+			"/dev/disk3s5":      "/dev/disk3",
+			"/dev/disk3s1s1":    "/dev/disk3",
+			"/dev/disk4s2":      "/dev/disk4",
+			"/dev/disk0s1":      "/dev/disk0",
+			"/dev/disk7":        "/dev/disk7",
+			"disk1s1":           "disk1",
+		}
+		for device, want := range cases {
+			if got := apfsContainer(device); got != want {
+				t.Errorf("apfsContainer(%q) = %q, want %q", device, got, want)
+			}
+		}
+	})
+}
+
 // TestSelectDiskMountsCapacityIsNotDoubleCounted states the server-visible
 // consequence, since that is the bug a reader of this test is most likely
 // chasing: server-core sums Used and Total across every reported mount to show a
