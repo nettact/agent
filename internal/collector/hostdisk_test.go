@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/shirou/gopsutil/v3/disk"
@@ -194,6 +195,14 @@ func TestSelectDiskMountsCollapsesDarwinMounts(t *testing.T) {
 		// volume: the ro System volume is dropped, devfs and every system APFS
 		// volume are collapsed away, and the autofs home mount has zero total
 		// (host.go skips those). No mountpoint here may report 100% used.
+		//
+		// collapseDarwinMounts is gated on runtime.GOOS inside selectDiskMounts,
+		// so this full-pipeline assertion is darwin-only: on a Linux or Windows
+		// runner selectDiskMounts legitimately leaves the table untouched (the
+		// pure collapseDarwinMounts assertions above still run everywhere).
+		if runtime.GOOS != "darwin" {
+			t.Skip("selectDiskMounts collapses APFS containers only on darwin")
+		}
 		got := mountpoints(selectDiskMounts(macOSMounts))
 		want := []string{"/System/Volumes/Data"}
 		if !equalStrings(got, want) {
