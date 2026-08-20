@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -16,39 +17,108 @@ import (
 )
 
 // Linux and macOS TTL probes. Both modes need to OBSERVE the ICMP Time-Exceeded
-// replies intermediate routers send back, and on both OSes only a raw ICMP
-// socket (root; CAP_NET_RAW on Linux) is known to deliver those as readable
-// packets — Linux's unprivileged ping socket routes its ICMP errors to the
-// socket error queue instead, and whether macOS's unprivileged datagram ICMP
-// socket delivers them readably is unverified on real hardware, so it is
-// deliberately not relied on here. A single raw-socket check therefore gates
-// both modes, the same shape as the Windows elevation check gating TCP there.
+// replies intermediate routers send back; sending costs no privilege in either
+// mode, since the TTL is an ordinary IP_TTL socket option. What the two OSes
+// differ on is which socket can see those replies.
 //
-// Sending the probe itself needs no privilege in either mode: the TTL is an
-// ordinary IP_TTL socket option.
+// A raw ICMP socket (root; CAP_NET_RAW on Linux) works everywhere and is tried
+// first. Failing that, macOS — and only macOS — has a second way in: an
+// UNPRIVILEGED datagram ICMP socket, which on Darwin delivers a router's
+// Time-Exceeded as an ordinary readable packet. Linux's superficially similar
+// ping socket does not: it diverts ICMP errors to the socket error queue, so a
+// datagram fallback there would yield a probe that can only ever report
+// timeouts — strictly worse than reporting no capability at all. The fallback
+// is therefore gated on datagramICMPUsable, a per-OS constant, rather than
+// tried opportunistically. See resolveICMPSocket for what was measured.
+//
+// Whichever socket is chosen, everything downstream is unchanged: the id/seq
+// and quotation correlation still has to run (a Darwin datagram socket is NOT
+// demuxed to this process's own echoes — it also sees ICMP belonging to other
+// processes on the host, so the match is what keeps replies apart), and packets
+// read with recvfrom(2) still arrive with their outer IP header on both socket
+// kinds, so matchICMPQuotation's offsets hold either way.
+
+// icmpSocketKind is how this process is able to open an ICMP socket, resolved
+// once and reused: a privilege level cannot be gained mid-process, and the
+// probes re-check on every open anyway (a socket that fails to open is reported
+// as errUnsupported, not as a path outcome).
+type icmpSocketKind int
+
+const (
+	icmpSocketNone icmpSocketKind = iota
+	icmpSocketRaw
+	icmpSocketDatagram
+)
+
+// resolveICMPSocket picks the best ICMP socket this process can open.
+//
+// The datagram branch is not a degraded mode: measured on macOS 26 as an
+// unprivileged user, it delivers intermediate Time-Exceeded messages readably,
+// preserves the echo id and sequence into the quotation (Darwin does not
+// rewrite them the way Linux's ping socket does, so matchQuotedEcho is
+// unaffected), carries the quotation of a TTL-limited TCP SYN so tcpProbe works
+// too, and still fails sends with EHOSTUNREACH when the host cannot reach the
+// wire, which is what keeps the localUnreachable verdict intact. That is the
+// whole contract this file depends on, so both modes are offered on it.
+var resolveICMPSocket = sync.OnceValue(func() icmpSocketKind {
+	if s, err := sysSocket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP); err == nil {
+		_ = unix.Close(s)
+		return icmpSocketRaw
+	}
+	if datagramICMPUsable {
+		if s, err := sysSocket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_ICMP); err == nil {
+			_ = unix.Close(s)
+			return icmpSocketDatagram
+		}
+	}
+	return icmpSocketNone
+})
 
 // detectCapabilities reports whether this process can run traceroute at all,
-// which here is exactly "can it open a raw ICMP socket".
+// which here is exactly "can it open an ICMP socket that sees router replies".
+// Both modes rise and fall together, the same shape as the Windows elevation
+// check gating TCP there.
 func detectCapabilities() capabilities {
-	s, err := sysSocket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
-	if err != nil {
+	if resolveICMPSocket() == icmpSocketNone {
 		return capabilities{}
 	}
-	_ = unix.Close(s)
 	return capabilities{ICMP: true, TCP: true}
 }
 
-// icmpProbe sends one ICMP echo toward dest with the given TTL on a raw socket.
-// An echo reply from the destination means reached; a Time-Exceeded (or an
-// unreachable) quoting our echo is an intermediate responder; nothing
-// attributable within the budget is a timeout.
+// icmpListenNetwork spells the chosen socket kind for x/net/icmp, whose ReadFrom
+// normalizes both kinds to the bare ICMP message before it returns.
+func icmpListenNetwork(k icmpSocketKind) string {
+	if k == icmpSocketDatagram {
+		return "udp4"
+	}
+	return "ip4:icmp"
+}
+
+// icmpDestAddr wraps dest in the address type the chosen socket kind accepts:
+// a datagram ICMP socket is addressed like UDP (with a meaningless port), a raw
+// one by bare IP.
+func icmpDestAddr(k icmpSocketKind, dest netip.Addr) net.Addr {
+	if k == icmpSocketDatagram {
+		return &net.UDPAddr{IP: dest.AsSlice()}
+	}
+	return &net.IPAddr{IP: dest.AsSlice()}
+}
+
+// icmpProbe sends one ICMP echo toward dest with the given TTL. An echo reply
+// from the destination means reached; a Time-Exceeded (or an unreachable)
+// quoting our echo is an intermediate responder; nothing attributable within
+// the budget is a timeout.
 func icmpProbe(ctx context.Context, dest netip.Addr, _ int, ttl int, timeout time.Duration) (probeOutcome, error) {
 	if !dest.Is4() {
 		return probeOutcome{}, errUnsupported
 	}
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	kind := resolveICMPSocket()
+	if kind == icmpSocketNone {
+		return probeOutcome{}, errUnsupported
+	}
+	conn, err := icmp.ListenPacket(icmpListenNetwork(kind), "0.0.0.0")
 	if err != nil {
-		return probeOutcome{}, errUnsupported // raw-socket capability lost since startup
+		return probeOutcome{}, errUnsupported // capability lost since startup
 	}
 	defer conn.Close()
 	p := conn.IPv4PacketConn()
@@ -70,7 +140,9 @@ func icmpProbe(ctx context.Context, dest netip.Addr, _ int, ttl int, timeout tim
 		return probeOutcome{}, err
 	}
 
-	// A raw socket sees every ICMP packet on the host, so id+seq is what keeps
+	// Neither socket kind is demuxed to this probe's own echoes — a raw socket
+	// sees every ICMP packet on the host, and a Darwin datagram ICMP socket was
+	// measured receiving other processes' replies too — so id+seq is what keeps
 	// concurrent traces from stealing each other's replies.
 	id := int(rand.Uint32() & 0xffff)
 	seq := int(rand.Uint32() & 0xffff)
@@ -84,7 +156,7 @@ func icmpProbe(ctx context.Context, dest netip.Addr, _ int, ttl int, timeout tim
 	}
 
 	start := time.Now()
-	if _, err := conn.WriteTo(wb, &net.IPAddr{IP: dest.AsSlice()}); err != nil {
+	if _, err := conn.WriteTo(wb, icmpDestAddr(kind, dest)); err != nil {
 		// The kernel refused the packet outright (no route, the egress link down).
 		// That is not a silent hop: nothing was sent, so the sweep has nothing left
 		// to learn from further TTLs.
@@ -160,13 +232,25 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 	}
 	ip4 := dest.As4()
 
-	raw, err := sysSocket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+	kind := resolveICMPSocket()
+	if kind == icmpSocketNone {
+		return probeOutcome{}, errUnsupported
+	}
+	sockType := unix.SOCK_RAW
+	if kind == icmpSocketDatagram {
+		sockType = unix.SOCK_DGRAM
+	}
+	// This socket only ever RECEIVES; it is the one that can see a router's
+	// Time-Exceeded quoting the SYN below. Unlike the x/net/icmp path in
+	// icmpProbe, recvfrom(2) hands back the outer IP header on both kinds, so
+	// matchICMPQuotation reads the same layout either way.
+	raw, err := sysSocket(unix.AF_INET, sockType, unix.IPPROTO_ICMP)
 	if err != nil {
-		return probeOutcome{}, errUnsupported // raw-socket capability lost since startup
+		return probeOutcome{}, errUnsupported // capability lost since startup
 	}
 	defer unix.Close(raw)
-	// Bind the raw socket to the local address that reaches dest so it receives the
-	// routers' ICMP; INADDR_ANY is the fallback.
+	// Bind to the local address that reaches dest so it receives the routers'
+	// ICMP; INADDR_ANY is the fallback.
 	if berr := unix.Bind(raw, &unix.SockaddrInet4{Addr: localIPv4For(dest)}); berr != nil {
 		return probeOutcome{}, errUnsupported
 	}
@@ -298,13 +382,23 @@ func tcpProbe(ctx context.Context, dest netip.Addr, port, ttl int, timeout time.
 	}
 }
 
-// responderFromAddr extracts an IPv4 responder address from a raw-socket source.
+// responderFromAddr extracts an IPv4 responder address from a source address as
+// x/net/icmp reports it. Both shapes must be handled: a raw ICMP socket yields
+// *net.IPAddr, a datagram one *net.UDPAddr (whose port is meaningless here).
+// Accepting only the former would not fail loudly — every hop would come back
+// with an invalid responder and be normalized into a timeout, so a working
+// macOS trace would render as a column of stars.
 func responderFromAddr(from net.Addr) netip.Addr {
-	ipa, ok := from.(*net.IPAddr)
-	if !ok {
+	var ip net.IP
+	switch v := from.(type) {
+	case *net.IPAddr:
+		ip = v.IP
+	case *net.UDPAddr:
+		ip = v.IP
+	default:
 		return netip.Addr{}
 	}
-	a, ok := netip.AddrFromSlice(ipa.IP)
+	a, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return netip.Addr{}
 	}

@@ -16,3 +16,9 @@ func sysSocket(domain, typ, proto int) (int, error) {
 	unix.CloseOnExec(fd)
 	return fd, nil
 }
+
+// datagramICMPUsable enables the unprivileged datagram ICMP fallback. Darwin
+// delivers a router's Time-Exceeded on such a socket as a readable packet, with
+// the echo id/seq preserved into the quotation, so the fallback is fully
+// equivalent to the raw path rather than a degraded one. See probe_unix.go.
+const datagramICMPUsable = true

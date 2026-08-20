@@ -1248,11 +1248,14 @@ func probeMachine(ctx context.Context, cfg Config, p platform.Platform) machineC
 	}
 	// Both traceroute modes are runtime capabilities owned by the traceroute
 	// engine, which is the only component that knows what observing intermediate
-	// Time-Exceeded responders costs on each OS: Administrator on Windows for TCP,
-	// a raw ICMP socket (root / CAP_NET_RAW) on Linux and macOS for either mode.
-	// Asking it keeps one answer per mode instead of a platform layer and an
-	// engine disagreeing. Effective stays supported∩granted, so desktop
-	// FullAccess remains capability-gated.
+	// Time-Exceeded responders costs on each OS: Administrator on Windows for
+	// TCP; a raw ICMP socket (CAP_NET_RAW) on Linux for either mode; and on
+	// macOS either a raw socket or, unprivileged, a datagram ICMP socket, which
+	// Darwin — unlike Linux — delivers router replies on, so an ordinary user
+	// account gets both modes at full fidelity. Asking the engine keeps one
+	// answer per mode instead of a platform layer and an engine disagreeing.
+	// Effective stays supported∩granted, so desktop FullAccess remains
+	// capability-gated.
 	icmpTraceCap, tcpTraceCap := traceroute.Supported()
 	if icmpTraceCap {
 		caps.base.Add(permission.DiagnosticTracerouteICMP)

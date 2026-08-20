@@ -13,6 +13,12 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/nettact/agent/internal/netguard"
+	"github.com/nettact/agent/probepolicy"
+	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
+	"github.com/nettact/protocol/telemetry"
 )
 
 // liveBudget is the per-probe budget these tests use, defaulting to the engine's
@@ -118,5 +124,75 @@ func TestLiveICMPLocalFailureIsNeverAHop(t *testing.T) {
 	}
 	if !sawLocal {
 		t.Fatal("no probe reported a local send failure; the destination may still be routable")
+	}
+}
+
+// TestLiveSocketKindProducesRealHops is the check that matters for the macOS
+// unprivileged path: it asserts the socket kind this process actually resolved
+// can name routers, in BOTH modes, through the full engine.
+//
+// Run it as an ordinary user on macOS to exercise the datagram fallback, and
+// under root to confirm the raw path did not regress; the log line reports
+// which kind was in play so the two runs are distinguishable. A pass as uid!=0
+// on Darwin is the evidence that observing intermediate Time-Exceeded there
+// needs no privilege.
+//
+// The destination is a literal IP, never a hostname, so no round-robin can move
+// the target between the two sub-runs.
+func TestLiveSocketKindProducesRealHops(t *testing.T) {
+	if os.Getenv("NETTACT_TRACE_LIVE") == "" {
+		t.Skip("set NETTACT_TRACE_LIVE=1 (requires network; root only for the raw path)")
+	}
+	dest := "1.1.1.1"
+	if v := os.Getenv("NETTACT_TRACE_DEST"); v != "" {
+		if _, err := netip.ParseAddr(v); err != nil {
+			t.Fatalf("NETTACT_TRACE_DEST %q must be a literal IP: %v", v, err)
+		}
+		dest = v
+	}
+	caps := detectCapabilities()
+	t.Logf("uid=%d socketKind=%d caps=%+v dest=%s", os.Getuid(), resolveICMPSocket(), caps, dest)
+	if !caps.ICMP && !caps.TCP {
+		t.Skip("no ICMP socket available to this process")
+	}
+
+	all := permission.FromStrings([]string{
+		string(permission.DiagnosticTracerouteICMP),
+		string(permission.DiagnosticTracerouteTCP),
+	})
+	e := New(netguard.New(probepolicy.Policy{}, true), all, all, all, NewLimiter(2), nil)
+
+	for _, mode := range []string{pcfg.TraceModeICMP, pcfg.TraceModeTCP} {
+		t.Run(mode, func(t *testing.T) {
+			res := e.Run(context.Background(), Request{
+				ReportID: "live-" + mode, Mode: mode,
+				DestKey: "ip:" + dest, DestHost: dest, Port: 443,
+				SubjectKind:   telemetry.TraceSubjectTarget,
+				TriggerReason: telemetry.TraceTriggerConsecutiveFailures,
+				TriggerStreak: 3, FirstFailedAt: time.Now().Add(-time.Minute),
+				MaxHops: 15, AttemptsPerHop: 3, TotalTimeoutMs: 30000,
+			}, time.Now())
+			named := 0
+			for _, h := range res.Hops {
+				for _, a := range h.Attempts {
+					t.Logf("ttl=%d responder=%q rtt=%.1fms timeout=%v", h.TTL, a.ResponderAddr, a.RTTMs, a.Timeout)
+					if a.ResponderAddr != "" {
+						named++
+					}
+				}
+			}
+			if res.Status != telemetry.TraceStatusSucceeded {
+				t.Fatalf("status=%s reason=%s", res.Status, res.Reason)
+			}
+			// The failure this guards is silent: a responder the code cannot read
+			// off the socket normalizes into a timeout, so a broken path still
+			// "succeeds" — as a column of stars.
+			if named == 0 {
+				t.Fatal("every attempt timed out; no responder was extracted from this socket kind")
+			}
+			if !res.Reached {
+				t.Errorf("destination %s not reached", dest)
+			}
+		})
 	}
 }
