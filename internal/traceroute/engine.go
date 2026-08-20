@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -600,8 +601,12 @@ func resolveHopHostnames(ctx context.Context, hops []telemetry.TraceHop) {
 			if err != nil || len(hostnames) == 0 {
 				return
 			}
+			name := normalizeHopHostname(hostnames[0])
+			if name == "" {
+				return
+			}
 			mu.Lock()
-			names[addr] = hostnames[0]
+			names[addr] = name
 			mu.Unlock()
 		}(addr)
 	}
@@ -617,6 +622,18 @@ func resolveHopHostnames(ctx context.Context, hops []telemetry.TraceHop) {
 			}
 		}
 	}
+}
+
+// normalizeHopHostname turns one LookupAddr answer into the name a report
+// carries. LookupAddr yields a rooted FQDN ("one.one.one.one."); the trailing
+// dot is correct DNS but noise to a human reading a hop list, and the console
+// renders the field verbatim, so it is stripped here — the only place a name
+// enters the report, and the same normalization the ARP collector applies to
+// its own LookupAddr results. A name that is nothing but the root dot carries
+// no information, so it collapses to empty and the caller reports no hostname
+// at all rather than a blank one.
+func normalizeHopHostname(s string) string {
+	return strings.TrimSuffix(strings.TrimSpace(s), ".")
 }
 
 // terminal stamps a terminal status/reason and the completion time onto res.

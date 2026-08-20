@@ -405,3 +405,21 @@ func TestIsLocalAddrRecognizesThisHostOnly(t *testing.T) {
 	}
 	t.Skip("no non-loopback IPv4 interface address to check against")
 }
+
+// TestNormalizeHopHostname pins the shape a hop name reaches the console in.
+// The trailing-dot case is the one that matters: LookupAddr always returns a
+// rooted FQDN, so without this every resolved hop rendered as "one.one.one.one."
+func TestNormalizeHopHostname(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"one.one.one.one.", "one.one.one.one"},
+		{"router.lan.", "router.lan"},
+		{"router.lan", "router.lan"},
+		{" host.example. ", "host.example"},
+		{".", ""},
+		{"", ""},
+	} {
+		if got := normalizeHopHostname(tc.in); got != tc.want {
+			t.Errorf("normalizeHopHostname(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
