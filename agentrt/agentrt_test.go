@@ -329,17 +329,19 @@ func TestAuthRejectedReenrollsWithADifferentToken(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			errCh := make(chan error, 1)
-			go func() { errCh <- Run(ctx, Config{
-				Servers: []ServerConfig{{
-					Name:        "default",
-					URL:         srv.URL,
-					TokenHash:   inlineHash(tc.configuredToken),
-					TokenSource: func(context.Context) (string, error) { return tc.configuredToken, nil },
-					Enroller:    enroller,
-				}},
-				DataDir: dataDir, WireFormat: "json",
-				Policy: permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
-			}) }()
+			go func() {
+				errCh <- Run(ctx, Config{
+					Servers: []ServerConfig{{
+						Name:        "default",
+						URL:         srv.URL,
+						TokenHash:   inlineHash(tc.configuredToken),
+						TokenSource: func(context.Context) (string, error) { return tc.configuredToken, nil },
+						Enroller:    enroller,
+					}},
+					DataDir: dataDir, WireFormat: "json",
+					Policy: permission.Policy{Granted: permission.DefaultStandalone(), Source: permission.SourceDefault},
+				})
+			}()
 
 			// Run must never return in this scenario: it either keeps retrying the
 			// credential or re-enrolls once and then retries the new one. The
