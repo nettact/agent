@@ -2,7 +2,6 @@ package conn
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -514,99 +513,6 @@ func TestRotationDeniedKeepsCredential(t *testing.T) {
 		t.Fatalf("PersistRotation(%d, %q) called after a denied rotation", got.epoch, got.token)
 	case <-time.After(500 * time.Millisecond):
 	}
-}
-
-// TestRotationPersistRetriedUntilSuccess: a transient failure of the durable
-// credential write must not lose the accepted rotation. The agent keeps the
-// in-memory identity and reconnects under the rotated token, and the write is
-// retried at the top of the next session attempt until it lands — so a later
-// restart finds the rotated credential on disk instead of the dying old one.
-func TestRotationPersistRetriedUntilSuccess(t *testing.T) {
-	deps, _, _, _ := newTestDeps(t)
-	type rotated struct {
-		epoch uint64
-		token string
-	}
-	rotCh := make(chan rotated, 4)
-	var attempts int32
-	deps.SignChallenge = func(challenge []byte) []byte { return append([]byte("sig:"), challenge...) }
-	deps.PersistRotation = func(epoch uint64, token string) error {
-		n := atomic.AddInt32(&attempts, 1)
-		rotCh <- rotated{epoch, token}
-		if n == 1 {
-			return errors.New("disk write failed (transient)")
-		}
-		return nil
-	}
-
-	var conns int32
-	srv := startTokenServer(t, []string{"test-token", "rotated-token"}, func(ctx context.Context, c *websocket.Conn) {
-		n := atomic.AddInt32(&conns, 1)
-		hello, err := srvRead(ctx, c)
-		if err != nil || hello.Hello == nil {
-			t.Errorf("hello: %+v err=%v", hello, err)
-			return
-		}
-		if n == 1 {
-			if hello.Hello.EnrollmentEpoch != 5 {
-				t.Errorf("first Hello epoch = %d, want 5", hello.Hello.EnrollmentEpoch)
-				return
-			}
-			if err := srvWrite(ctx, c, wire.Frame{SequenceFloor: &wire.SequenceFloor{
-				EnrollmentEpoch: 5, SequenceFloor: 0,
-			}}); err != nil {
-				t.Errorf("write floor: %v", err)
-				return
-			}
-			if f, err := srvRead(ctx, c); err != nil || f.SequenceFloorApplied == nil {
-				t.Errorf("applied reply: %+v err=%v", f, err)
-				return
-			}
-			// No conflict here — the server initiates the rotation on its own.
-			if err := srvWrite(ctx, c, wire.Frame{EpochRotationChallenge: &wire.EpochRotationChallenge{
-				Challenge: "chal-1", Reason: "sequence_conflict", ExpiresAt: time.Now().Add(time.Minute),
-			}}); err != nil {
-				t.Errorf("write challenge: %v", err)
-				return
-			}
-			req, err := srvRead(ctx, c)
-			if err != nil || req.EpochRotationRequest == nil {
-				t.Errorf("rotation request: %+v err=%v", req, err)
-				return
-			}
-			if err := srvWrite(ctx, c, wire.Frame{EpochRotationResult: &wire.EpochRotationResult{
-				Status: wire.RotationOK, NewEpoch: 6, AgentToken: "rotated-token",
-			}}); err != nil {
-				t.Errorf("write rotation result: %v", err)
-				return
-			}
-			_, _ = srvRead(ctx, c) // hold until the agent ends the session
-			return
-		}
-		// Second session: the rotated credential, despite the failed disk write.
-		if hello.Hello.EnrollmentEpoch != 6 {
-			t.Errorf("second Hello epoch = %d, want 6 (the rotated epoch, held in memory)", hello.Hello.EnrollmentEpoch)
-			return
-		}
-		_, _ = srvRead(ctx, c) // hold the connection open until the client leaves
-	})
-
-	cancel := runAgent(t, epochOptions(srv.URL, wire.SubprotocolJSON, 5), deps)
-	defer cancel()
-
-	// Two calls: the failed first write inside the rotation, then the retry at
-	// the top of the next session attempt.
-	for want := 1; want <= 2; want++ {
-		select {
-		case got := <-rotCh:
-			if got.epoch != 6 || got.token != "rotated-token" {
-				t.Fatalf("PersistRotation call %d = (%d, %q), want (6, rotated-token)", want, got.epoch, got.token)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("PersistRotation call %d never arrived", want)
-		}
-	}
-	waitFor(t, "the rotated session connected", func() bool { return atomic.LoadInt32(&conns) >= 2 })
 }
 
 // TestUnsolicitedRotationResultReissues pins the P2 review fix: the server

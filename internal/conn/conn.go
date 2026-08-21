@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/nettact/agent/internal/desiredstate"
@@ -87,6 +89,12 @@ const (
 	maxBatchesPerDrain = 100
 	batchItems         = 500
 
+	// closeCauseGrace bounds how long a failed session waits for the reader to
+	// report a close code the write missed. It is a race between two goroutines
+	// reacting to the same TCP event, so it needs to cover scheduling, not
+	// network latency.
+	closeCauseGrace = 250 * time.Millisecond
+
 	defaultDialTimeout = 10 * time.Second
 	defaultAckTimeout  = 30 * time.Second
 	defaultBackoffBase = time.Second
@@ -106,6 +114,27 @@ type Options struct {
 	Token     string // bearer token presented on the upgrade request
 	Insecure  bool   // skip TLS verification (LAN self-signed dev)
 	Format    string // wire.SubprotocolProtobuf or wire.SubprotocolJSON
+
+	// WireSchema is the wire schema this runner dials with first. Zero (or the
+	// native version) means the ordinary case: speak this build's own schema.
+	// PreviousSchema means the agent has already learned that this particular
+	// server is a release behind, and starting there saves it one refused
+	// handshake per reconnect.
+	//
+	// It is a preference, not a lock. Whichever value it starts at, a server
+	// that refuses the schema with CloseUnsupportedSchema gets one immediate
+	// retry in the other one before the pairing is treated as terminal — the
+	// refusal is as likely to mean "you are ahead of me" as "you are behind me",
+	// and only trying tells them apart.
+	WireSchema int
+
+	// SchemaProbedAt is when this agent last offered its native schema to this
+	// server. It only matters while running downgraded: the reconnect loop
+	// re-offers the native schema once this is old enough, so a server that has
+	// since been upgraded is picked up on its own without waiting for the agent
+	// to be restarted. Zero means "not recently", which makes the first
+	// reconnect of a downgraded session a probe.
+	SchemaProbedAt time.Time
 
 	// Dialer establishes the session link. Nil selects the default WebSocket
 	// dialer built from ServerURL/Insecure/Format. The desktop injects the
@@ -292,9 +321,55 @@ type Deps struct {
 	// and epoch; the agent/site identity stay — so a crash after the rotation
 	// comes back with the new credential rather than the dead one. agentrt wires
 	// identity.SaveCredential here; this package deliberately never imports
-	// identity. It runs on the session goroutine, after the WAL's epoch has
-	// already moved (see applyRotationResult for why that order).
+	// identity.
+	//
+	// It runs on the session goroutine and it runs FIRST: nothing else about a
+	// rotation happens until this has returned nil. It must be idempotent, since
+	// a rotation the server re-issues after an interrupted attempt calls it again
+	// with the same arguments. See applyRotationResult for the whole ordering
+	// argument.
 	PersistRotation func(epoch uint64, token string) error
+
+	// PersistNegotiated records the wire schema this server was observed to
+	// accept, so a restart does not rediscover it by being refused again. It is
+	// called once per established session, on the session goroutine, and may
+	// coalesce writes — it is a hint, and losing one costs a single extra
+	// handshake.
+	//
+	// Nil disables the record entirely, which is what tests and any assembly
+	// without durable state do; the session then behaves exactly as it would on
+	// a first-ever run, every run.
+	PersistNegotiated func(schema int) error
+}
+
+// previousSchema is the wire schema this build can still speak, one below its
+// native one, kept so a server that is a single release behind can still be
+// reported to.
+//
+// It is written out rather than derived from the native version on purpose.
+// Keeping the version below speakable is a release decision — the release that
+// withdraws it deletes this path — and deriving it would silently re-target the
+// downgrade at a schema this binary cannot actually produce the moment the
+// native version is bumped again.
+const previousSchema = 7
+
+// schemaReprobeInterval is how long a downgraded runner waits before offering
+// its native schema again. The trade it balances is small in both directions: a
+// probe that fails costs one refused handshake, while never probing leaves an
+// agent talking the old schema to a server that was upgraded months ago — and
+// nothing else would ever notice, because the downgraded session works.
+//
+// Jittered per runner so a fleet that was downgraded together does not re-probe
+// together.
+const schemaReprobeInterval = 24 * time.Hour
+
+// otherSchema returns the schema to try when the server refuses this one. The
+// set is exactly two: this build's native schema and the one below it.
+func otherSchema(schema int) int {
+	if schema == protocol.SchemaVersion {
+		return previousSchema
+	}
+	return protocol.SchemaVersion
 }
 
 // Run dials the server and keeps a session alive until ctx is cancelled,
@@ -349,6 +424,15 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 		// deliberately never stored.
 		appliedConfigVersion: -1,
 		appliedGameVersion:   -1,
+		schema:               protocol.SchemaVersion,
+		lastNativeAt:         opts.SchemaProbedAt,
+		// ±20% jitter, for the same thundering-herd reason the reconnect backoff
+		// has it: a fleet downgraded by one server upgrade would otherwise all
+		// re-probe in the same minute.
+		reprobeAfter: time.Duration(float64(schemaReprobeInterval) * (1 + (rand.Float64()*0.4 - 0.2))),
+	}
+	if opts.WireSchema == previousSchema {
+		r.schema = previousSchema
 	}
 	// Tell the outbox which enrolled identity this session runs under, before
 	// anything can be claimed from it.
@@ -397,22 +481,21 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 	r.restoreProbeConfig()
 
 	bo := &backoff{base: opts.backoffBase, cap: opts.backoffCap}
-	// Every exit path from the loop below — shutdown during a backoff sleep
-	// included — gets one final chance to land a pending rotation on disk, so
-	// the next start reads the rotated credential instead of the dying old one.
-	defer func() {
-		if err := r.persistRotation(); err != nil {
-			r.logf("persist of the rotated credential at shutdown: %v", err)
-		}
-	}()
 	for {
-		// A rotation accepted in memory but not yet on disk is retried on every
-		// session attempt: the credential file is the only thing that survives
-		// a restart, so the window between the server's commit and this write
-		// is the one gap a crash can still widen. The retry is free when
-		// nothing is pending.
-		if err := r.persistRotation(); err != nil {
-			r.logf("retry persist of the rotated credential: %v", err)
+		// A runner that has been talking the older schema re-offers the native
+		// one once the last attempt is stale enough. The timestamp is what makes
+		// this safe to check on every dial: a downgrade that happened moments ago
+		// set it to now, so the flip cannot undo itself, while a runner that has
+		// been downgraded since a previous run picks the probe up from what that
+		// run recorded. A refused probe simply flips straight back (below), so
+		// the cost of an unnecessary one is a single handshake.
+		if r.schema != protocol.SchemaVersion && time.Since(r.lastNativeAt) >= r.reprobeAfter {
+			r.logf("offering wire schema %d again (the last attempt was %s ago)",
+				protocol.SchemaVersion, time.Since(r.lastNativeAt).Round(time.Minute))
+			r.schema, r.tried = protocol.SchemaVersion, nil
+		}
+		if r.schema == protocol.SchemaVersion {
+			r.lastNativeAt = time.Now()
 		}
 		start := time.Now()
 		err := r.session(ctx)
@@ -443,8 +526,24 @@ func Run(ctx context.Context, opts Options, deps Deps) error {
 			r.quiesce("another instance took over this credential")
 			return fmt.Errorf("another agent instance connected with this credential: %w", ErrSuperseded)
 		case wire.CloseUnsupportedSchema:
+			// A server that refuses the schema may simply be one release behind
+			// this agent — or one ahead, after a rollback. Neither is knowable
+			// from the close code, so try the other schema once, immediately and
+			// without the backoff: the pairing is not broken until BOTH have been
+			// refused. The tried set bounds it at two attempts per cycle and is
+			// cleared the moment a session is established.
+			if r.tried == nil {
+				r.tried = map[int]bool{}
+			}
+			r.tried[r.schema] = true
+			if alt := otherSchema(r.schema); !r.tried[alt] {
+				r.logf("the server refused wire schema %d; retrying immediately with %d", r.schema, alt)
+				r.schema = alt
+				continue
+			}
 			r.quiesce("the server rejected this agent's schema version")
-			return fmt.Errorf("server rejected schema version %d; upgrade the agent or server: %w", protocol.SchemaVersion, ErrUnsupportedSchema)
+			return fmt.Errorf("server rejected wire schema %d and %d; upgrade the agent or server: %w",
+				protocol.SchemaVersion, previousSchema, ErrUnsupportedSchema)
 		case wire.CloseRevoked:
 			r.quiesce("this agent was deleted on the server")
 			return fmt.Errorf("agent was deleted on the server; re-enroll to continue: %w", ErrRevoked)
@@ -516,16 +615,27 @@ type runner struct {
 	appliedDiagSerial uint64
 	haveDiagSerial    bool
 	lastSnapshotAt    time.Time
-	// rotEpoch/rotToken hold a rotation this runner accepted but has not yet
-	// durably persisted (rotToken empty = nothing pending). The server commits
-	// the rotation before the result reaches us and the old token dies at the
-	// challenge's expiry, so the accepted rotation is kept in memory even when
-	// the disk write fails, and persistRotation retries it at the top of every
-	// session attempt until it lands. A restart that happens before the write
-	// landed still converges while the server's rotation window is open — the
-	// server re-issues the same result idempotently for the old token.
-	rotEpoch uint64
-	rotToken string
+
+	// schema is the wire schema the NEXT dial will use, and tried records which
+	// schemas this reconnect cycle has already had refused. A cycle ends when a
+	// session is established (the server answers with a frame of its own), which
+	// clears tried: the two-schema search is per pairing attempt, not per
+	// process, or a server that was refused once could never be reached again.
+	schema int
+	tried  map[int]bool
+	// lastNativeAt is when the native schema was last offered to this server,
+	// seeded from what a previous run recorded, and reprobeAfter is how stale
+	// that may get before a downgraded runner offers it again.
+	lastNativeAt time.Time
+	reprobeAfter time.Duration
+	// established is set by the reader the instant the server sends anything at
+	// all, and negotiationRecorded says the resulting schema has already been
+	// written down for this session. The first frame is the earliest honest
+	// signal that the Hello was accepted: the server pushes its desired state
+	// unconditionally on connect, so silence up to that point is exactly what a
+	// refusal looks like.
+	established         atomic.Bool
+	negotiationRecorded bool
 
 	// appliedGame/appliedDiag are the blocks currently INSTALLED on their own
 	// axes, kept so the cache stores what this agent is running rather than
@@ -572,6 +682,13 @@ func (r *runner) session(ctx context.Context) error {
 	// sends is under a floor the PREVIOUS session applied, so the server must
 	// re-state it (and it does, on every connect).
 	r.floor = nil
+	r.established.Store(false)
+	r.negotiationRecorded = false
+	// The schema is read once, here, and passed to everything that needs it. The
+	// reader runs on its own goroutine and outlives the return of this function
+	// by an instant, while the field is reassigned by the reconnect loop — so
+	// the value travels as an argument rather than being read from the runner.
+	schema := r.schema
 	dialCtx, cancel := context.WithTimeout(ctx, r.opts.dialTimeout)
 	c, err := r.dialer(dialCtx, r.opts.Token)
 	cancel()
@@ -628,7 +745,7 @@ func (r *runner) session(ctx context.Context) error {
 	// Hello MUST be the first frame: it replaces the old per-request X-Agent-*
 	// headers. (The server pushes DesiredState unconditionally on connect, so
 	// Hello carries no applied-config watermark; MonitorStatus is that signal.)
-	hello := r.opts.Hello
+	hello := r.helloFor(schema)
 	if err := r.writeFrame(sessionCtx, c, wire.Frame{Hello: &hello}); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
@@ -642,7 +759,11 @@ func (r *runner) session(ctx context.Context) error {
 	// Say so out loud. Success used to be inferable only from a later drain or
 	// config line, which means a healthy agent with nothing yet to send looked
 	// exactly like a broken one in the log.
-	r.logf("connected to %s (agent %s)", r.opts.ServerURL, r.opts.AgentID)
+	if schema == protocol.SchemaVersion {
+		r.logf("connected to %s (agent %s)", r.opts.ServerURL, r.opts.AgentID)
+	} else {
+		r.logf("connected to %s (agent %s) speaking wire schema %d", r.opts.ServerURL, r.opts.AgentID, schema)
+	}
 
 	// One reader goroutine feeds these; the session goroutine is the ONLY
 	// writer and the only place config/WAL state is touched, so no locking is
@@ -652,10 +773,85 @@ func (r *runner) session(ctx context.Context) error {
 	ctrlCh := make(chan wire.Frame, 4)
 	pushCh := make(chan wire.Frame, 4)
 
-	go r.readLoop(sessionCtx, c, ackCh, ctrlCh, pushCh, errCh)
+	go r.readLoop(sessionCtx, c, schema, ackCh, ctrlCh, pushCh, errCh)
 	go r.pingLoop(sessionCtx, c, errCh)
 
-	return r.sessionLoop(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh)
+	// The reader is still live here (endSession runs after this returns), which
+	// is what lets a lost close code be recovered — see preferCloseCause.
+	return r.preferCloseCause(r.sessionLoop(ctx, sessionCtx, c, schema, ackCh, ctrlCh, pushCh, errCh), errCh)
+}
+
+// preferCloseCause replaces a session error with the peer's close code when the
+// reader has one and the error in hand does not.
+//
+// WHICH call observes a peer close is a race, not a fact about the close. A
+// session with a backlog writes its first packet in the same breath as its
+// Hello, so a server that answers the Hello by closing is as likely to be seen
+// by that write as by the read — and the write does not see a close at all. The
+// transport has already been torn down underneath it by the time it notices, so
+// it reports something like "use of closed network connection", while the
+// reader, the only thing that actually parses the close frame, holds the code.
+//
+// Losing that race must not lose the verdict. It decides whether the runner
+// re-dials in the other wire schema, stops for a superseded credential, or
+// deletes a revoked one — and the agents that lose it are precisely those with
+// something queued to send.
+func (r *runner) preferCloseCause(err error, errCh <-chan error) error {
+	if err == nil || wire.CloseStatus(err) != -1 {
+		return err
+	}
+	select {
+	case readErr := <-errCh:
+		if wire.CloseStatus(readErr) != -1 {
+			return readErr
+		}
+	case <-time.After(closeCauseGrace):
+		// The reader has nothing to say. Ordinary: most session failures are not
+		// closes at all, and this bound is what keeps that case from waiting.
+	}
+	return err
+}
+
+// helloFor builds this session's Hello for the schema it is running under.
+//
+// The older schema's Hello is stripped of everything that schema does not
+// define: no capability list and no enrollment epoch. A peer that does not know
+// those keys would skip them anyway, so this is not about being understood — it
+// is the sending half of the same rule the receiving half already follows.
+// Declaring a capability is a promise to run its state machine, and a session
+// that has deliberately turned those state machines off must not make the
+// promise. The epoch goes for the same reason: it names a barrier this session
+// will not be running.
+func (r *runner) helloFor(schema int) wire.Hello {
+	hello := r.opts.Hello
+	hello.SchemaVersion = schema
+	if schema != protocol.SchemaVersion {
+		hello.Capabilities = nil
+		hello.EnrollmentEpoch = 0
+	}
+	return hello
+}
+
+// noteNegotiated records the schema this session established, once. It runs on
+// the session goroutine, off the flag the reader sets on the first frame it
+// decodes.
+//
+// Establishing a session is also what closes the two-schema search: whatever
+// was tried before, this pairing works, and the next refusal starts a fresh
+// pair of attempts rather than inheriting a verdict from an earlier outage.
+func (r *runner) noteNegotiated(schema int) {
+	if r.negotiationRecorded || !r.established.Load() {
+		return
+	}
+	r.negotiationRecorded = true
+	r.tried = nil
+	if r.deps.PersistNegotiated == nil {
+		return
+	}
+	if err := r.deps.PersistNegotiated(schema); err != nil {
+		// Non-fatal by construction: the record only saves a future handshake.
+		r.logf("could not record the negotiated wire schema %d: %v", schema, err)
+	}
 }
 
 // readLoop is the session's sole reader: it decodes each frame and routes it
@@ -666,13 +862,18 @@ func (r *runner) session(ctx context.Context) error {
 // EpochRotationResult) get their own channel: they drive state machines the
 // session goroutine runs, and mixing them into pushCh would let them queue
 // behind config frames while a rotation or a barrier waits.
-func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- wire.Ack, ctrlCh chan<- wire.Frame, pushCh chan<- wire.Frame, errCh chan<- error) {
+func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, schema int, ackCh chan<- wire.Ack, ctrlCh chan<- wire.Frame, pushCh chan<- wire.Frame, errCh chan<- error) {
 	for {
 		f, err := c.ReadFrame(sessionCtx)
 		if err != nil {
 			errCh <- err
 			return
 		}
+		// Anything at all from the server means the Hello was accepted — the
+		// earliest honest signal there is, since the server pushes its desired
+		// state on connect without being asked. The session goroutine turns this
+		// into the durable "this server speaks schema N" record.
+		r.established.Store(true)
 		switch {
 		case f.Ack != nil:
 			select {
@@ -681,6 +882,16 @@ func (r *runner) readLoop(sessionCtx context.Context, c wire.Conn, ackCh chan<- 
 				return
 			}
 		case f.SequenceFloor != nil, f.EpochRotationChallenge != nil, f.EpochRotationResult != nil:
+			if schema != protocol.SchemaVersion {
+				// This session declared no capabilities and no epoch, so these
+				// frames are ones the peer was told not to send. They are not
+				// merely ignored: the agent has no way to answer them under this
+				// schema, and half-answering a barrier or a rotation is worse
+				// than not having one. End the session and reconnect — defining a
+				// close code for it is the server's prerogative, not the agent's.
+				errCh <- fmt.Errorf("server sent a schema-%d control frame on a schema-%d session", protocol.SchemaVersion, schema)
+				return
+			}
 			select {
 			case ctrlCh <- f:
 			case <-sessionCtx.Done():
@@ -727,13 +938,13 @@ func (r *runner) pingLoop(sessionCtx context.Context, c wire.Conn, errCh chan<- 
 
 // sessionLoop is the session goroutine's main loop: drain the WAL on a ticker
 // (plus once immediately) and apply server pushes as they arrive.
-func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error) error {
+func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, schema int, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error) error {
 	// Immediate first drain: a freshly-(re)connected session should flush
 	// whatever accumulated while offline without waiting a full tick —
 	// preserves the old loop's fast-startup behavior. (It stays behind the
 	// floor barrier: until the server pushes a SequenceFloor for this epoch,
 	// drain is a no-op.)
-	if err := r.drain(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh); err != nil {
+	if err := r.drain(ctx, sessionCtx, c, schema, ackCh, ctrlCh, pushCh, errCh); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(r.deps.DrainInterval)
@@ -745,6 +956,10 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 		trackerUpdates = r.deps.Tracker.Updates()
 	}
 	for {
+		// Cheap and idempotent after the first time: the flag is set by the
+		// reader the instant the server says anything, and this is the session
+		// goroutine's first opportunity to act on it.
+		r.noteNegotiated(schema)
 		select {
 		case <-ctx.Done():
 			return ctx.Err() // Run maps shutdown to a clean nil return
@@ -765,7 +980,7 @@ func (r *runner) sessionLoop(ctx, sessionCtx context.Context, c wire.Conn, ackCh
 				return fmt.Errorf("write monitor status: %w", err)
 			}
 		case <-ticker.C:
-			if err := r.drain(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh); err != nil {
+			if err := r.drain(ctx, sessionCtx, c, schema, ackCh, ctrlCh, pushCh, errCh); err != nil {
 				return err
 			}
 		}
@@ -895,10 +1110,41 @@ func (r *runner) awaitRotationResult(ctx, sessionCtx context.Context, c wire.Con
 }
 
 // applyRotationResult acts on the server's verdict for the rotation request
-// this session sent. On success it moves the WAL's epoch first, then the
-// credential, then ends the session so the reconnect presents the rotated
-// identity; a denial, a retry or an unknown status is a plain session error
-// and the old credential stays in force.
+// this session sent. A denial, a retry or an unknown status is a plain session
+// error and the old credential stays in force.
+//
+// # Why the accepted case is strictly durable-first
+//
+// A rotation touches three things, and the order they move in is the whole
+// design — each step is the precondition of the next:
+//
+//  1. the credential on disk (with the desired-state cache re-keyed to it: one
+//     atomic step, either both or neither);
+//  2. the outbox's epoch;
+//  3. the identity this process is using.
+//
+// Persisting first is what makes a crash survivable in the only direction that
+// converges. A crash after step 1 leaves a credential the server knows about,
+// and the next start presents it; a crash before step 1 leaves the OLD
+// credential, which the server is required to keep honouring until the new one
+// is first used, and the reconnect gets the same result re-issued idempotently.
+// Either way the durable state is a credential the agent can actually
+// authenticate with.
+//
+// The reverse — move the process onto the new token first and chase the disk
+// write afterwards — was what this did before, and it trades a recoverable
+// failure for an unrecoverable one: a machine that loses power between the
+// switch and the write comes back holding a credential nobody ever wrote down,
+// with the old one already abandoned in memory. That is a permanently
+// unauthenticatable agent, and re-enrollment is the only way out of it. The
+// price of the durable-first order is that a failed disk write means the
+// rotation simply did not happen this time: the session ends, the OLD token
+// reconnects, and the server re-drives the same rotation. That is a retry, not
+// a loss.
+//
+// Step 2 is deliberately non-fatal on its own. The credential is already
+// durable at that point, and the session start reconciles the outbox's epoch
+// from the credential (see Run) — the one direction that always converges.
 func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 	switch res.Status {
 	case wire.RotationOK:
@@ -908,31 +1154,20 @@ func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 		if res.AgentToken == "" {
 			return fmt.Errorf("server rotated the credential but issued no agent token")
 		}
-		// The WAL's epoch moves before the credential's. A crash between the
-		// two durable writes leaves the WAL ahead of the credential, and Run's
-		// session-start reconcile resets it from the credential — the direction
-		// that always converges on "WAL follows credential". A failed epoch
-		// write is likewise non-fatal: the in-memory move stands for this
-		// process, and the same reconcile heals the durable one.
-		if _, err := r.deps.Outbox.SetEpoch(r.opts.ServerName, res.NewEpoch); err != nil {
-			r.logf("set outbox epoch %d: %v", res.NewEpoch, err)
+		// Step 1. A failure here abandons the rotation for this session: the old
+		// credential is still the durable one and still valid, so ending the
+		// session and reconnecting under it is both correct and recoverable.
+		if err := r.persistRotation(res.NewEpoch, res.AgentToken); err != nil {
+			return fmt.Errorf("rotation to epoch %d not applied — the credential could not be saved: %w", res.NewEpoch, err)
 		}
-		// The runner's own identity moves BEFORE the durable credential write.
-		// The server has already committed the rotation: the old token dies at
-		// the challenge's expiry, so a failed disk write must not strand this
-		// process reconnecting with a dying credential while the accepted
-		// result is discarded. The in-memory identity carries the session
-		// forward, and the pending rotation is retried at the top of every
-		// session attempt until it lands (see persistRotation). A restart
-		// before the write landed converges through the server's rotation
-		// window, which re-issues the same result idempotently.
+		// Step 2.
+		if _, err := r.deps.Outbox.SetEpoch(r.opts.ServerName, res.NewEpoch); err != nil {
+			r.logf("set outbox epoch %d: %v (the credential is already durable; the next session start re-syncs it)", res.NewEpoch, err)
+		}
+		// Step 3.
 		r.opts.Token = res.AgentToken
 		r.opts.EnrollmentEpoch = res.NewEpoch
 		r.opts.Hello.EnrollmentEpoch = res.NewEpoch
-		r.rotEpoch, r.rotToken = res.NewEpoch, res.AgentToken
-		if err := r.persistRotation(); err != nil {
-			r.logf("persist rotated credential to epoch %d: %v (in-memory credential in force; retrying on every reconnect)", res.NewEpoch, err)
-		}
 		return fmt.Errorf("credential rotated to epoch %d; reconnecting under the new identity: %w", res.NewEpoch, errEpochRotated)
 	default:
 		// Denied, retry and any unknown status share one shape: this session's
@@ -947,34 +1182,29 @@ func (r *runner) applyRotationResult(res *wire.EpochRotationResult) error {
 	}
 }
 
-// persistRotation durably writes the pending rotation, clearing the pending
-// state once it lands. It is idempotent and cheap when nothing is pending, so
-// callers retry it freely — the session loop calls it before every dial and at
-// shutdown. A missing hook is an error on every call, which surfaces the
-// wiring bug in the session log rather than silently running unpersisted.
-func (r *runner) persistRotation() error {
-	if r.rotToken == "" {
-		return nil
-	}
+// persistRotation durably writes one rotated credential and re-keys the
+// desired-state cache to it. Both halves or neither: a credential on disk whose
+// cache is still bound to the retired bearer would restore nothing after a
+// restart, so a failed re-key is reported as a failed persist and the caller
+// abandons the rotation.
+//
+// A missing hook fails the rotation rather than being ignored. Running a
+// rotation with nowhere to write it is the wiring bug that produces the
+// unauthenticatable agent described in applyRotationResult, and the failure
+// belongs at the moment it can still be declined.
+func (r *runner) persistRotation(epoch uint64, token string) error {
 	if r.deps.PersistRotation == nil {
-		return fmt.Errorf("no persistence hook is wired for the rotated credential (epoch %d)", r.rotEpoch)
+		return fmt.Errorf("no persistence hook is wired for the rotated credential (epoch %d)", epoch)
 	}
-	if err := r.deps.PersistRotation(r.rotEpoch, r.rotToken); err != nil {
+	if err := r.deps.PersistRotation(epoch, token); err != nil {
 		return err
 	}
-	// Re-key the desired-state cache only once the credential is durable:
-	// re-keying before that would let a crash restart with the OLD credential
-	// while the cache already speaks the NEW token, which the old binding
-	// cannot admit. A failed re-key returns an error so the pending rotation is
-	// retained and retried — the credential write above is idempotent, so the
-	// retry re-runs only the re-key.
 	if r.deps.Desired != nil {
-		if err := r.deps.Desired.Rebind(r.rotToken); err != nil {
-			return fmt.Errorf("re-key desired-state cache to epoch %d: %w", r.rotEpoch, err)
+		if err := r.deps.Desired.Rebind(token); err != nil {
+			return fmt.Errorf("re-key desired-state cache to epoch %d: %w", epoch, err)
 		}
 	}
-	r.logf("persisted the rotated credential (epoch %d)", r.rotEpoch)
-	r.rotEpoch, r.rotToken = 0, ""
+	r.logf("persisted the rotated credential (epoch %d)", epoch)
 	return nil
 }
 
@@ -997,15 +1227,23 @@ func (r *runner) anchoredNow() time.Time {
 // tick, same-sequence retry on failure, server dedups on agent_id+sequence).
 // All WAL access happens here, on the session goroutine, so the store never
 // sees concurrent claims.
-func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error) error {
-	// The sequence-floor barrier (schema 8). Until the server has pushed a
-	// floor for this session's epoch and the agent has durably applied it, no
-	// packet may be claimed or sent — the server enforces the same ordering on
-	// its side and treats an early packet as a protocol error. A zero-epoch
-	// session (a credential enrolled before schema 8) has no barrier: the
-	// server is required not to push floors to it, so gating would stall every
-	// legacy install forever.
-	if r.floor == nil && r.opts.EnrollmentEpoch != 0 {
+func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, schema int, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error) error {
+	// The sequence-floor barrier. Until the server has pushed a floor for this
+	// session's epoch and the agent has durably applied it, no packet may be
+	// claimed or sent — the server enforces the same ordering on its side and
+	// treats an early packet as a protocol error. A zero-epoch session (a
+	// credential enrolled before the barrier existed) has no barrier: the server
+	// is required not to push floors to it, so gating would stall every legacy
+	// install forever.
+	//
+	// A session running the older schema has no barrier either, and the test is
+	// on the SCHEMA rather than on the epoch. The two are independent: a server
+	// rolled back to the older schema still faces an agent holding a credential
+	// that was rotated to a non-zero epoch while it was current. Gating on the
+	// epoch alone would leave that agent waiting forever for a floor the server
+	// no longer knows how to send — an agent that is connected, healthy, and
+	// silent.
+	if r.floor == nil && r.opts.EnrollmentEpoch != 0 && schema == protocol.SchemaVersion {
 		return nil
 	}
 	for i := 0; i < maxBatchesPerDrain; i++ {
@@ -1020,7 +1258,12 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 			return nil
 		}
 		pkt := telemetry.Packet{
-			SchemaVersion:      protocol.SchemaVersion,
+			// The packet's schema follows the SESSION, not the build. The
+			// receiving side validates it exactly as it validates the Hello, so a
+			// downgraded session that stamped its build's native version here
+			// would be refused at its first packet — with a healthy handshake and
+			// a working link, which is the hardest shape of this bug to see.
+			SchemaVersion:      schema,
 			AgentID:            r.opts.AgentID,
 			SiteID:             r.opts.SiteID,
 			Sequence:           batch.Sequence,
@@ -1039,7 +1282,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 		if err := r.writeFrame(sessionCtx, c, wire.Frame{Packet: &pkt}); err != nil {
 			return fmt.Errorf("write packet seq=%d: %w", batch.Sequence, err)
 		}
-		ack, err := r.awaitAck(ctx, sessionCtx, c, ackCh, ctrlCh, pushCh, errCh, batch.Sequence)
+		ack, err := r.awaitAck(ctx, sessionCtx, c, schema, ackCh, ctrlCh, pushCh, errCh, batch.Sequence)
 		if err != nil {
 			// The batch stays tagged in the WAL and is re-sent under the SAME
 			// sequence by the next session, so nothing is lost or double-counted.
@@ -1080,7 +1323,7 @@ func (r *runner) drain(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-cha
 // consuming pushCh while it waits — the deadlock guard: if pushes queued up
 // unconsumed, the reader would block sending to pushCh and the ack could never
 // be read off the wire.
-func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
+func (r *runner) awaitAck(ctx, sessionCtx context.Context, c wire.Conn, schema int, ackCh <-chan wire.Ack, ctrlCh <-chan wire.Frame, pushCh <-chan wire.Frame, errCh <-chan error, seq uint64) (wire.Ack, error) {
 	timer := time.NewTimer(r.opts.ackTimeout)
 	defer timer.Stop()
 	for {

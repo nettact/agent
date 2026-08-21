@@ -12,6 +12,7 @@ import (
 	"github.com/nettact/agent/internal/enroll"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/probepolicy"
+	"github.com/nettact/protocol"
 	protoenroll "github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/permission"
 )
@@ -163,7 +164,7 @@ func TestMissingTokenIsTerminalThroughTheLoaderCallback(t *testing.T) {
 			return "", ErrNoEnrollmentToken
 		},
 	}}
-	_, err := enrollServer(context.Background(), runEnv{cfg: Config{DataDir: agentDataDir(t)}}, rt)
+	_, _, err := enrollServer(context.Background(), runEnv{cfg: Config{DataDir: agentDataDir(t)}}, rt, protocol.SchemaVersion)
 	if !errors.Is(err, ErrNoEnrollmentToken) {
 		t.Fatalf("err = %v; the runner cannot tell this from a server being down", err)
 	}
@@ -190,7 +191,7 @@ func TestRejectedEnrollmentIsDistinguishable(t *testing.T) {
 			return protoenroll.EnrollResponse{}, errRejectedForTest
 		},
 	}}
-	_, err = enrollServer(context.Background(), env, rt)
+	_, _, err = enrollServer(context.Background(), env, rt, protocol.SchemaVersion)
 	if !errors.Is(err, ErrEnrollRejected) {
 		t.Fatalf("err = %v; a refused token reads as a transient outage", err)
 	}
@@ -198,7 +199,7 @@ func TestRejectedEnrollmentIsDistinguishable(t *testing.T) {
 	rt.cfg.Enroller = func(context.Context, protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
 		return protoenroll.EnrollResponse{}, errors.New("dial tcp: connection refused")
 	}
-	_, err = enrollServer(context.Background(), env, rt)
+	_, _, err = enrollServer(context.Background(), env, rt, protocol.SchemaVersion)
 	if errors.Is(err, ErrEnrollRejected) {
 		t.Fatalf("err = %v; an unreachable server reads as a refused token", err)
 	}

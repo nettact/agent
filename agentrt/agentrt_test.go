@@ -17,6 +17,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/nettact/agent/internal/identity"
+	"github.com/nettact/protocol"
 	protoenroll "github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/wire"
@@ -446,7 +447,7 @@ func TestEnrollServerConsumesTheToken(t *testing.T) {
 	}}
 	env := runEnv{cfg: Config{DataDir: dataDir}, key: key, hostname: "test", platformID: "test"}
 
-	cred, err := enrollServer(context.Background(), env, rt)
+	cred, _, err := enrollServer(context.Background(), env, rt, protocol.SchemaVersion)
 	if err != nil {
 		t.Fatalf("enrollServer: %v", err)
 	}

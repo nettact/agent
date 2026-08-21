@@ -64,6 +64,19 @@ const (
 	ReasonSuperseded Reason = "superseded"
 	// ReasonSchemaMismatch: the server rejected this agent's schema version.
 	ReasonSchemaMismatch Reason = "schema_mismatch"
+	// ReasonUnsupportedSubprotocol: the server would not accept either wire
+	// format this agent offered on the upgrade. Retryable like any pairing
+	// problem — nothing here is broken and the credential is fine — but it needs
+	// its own name: it is a configuration mismatch with a specific fix, and left
+	// as a generic session failure it reads as an unreliable network and sends
+	// the operator to look at cables.
+	ReasonUnsupportedSubprotocol Reason = "unsupported_subprotocol"
+	// ReasonProtocolError: the server refused a frame as not allowed at that
+	// point in the session. Also retryable, and named for the same reason: it
+	// says the fault is in one side's implementation or in the pairing of the
+	// two versions, not in the link, and that is the one thing an anonymous
+	// reconnect loop cannot tell anybody.
+	ReasonProtocolError Reason = "protocol_error"
 	// ReasonRevoked: the agent was deleted server-side; it must re-enroll.
 	ReasonRevoked Reason = "revoked"
 	// ReasonNetwork is the catch-all: something below the application layer
@@ -100,6 +113,10 @@ func Classify(err error) Reason {
 		return ReasonSuperseded
 	case wire.CloseUnsupportedSchema:
 		return ReasonSchemaMismatch
+	case wire.CloseUnsupportedSubprotocol:
+		return ReasonUnsupportedSubprotocol
+	case wire.CloseProtocolError:
+		return ReasonProtocolError
 	case wire.CloseRevoked:
 		return ReasonRevoked
 	}

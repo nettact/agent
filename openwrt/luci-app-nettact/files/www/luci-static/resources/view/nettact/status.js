@@ -45,6 +45,8 @@ var REASON_LABELS = {
 	ack_timeout: _('The server stopped acknowledging uploads'),
 	superseded: _('Another agent connected with the same credential'),
 	schema_mismatch: _('The server does not support this agent version'),
+	unsupported_subprotocol: _('The server did not accept this agent wire format'),
+	protocol_error: _('The server refused a message as not allowed at that point'),
 	revoked: _('This agent was deleted on the server'),
 	network: _('The server could not be reached'),
 	no_token: _('No enrollment token — enroll this router first'),

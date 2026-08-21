@@ -525,6 +525,14 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("load credentials: %w", err)
 	}
+	// What each server was last observed to speak on the wire. A server that has
+	// never answered has no record, which means "prefer this build's own schema"
+	// — the same starting point a first run has. Read once here so a runner never
+	// touches the file except to write its own entry.
+	negotiated, err := identity.LoadNegotiated(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("load negotiated wire schemas: %w", err)
+	}
 
 	// Internal context cancelled when Run returns, so the schedulers and heartbeat
 	// never outlive one Run — important when a terminal outcome (not ctx cancel)
@@ -824,7 +832,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		runnersWG.Add(1)
 		go func(i int, rt *serverRuntime) {
 			defer runnersWG.Done()
-			err := runServer(runCtx, env, rt, creds[rt.cfg.Name])
+			err := runServer(runCtx, env, rt, creds[rt.cfg.Name], negotiated[rt.cfg.Name])
 			outcomes[i] = err
 			if err != nil {
 				// Terminal is recorded before the event fires and before Run
@@ -868,8 +876,13 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 // terminal: the credential is deleted and the loop re-enrolls, which is the
 // behaviour the desktop supervisor used to implement one level up and which now
 // has to live here, since one server's revocation must not disturb the others.
-func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity.Credential) error {
+func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity.Credential, neg identity.Negotiated) error {
 	enrolled := cred.AgentToken != ""
+	// The wire schema this runner starts from. It is per server and it stays per
+	// server: one server being a release behind says nothing about the others,
+	// and every runner here has its own copy of this value, its own session and
+	// its own record on disk.
+	schema := preferredSchema(neg)
 	if enrolled {
 		log.Printf("[%s] resuming as %s (site %s)", rt.cfg.Name, cred.AgentID, cred.SiteID)
 		env.status.set(rt.cfg.Name, func(s *serverStatus) {
@@ -889,7 +902,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				}
 				s.AgentID = ""
 			})
-			c, err := enrollServer(ctx, env, rt)
+			c, used, err := enrollServer(ctx, env, rt, schema)
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil
@@ -922,6 +935,14 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				continue
 			}
 			cred, enrolled, backoff = c, true, enrollBackoffBase
+			// Enrollment is the first thing that ever reaches a server, so its
+			// answer is often the first evidence of what that server speaks.
+			// Record it before the session starts, so a crash between the two
+			// does not send the next start back to the schema just refused.
+			schema = used
+			if err := recordNegotiated(env.cfg.DataDir, rt.cfg.Name, &neg, used); err != nil {
+				log.Printf("[%s] could not record the negotiated wire schema: %v", rt.cfg.Name, err)
+			}
 			log.Printf("[%s] enrolled as %s (site %s)", rt.cfg.Name, cred.AgentID, cred.SiteID)
 			env.status.set(rt.cfg.Name, func(s *serverStatus) {
 				s.State = statusConnecting
@@ -938,6 +959,16 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 		// re-enrollment (a revoked server comes back as a new agent) does not
 		// rewrite what the old one saw.
 		rt.scene.SetAgentID(agentID)
+		connDeps := rt.connDeps(cred, env.cfg.DataDir, env.key)
+		// Runs on conn's own goroutine, which is this one: conn.Run blocks here
+		// for the life of the session loop, so the two variables this closes over
+		// are touched by nothing else. It updates the in-memory preference as well
+		// as the file, so a revocation followed by a re-enrollment starts from
+		// what the session just learned rather than from what the last start read.
+		connDeps.PersistNegotiated = func(used int) error {
+			schema = used
+			return recordNegotiated(env.cfg.DataDir, rt.cfg.Name, &neg, used)
+		}
 		err := conn.Run(ctx, conn.Options{
 			ServerName:      rt.cfg.Name,
 			ServerURL:       rt.cfg.URL,
@@ -948,6 +979,8 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 			AgentID:         cred.AgentID,
 			SiteID:          cred.SiteID,
 			EnrollmentEpoch: cred.EnrollmentEpoch,
+			WireSchema:      schema,
+			SchemaProbedAt:  neg.LastProbe,
 			Hello: wire.Hello{
 				SchemaVersion:   protocol.SchemaVersion,
 				Hostname:        env.hostname,
@@ -1031,7 +1064,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 					s.LastError = &statusError{Code: string(reason), Detail: err.Error()}
 				})
 			},
-		}, rt.connDeps(cred, env.cfg.DataDir, env.key))
+		}, connDeps)
 
 		// Run returned, so this session ended in a way that never reached the retry
 		// hook — shutdown, or one of the terminal close codes. Spend the disconnect
@@ -1088,9 +1121,9 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 
 // enrollServer performs one server's enrollment exchange and persists the
 // credential it returns.
-func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.Credential, error) {
+func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime, schema int) (identity.Credential, int, error) {
 	if rt.cfg.TokenSource == nil {
-		return identity.Credential{}, ErrNoEnrollmentToken
+		return identity.Credential{}, schema, ErrNoEnrollmentToken
 	}
 	token, err := rt.cfg.TokenSource(ctx)
 	if err != nil {
@@ -1098,13 +1131,13 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		// must survive to the runner as the terminal outcome it is; anything else
 		// is a real failure to fetch and stays retryable.
 		if errors.Is(err, ErrNoEnrollmentToken) {
-			return identity.Credential{}, fmt.Errorf("obtain enrollment token: %w", err)
+			return identity.Credential{}, schema, fmt.Errorf("obtain enrollment token: %w", err)
 		}
-		return identity.Credential{}, fmt.Errorf("obtain enrollment token: %v: %w", err, ErrEnroll)
+		return identity.Credential{}, schema, fmt.Errorf("obtain enrollment token: %v: %w", err, ErrEnroll)
 	}
 	// Build+sign the request, then run it through the injected Enroller (direct
 	// registry call for the desktop's own server) or the default HTTP POST.
-	req := enroll.BuildRequest(env.key, token, env.hostname, env.platformID, Version, rt.report)
+	req := enroll.BuildRequest(schema, env.key, token, env.hostname, env.platformID, Version, rt.report)
 	exchange := rt.cfg.Enroller
 	if exchange == nil {
 		exchange = func(ctx context.Context, r protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
@@ -1112,13 +1145,32 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		}
 	}
 	resp, err := exchange(ctx, req)
+	if err != nil && enroll.SchemaRefused(err) {
+		// The server does not know the schema this request declared. Enrollment
+		// is a separate path from the session and it runs FIRST, before any
+		// handshake, so this is the only place a brand-new install can discover
+		// that the other side is a release away — and being refused here means it
+		// never gets far enough to find out any other way.
+		//
+		// Exactly once, in the other schema. Twice is the whole budget: the set
+		// this build can speak has two members, and a loop that kept trying would
+		// spend a token's lifetime rediscovering the same answer. The one-time
+		// token survives the refusal — the schema is checked before the signature
+		// and long before the token is marked spent — so the retry presents the
+		// same token rather than needing a fresh one.
+		alt := otherWireSchema(schema)
+		log.Printf("[%s] the server does not accept wire schema %d for enrollment; trying %d once", rt.cfg.Name, schema, alt)
+		schema = alt
+		req = enroll.BuildRequest(schema, env.key, token, env.hostname, env.platformID, Version, rt.report)
+		resp, err = exchange(ctx, req)
+	}
 	if err != nil {
 		// A refusal has to stay recognisable through the wrapping: it is the one
 		// enrollment failure whose remedy is a person doing something, and a
 		// caller that cannot tell it from an unreachable server has to describe
 		// every outage as a bad token.
 		if errors.Is(err, ErrEnrollRejected) {
-			return identity.Credential{}, fmt.Errorf("enroll: %w", err)
+			return identity.Credential{}, schema, fmt.Errorf("enroll: %w", err)
 		}
 		// Both causes are wrapped, not just the sentinel: ErrEnroll is what the
 		// runner branches on, while the transport error underneath is what says
@@ -1126,7 +1178,7 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		// does not resolve. Folding the latter in with %v would leave the status
 		// file able to report only "enrollment failed", which is the black box
 		// this is meant to open.
-		return identity.Credential{}, fmt.Errorf("enroll: %w: %w", err, ErrEnroll)
+		return identity.Credential{}, schema, fmt.Errorf("enroll: %w: %w", err, ErrEnroll)
 	}
 	sum := sha256.Sum256([]byte(token))
 	cred := identity.Credential{
@@ -1156,10 +1208,68 @@ func enrollServer(ctx context.Context, env runEnv, rt *serverRuntime) (identity.
 		// token can never help a retry, and leaving it would mislead the next
 		// start into retrying a dead token.
 		rt.clearToken()
-		return identity.Credential{}, fmt.Errorf("save credential: %w: %w", err, ErrLocalState)
+		return identity.Credential{}, schema, fmt.Errorf("save credential: %w: %w", err, ErrLocalState)
 	}
 	rt.clearToken()
-	return cred, nil
+	return cred, schema, nil
+}
+
+// otherWireSchema returns the schema to try when a server refuses this one. The
+// set this build can speak has exactly two members: its native schema and the
+// one below it.
+func otherWireSchema(schema int) int {
+	if schema == protocol.SchemaVersion {
+		return enroll.PreviousSchema
+	}
+	return protocol.SchemaVersion
+}
+
+// preferredSchema is the wire schema a runner opens with, given what a previous
+// run recorded about this server.
+//
+// Anything but a recorded downgrade means "speak this build's own schema",
+// including a record that says nothing — a server that has never answered is
+// treated exactly like a first-ever run. A recorded downgrade is honoured only
+// while it was reached by THIS binary: a different build is reason enough to
+// offer the native schema again, since both halves of that conclusion (what
+// this agent can speak, and what the server accepted from it) belong to
+// something that has just been replaced. The reconnect loop applies the other
+// re-probe trigger, the elapsed one, because only it knows when a reconnect
+// happens.
+func preferredSchema(neg identity.Negotiated) int {
+	if neg.Schema != enroll.PreviousSchema || neg.AgentVersion != Version {
+		return protocol.SchemaVersion
+	}
+	return enroll.PreviousSchema
+}
+
+// negotiationRefresh bounds how often an unchanged conclusion is rewritten. The
+// record is a hint whose only cost, if lost, is one refused handshake, so it is
+// not worth a flash write on every reconnect of a flapping link; it is worth
+// one an hour, because the timestamp inside it is what schedules the next probe
+// of a server that may since have been upgraded.
+const negotiationRefresh = time.Hour
+
+// recordNegotiated persists what a server was observed to accept and updates
+// the caller's in-memory copy. Called only from a server's own runner
+// goroutine, which is the only writer of both.
+func recordNegotiated(dataDir, server string, cur *identity.Negotiated, schema int) error {
+	now := time.Now().UTC()
+	unchanged := cur.Schema == schema && cur.AgentVersion == Version
+	if unchanged && now.Sub(cur.LastProbe) < negotiationRefresh {
+		return nil
+	}
+	rec := identity.Negotiated{Schema: schema, AgentVersion: Version, DecidedAt: now, LastProbe: now}
+	if unchanged && !cur.DecidedAt.IsZero() {
+		// The conclusion has not changed, only its freshness — keep saying when
+		// it was actually reached.
+		rec.DecidedAt = cur.DecidedAt
+	}
+	if err := identity.SaveNegotiated(dataDir, server, rec); err != nil {
+		return err
+	}
+	*cur = rec
+	return nil
 }
 
 // clearToken clears the saved enrollment token after a successful exchange.

@@ -646,6 +646,12 @@ msgstr "另一个探针使用相同凭据建立了连接"
 msgid "The server does not support this agent version"
 msgstr "服务器不支持此探针版本"
 
+msgid "The server did not accept this agent wire format"
+msgstr "服务器不接受此探针的线路格式"
+
+msgid "The server refused a message as not allowed at that point"
+msgstr "服务器认为某条消息在会话的该阶段不被允许"
+
 msgid "This agent was deleted on the server"
 msgstr "此探针已在服务器上被删除"
 

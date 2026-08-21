@@ -21,6 +21,7 @@ import (
 	"github.com/nettact/agent/internal/conn"
 	"github.com/nettact/agent/internal/identity"
 	"github.com/nettact/agent/internal/wal"
+	"github.com/nettact/protocol"
 	protoenroll "github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/wire"
@@ -210,7 +211,7 @@ func TestEnrollFailureKeepsItsCause(t *testing.T) {
 		},
 	}}
 
-	_, err = enrollServer(context.Background(), env, rt)
+	_, _, err = enrollServer(context.Background(), env, rt, protocol.SchemaVersion)
 	if err == nil {
 		t.Fatal("enrollServer succeeded against a failing exchange")
 	}

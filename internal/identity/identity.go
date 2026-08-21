@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -98,10 +99,53 @@ type Credential struct {
 	PrevTokenFingerprint string `json:"prev_token_fingerprint,omitempty"`
 }
 
-// credentialFile is the on-disk shape of agent.json.
+// Negotiated records what wire schema one server was last observed to speak,
+// so a restart does not have to rediscover it by being refused again.
+//
+// It is a top-level map in agent.json, beside the credentials rather than
+// inside them, because it describes the SERVER's capability and not this
+// credential's properties. The difference is load-bearing exactly once, and it
+// is the moment that matters most: when a server revokes the agent, the
+// credential is deleted and the very next act is a fresh enrollment — which
+// needs this record to decide what schema to declare. Kept inside the
+// credential it would be gone precisely when it is needed.
+//
+// It is additive to the existing file format and the format number must NOT be
+// bumped for it: an unknown format number makes the whole file read as "not
+// enrolled anywhere", so a bump would silently discard every credential on a
+// downgrade. As an added key it is invisible to an older binary in both
+// directions — that binary ignores it on read and drops it on write, which
+// merely costs the next run one refused handshake to rediscover.
+type Negotiated struct {
+	// Schema is the wire schema last established with this server. Zero (or a
+	// missing entry) means nothing has been learned yet and the agent should
+	// prefer its native schema.
+	Schema int `json:"schema,omitempty"`
+
+	// AgentVersion is the agent build that reached that conclusion. A different
+	// build is reason enough to re-try the native schema: what this agent can
+	// speak, and what the server accepted from it, are both properties of a
+	// binary that has just been replaced.
+	AgentVersion string `json:"agent_version,omitempty"`
+
+	// DecidedAt is when the conclusion was reached, and LastProbe when the
+	// native schema was last attempted against this server. LastProbe is what
+	// bounds how long a downgraded agent can stay downgraded after the server
+	// has been upgraded: the retry cadence is measured from it, and it is
+	// therefore also written when a probe FAILS and the agent falls back.
+	DecidedAt time.Time `json:"decided_at"`
+	LastProbe time.Time `json:"last_probe"`
+}
+
+// credentialsFile is the on-disk shape of agent.json.
 type credentialsFile struct {
 	V       int                   `json:"v"`
 	Servers map[string]Credential `json:"servers"`
+	// Negotiated is keyed by the same configured server name as Servers. It is
+	// carried through every read-modify-write of this file so a credential save
+	// never drops it (and vice versa); see Negotiated for why the format number
+	// stays at 2.
+	Negotiated map[string]Negotiated `json:"negotiated,omitempty"`
 }
 
 // credMu serializes the whole load-modify-save of agent.json.
@@ -126,21 +170,68 @@ var credMu sync.Mutex
 func LoadCredentials(dataDir string) (map[string]Credential, error) {
 	credMu.Lock()
 	defer credMu.Unlock()
-	return loadLocked(dataDir)
-}
-
-// loadLocked is LoadCredentials without the lock. Caller holds credMu.
-func loadLocked(dataDir string) (map[string]Credential, error) {
-	b, err := os.ReadFile(filepath.Join(dataDir, credentialFile))
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]Credential{}, nil
-	}
+	f, err := loadLocked(dataDir)
 	if err != nil {
 		return nil, err
 	}
+	return f.Servers, nil
+}
+
+// LoadNegotiated returns every server's remembered wire-schema decision, keyed
+// by server name. An unreadable, malformed or wrong-format file yields an empty
+// map and no error, exactly as for the credentials it lives beside: a missing
+// record means "nothing learned", which is the same starting point a first run
+// has and costs at most one refused handshake to re-learn.
+func LoadNegotiated(dataDir string) (map[string]Negotiated, error) {
+	credMu.Lock()
+	defer credMu.Unlock()
+	f, err := loadLocked(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	return f.Negotiated, nil
+}
+
+// SaveNegotiated persists one server's wire-schema decision, leaving the other
+// servers' records — and every credential in the file — alone. Same
+// read-modify-write under credMu, published by the same atomic rename, for the
+// same reason: several runners write this file concurrently.
+func SaveNegotiated(dataDir, server string, rec Negotiated) error {
+	if server == "" {
+		return errors.New("identity: negotiation record needs a server name")
+	}
+	credMu.Lock()
+	defer credMu.Unlock()
+
+	f, err := loadLocked(dataDir)
+	if err != nil {
+		return err
+	}
+	if f.Negotiated == nil {
+		f.Negotiated = map[string]Negotiated{}
+	}
+	f.Negotiated[server] = rec
+	return saveAll(dataDir, f)
+}
+
+// loadLocked reads agent.json whole. Caller holds credMu.
+//
+// It returns the entire file rather than just the credentials so that every
+// mutation can write back the parts it does not care about: the credentials and
+// the negotiation records share one document, and a save that reconstructed the
+// document from only its own half would erase the other.
+func loadLocked(dataDir string) (credentialsFile, error) {
+	empty := credentialsFile{V: credentialFormat, Servers: map[string]Credential{}, Negotiated: map[string]Negotiated{}}
+	b, err := os.ReadFile(filepath.Join(dataDir, credentialFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return empty, nil
+	}
+	if err != nil {
+		return credentialsFile{}, err
+	}
 	var f credentialsFile
 	if err := json.Unmarshal(b, &f); err != nil || f.V != credentialFormat {
-		return map[string]Credential{}, nil
+		return empty, nil
 	}
 	out := make(map[string]Credential, len(f.Servers))
 	for name, c := range f.Servers {
@@ -149,7 +240,11 @@ func loadLocked(dataDir string) (map[string]Credential, error) {
 		}
 		out[name] = c
 	}
-	return out, nil
+	f.Servers = out
+	if f.Negotiated == nil {
+		f.Negotiated = map[string]Negotiated{}
+	}
+	return f, nil
 }
 
 // SaveCredential persists one server's credential, leaving the others alone.
@@ -166,12 +261,12 @@ func SaveCredential(dataDir, server string, c Credential) error {
 	credMu.Lock()
 	defer credMu.Unlock()
 
-	creds, err := loadLocked(dataDir)
+	f, err := loadLocked(dataDir)
 	if err != nil {
 		return err
 	}
-	creds[server] = c
-	return saveAll(dataDir, creds)
+	f.Servers[server] = c
+	return saveAll(dataDir, f)
 }
 
 // DeleteCredential removes one server's credential so the next run re-enrolls
@@ -186,15 +281,18 @@ func DeleteCredential(dataDir, server string) error {
 	credMu.Lock()
 	defer credMu.Unlock()
 
-	creds, err := loadLocked(dataDir)
+	f, err := loadLocked(dataDir)
 	if err != nil {
 		return err
 	}
-	if _, ok := creds[server]; !ok {
+	if _, ok := f.Servers[server]; !ok {
 		return nil
 	}
-	delete(creds, server)
-	return saveAll(dataDir, creds)
+	delete(f.Servers, server)
+	// The negotiation record deliberately stays: it describes what the server
+	// speaks, which a revocation says nothing about, and the re-enrollment that
+	// follows a deleted credential is the single place it is most needed.
+	return saveAll(dataDir, f)
 }
 
 // PruneCredentials deletes the credentials of every server not named in keep,
@@ -215,7 +313,7 @@ func PruneCredentials(dataDir string, keep []string) (int, error) {
 	credMu.Lock()
 	defer credMu.Unlock()
 
-	creds, err := loadLocked(dataDir)
+	f, err := loadLocked(dataDir)
 	if err != nil {
 		return 0, err
 	}
@@ -224,22 +322,40 @@ func PruneCredentials(dataDir string, keep []string) (int, error) {
 		wanted[name] = struct{}{}
 	}
 	removed := 0
-	for name := range creds {
+	for name := range f.Servers {
 		if _, ok := wanted[name]; !ok {
-			delete(creds, name)
+			delete(f.Servers, name)
 			removed++
 		}
 	}
-	if removed == 0 {
+	// A server that is no longer configured takes its negotiation record with
+	// it: unlike a revocation, this says the entry itself is gone, and leaving
+	// the record would apply a stale conclusion to whatever is later configured
+	// under the same name. Counted separately from removed, which reports
+	// credentials — the caller logs it as "identities forgotten".
+	prunedRecords := false
+	for name := range f.Negotiated {
+		if _, ok := wanted[name]; !ok {
+			delete(f.Negotiated, name)
+			prunedRecords = true
+		}
+	}
+	if removed == 0 && !prunedRecords {
 		return 0, nil
 	}
-	return removed, saveAll(dataDir, creds)
+	return removed, saveAll(dataDir, f)
 }
 
 // saveAll publishes agent.json via a temp file in the same directory, so the
 // rename is within one filesystem and therefore atomic. Caller holds credMu.
-func saveAll(dataDir string, creds map[string]Credential) error {
-	b, err := json.MarshalIndent(credentialsFile{V: credentialFormat, Servers: creds}, "", "  ")
+func saveAll(dataDir string, doc credentialsFile) error {
+	doc.V = credentialFormat
+	if len(doc.Negotiated) == 0 {
+		// Keep a file that has learned nothing byte-identical to what earlier
+		// builds wrote, so an install that never downgrades never grows the key.
+		doc.Negotiated = nil
+	}
+	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
