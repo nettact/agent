@@ -796,18 +796,30 @@ func (r *runner) session(ctx context.Context) error {
 // re-dials in the other wire schema, stops for a superseded credential, or
 // deletes a revoked one — and the agents that lose it are precisely those with
 // something queued to send.
+// Both goroutines can report, and only the reader parses close frames, so the
+// first error off the channel is not necessarily the one carrying the verdict.
+// When a peer close races the pinger, the pinger's write fails first with a
+// generic transport error and the reader's coded close lands behind it. Taking
+// only the first value hands the outcome to whichever goroutine noticed the
+// teardown sooner and drops the code — the exact failure this function exists
+// to prevent. Drain until the code shows up or the window closes; the bound on
+// the loop is how many senders the channel has.
 func (r *runner) preferCloseCause(err error, errCh <-chan error) error {
 	if err == nil || wire.CloseStatus(err) != -1 {
 		return err
 	}
-	select {
-	case readErr := <-errCh:
-		if wire.CloseStatus(readErr) != -1 {
-			return readErr
+	deadline := time.After(closeCauseGrace)
+	for range cap(errCh) {
+		select {
+		case reported := <-errCh:
+			if wire.CloseStatus(reported) != -1 {
+				return reported
+			}
+		case <-deadline:
+			// Nothing coded is coming. Ordinary: most session failures are not
+			// closes at all, and this bound is what keeps that case from waiting.
+			return err
 		}
-	case <-time.After(closeCauseGrace):
-		// The reader has nothing to say. Ordinary: most session failures are not
-		// closes at all, and this bound is what keeps that case from waiting.
 	}
 	return err
 }

@@ -116,6 +116,20 @@ func TestSchemaRefusalIsRecognisedAndNothingElseIs(t *testing.T) {
 			body:   `{"error":"unsupported schema_version 8"}`,
 			want:   false,
 		},
+		// The refusal reaches us through whatever sits in front of the server, and
+		// a proxy is free to re-badge the origin's 500 as its own 5xx. Pinning the
+		// exact code would turn that rewrite into a silent no-downgrade, so the
+		// body is what decides and the status only has to stay out of 4xx.
+		"a proxy re-badged the refusal as 502": {
+			status: http.StatusBadGateway,
+			body:   `{"error":"unsupported schema_version 8 (this build speaks 7; upgrade the other side)"}`,
+			want:   true,
+		},
+		"a refusal arriving as 503": {
+			status: http.StatusServiceUnavailable,
+			body:   `{"error":"unsupported schema_version 8"}`,
+			want:   true,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := &StatusError{
