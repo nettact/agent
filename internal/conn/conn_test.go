@@ -3,6 +3,7 @@ package conn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -53,13 +54,30 @@ func startServer(t *testing.T, script func(ctx context.Context, c *websocket.Con
 	return srv
 }
 
-// srvRead decodes one frame in the connection's negotiated format.
+// errFrameDecode marks the second of srvRead's two failure classes.
+//
+// srvRead can fail because the connection died before delivering anything, or
+// because bytes DID arrive and would not decode — a malformed payload, the
+// wrong codec for the negotiated subprotocol, or a frame carrying other than
+// exactly one payload. Callers that tolerate the first must not silently
+// tolerate the second: a peer that put undecodable bytes on the wire is a
+// protocol defect, while a connection that produced nothing is usually just a
+// teardown race. The bare error does not distinguish them, so this sentinel
+// wraps the decode half and callers separate the two with errors.Is.
+var errFrameDecode = errors.New("frame did not decode")
+
+// srvRead decodes one frame in the connection's negotiated format. A decode
+// failure is wrapped in errFrameDecode; a transport failure is returned bare.
 func srvRead(ctx context.Context, c *websocket.Conn) (wire.Frame, error) {
 	_, data, err := c.Read(ctx)
 	if err != nil {
 		return wire.Frame{}, err
 	}
-	return wire.UnmarshalFrame(data, wire.SubprotocolContentType(c.Subprotocol()))
+	f, err := wire.UnmarshalFrame(data, wire.SubprotocolContentType(c.Subprotocol()))
+	if err != nil {
+		return wire.Frame{}, fmt.Errorf("%w: %v", errFrameDecode, err)
+	}
+	return f, nil
 }
 
 // srvWrite encodes and sends one frame in the connection's negotiated format.

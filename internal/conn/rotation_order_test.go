@@ -3,6 +3,7 @@ package conn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,12 +68,18 @@ func walEpochIs(outbox *wal.Store, epoch uint64) bool {
 	return err == nil
 }
 
-// startBearerServer is startTokenServer plus a record of which bearer token
-// each accepted connection presented — the only way to see whether a session
-// that failed to persist a rotation came back on the old credential or on one
-// that exists nowhere but in memory.
-func startBearerServer(t *testing.T, tokens []string, seen *[]string, mu *sync.Mutex,
-	script func(ctx context.Context, c *websocket.Conn)) *httptest.Server {
+// startBearerServer is startTokenServer plus the bearer token the connection
+// presented, handed to the script — the only way to see whether a session that
+// failed to persist a rotation came back on the old credential or on one that
+// exists nowhere but in memory.
+//
+// The token's VALIDITY is still checked at upgrade time: an unknown token is a
+// failure however short-lived the connection is. Recording, though, is the
+// script's job, because only the script knows whether the connection ever
+// became a session — a connection that dies before its first frame is not one,
+// and must not take a slot in any of the test's books.
+func startBearerServer(t *testing.T, tokens []string,
+	script func(ctx context.Context, c *websocket.Conn, bearer string)) *httptest.Server {
 	t.Helper()
 	valid := make(map[string]bool, len(tokens))
 	for _, tk := range tokens {
@@ -85,9 +92,7 @@ func startBearerServer(t *testing.T, tokens []string, seen *[]string, mu *sync.M
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		mu.Lock()
-		*seen = append(*seen, strings.TrimPrefix(auth, "Bearer "))
-		mu.Unlock()
+		bearer := strings.TrimPrefix(auth, "Bearer ")
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			Subprotocols: []string{wire.SubprotocolProtobuf, wire.SubprotocolJSON},
 		})
@@ -96,7 +101,7 @@ func startBearerServer(t *testing.T, tokens []string, seen *[]string, mu *sync.M
 			return
 		}
 		defer c.CloseNow() //nolint:errcheck
-		script(r.Context(), c)
+		script(r.Context(), c, bearer)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -152,16 +157,80 @@ func TestRotationLostBeforeCredentialWriteKeepsOldIdentity(t *testing.T) {
 
 	var mu sync.Mutex
 	var bearers []string
+	var firstFrameErr error // guarded by mu; see the read-error branch below
 	var conns int32
+	// Both first-frame failures below are recorded rather than reported where
+	// they are found: httptest.Server.Close does not wait for hijacked
+	// connections, so a t call from a handler goroutine can outlive the test
+	// and panic.
+	recordFirstFrame := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstFrameErr == nil {
+			firstFrameErr = err
+		}
+	}
+	// Asserted from a cleanup rather than at the end of the test body: a bad
+	// first frame also stalls the agent, so a waitFor's t.Fatalf fires first
+	// and an end-of-body check would never run -- the exact case this records
+	// would be the case it could not report. Cleanups still run after a Fatalf.
+	//
+	// Best-effort by construction: cleanups are LIFO and this one is registered
+	// before the server, so it runs after srv.Close -- which does not wait for
+	// hijacked handlers either. A handler that records after this has run is
+	// missed, and the test then fails only through the waitFor timeout, exactly
+	// as it did before this recorder existed. It sharpens that failure when it
+	// wins the race; it does not replace it.
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstFrameErr != nil {
+			t.Error(firstFrameErr)
+		}
+	})
 	result := wire.EpochRotationResult{Status: wire.RotationOK, NewEpoch: 7, AgentToken: "rotated-token"}
-	srv := startBearerServer(t, []string{"test-token", "rotated-token"}, &bearers, &mu,
-		func(ctx context.Context, c *websocket.Conn) {
-			n := atomic.AddInt32(&conns, 1)
+	srv := startBearerServer(t, []string{"test-token", "rotated-token"},
+		func(ctx context.Context, c *websocket.Conn, bearer string) {
 			hello, err := srvRead(ctx, c)
-			if err != nil || hello.Hello == nil {
-				t.Errorf("hello: %+v err=%v", hello, err)
+			if err != nil {
+				// Two different failures arrive here and only one is benign.
+				//
+				// A bare transport error means the connection produced nothing:
+				// it never became a session, so it takes no session number and
+				// records no bearer. Blaming the agent for a connection it
+				// closed cleanly would be wrong, and counting it would shift
+				// every positional assertion below by one.
+				//
+				// errFrameDecode means bytes DID arrive and would not decode --
+				// a real protocol defect (wrong codec for the negotiated
+				// subprotocol, or a frame carrying other than one payload) that
+				// swallowing here would hide.
+				if errors.Is(err, errFrameDecode) {
+					recordFirstFrame(fmt.Errorf("a connection's first frame arrived but did not decode: %w", err))
+				}
 				return
 			}
+			if hello.Hello == nil {
+				// A frame that decoded but is not Hello: the agent speaking out
+				// of order, and unconditionally a failure.
+				//
+				// If this fires, do NOT quiet it by extending the silent return
+				// above. That branch is narrow on purpose — it covers a
+				// connection that produced no frame at all, which is a
+				// connection that never became a session. A frame that arrived
+				// and was not Hello is a protocol violation this test exists to
+				// catch.
+				recordFirstFrame(fmt.Errorf("a connection's first frame decoded but was not Hello "+
+					"(the agent must send Hello first): %+v", hello))
+				return
+			}
+			// Hello arrived: this is a session, and only now does it enter the
+			// books. The agent runs one session at a time, so the order here is
+			// the order the sessions happened in.
+			mu.Lock()
+			n := atomic.AddInt32(&conns, 1)
+			bearers = append(bearers, bearer)
+			mu.Unlock()
 			switch {
 			case n <= 2:
 				// Sessions 1 and 2 both drive the rotation: the first write fails,
@@ -242,20 +311,81 @@ func TestRotationPersistFailurePersistsNothing(t *testing.T) {
 
 	var mu sync.Mutex
 	var bearers []string
+	var firstFrameErr error // guarded by mu; see the read-error branch below
 	var requests, conns int32
+	// Both first-frame failures below are recorded rather than reported where
+	// they are found: httptest.Server.Close does not wait for hijacked
+	// connections, so a t call from a handler goroutine can outlive the test
+	// and panic.
+	recordFirstFrame := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstFrameErr == nil {
+			firstFrameErr = err
+		}
+	}
+	// Asserted from a cleanup rather than at the end of the test body: a bad
+	// first frame also stalls the agent, so a waitFor's t.Fatalf fires first
+	// and an end-of-body check would never run -- the exact case this records
+	// would be the case it could not report. Cleanups still run after a Fatalf.
+	//
+	// Best-effort by construction: cleanups are LIFO and this one is registered
+	// before the server, so it runs after srv.Close -- which does not wait for
+	// hijacked handlers either. A handler that records after this has run is
+	// missed, and the test then fails only through the waitFor timeout, exactly
+	// as it did before this recorder existed. It sharpens that failure when it
+	// wins the race; it does not replace it.
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstFrameErr != nil {
+			t.Error(firstFrameErr)
+		}
+	})
 	// Only "test-token" is accepted: a session on the never-written rotated
 	// token fails the upgrade and the harness reports it.
-	srv := startBearerServer(t, []string{"test-token"}, &bearers, &mu,
-		func(ctx context.Context, c *websocket.Conn) {
+	srv := startBearerServer(t, []string{"test-token"},
+		func(ctx context.Context, c *websocket.Conn, bearer string) {
 			if atomic.LoadInt32(&conns) >= 4 {
 				return // the test has what it needs; later connections are teardown noise
 			}
-			atomic.AddInt32(&conns, 1)
 			hello, err := srvRead(ctx, c)
-			if err != nil || hello.Hello == nil {
-				t.Errorf("hello: %+v err=%v", hello, err)
+			if err != nil {
+				// Two different failures arrive here and only one is benign.
+				//
+				// A bare transport error means the connection produced nothing:
+				// it never became a session, so it takes no session number and
+				// records no bearer. Blaming the agent for a connection it
+				// closed cleanly would be wrong, and counting it would shift
+				// every positional assertion below by one.
+				//
+				// errFrameDecode means bytes DID arrive and would not decode --
+				// a real protocol defect (wrong codec for the negotiated
+				// subprotocol, or a frame carrying other than one payload) that
+				// swallowing here would hide.
+				if errors.Is(err, errFrameDecode) {
+					recordFirstFrame(fmt.Errorf("a connection's first frame arrived but did not decode: %w", err))
+				}
 				return
 			}
+			if hello.Hello == nil {
+				// A frame that decoded but is not Hello: the agent speaking out
+				// of order, and unconditionally a failure.
+				//
+				// If this fires, do NOT quiet it by extending the silent return
+				// above. That branch is narrow on purpose — it covers a
+				// connection that produced no frame at all, which is a
+				// connection that never became a session. A frame that arrived
+				// and was not Hello is a protocol violation this test exists to
+				// catch.
+				recordFirstFrame(fmt.Errorf("a connection's first frame decoded but was not Hello "+
+					"(the agent must send Hello first): %+v", hello))
+				return
+			}
+			mu.Lock()
+			atomic.AddInt32(&conns, 1)
+			bearers = append(bearers, bearer)
+			mu.Unlock()
 			if hello.Hello.EnrollmentEpoch != 5 {
 				t.Errorf("Hello epoch = %d, want 5 — an unpersistable rotation must not move the identity", hello.Hello.EnrollmentEpoch)
 				return
