@@ -128,6 +128,67 @@ func TestEnrollmentRetriesOnceInTheOtherSchema(t *testing.T) {
 	}
 }
 
+// TestEnrollmentRetriesOnceOnARebadgedRefusal is the flow-level counterpart of
+// the predicate's "a proxy re-badged the refusal as 502" row in
+// internal/enroll. Whatever sits in front of the server is free to rewrite the
+// origin's 500 as its own 5xx, so a real refusal can arrive under a status the
+// server never wrote.
+//
+// The predicate row proves SchemaRefused says yes to that answer; it cannot
+// prove the driver acts on the yes. The retry could in principle be gated a
+// second time on the exact status between the predicate and the downgrade, and
+// only a run through enrollServer shows the whole move happening: one attempt
+// in the native schema, exactly one more in the other, a credential issued at
+// the end — with nothing about the changed status surfacing as an error.
+func TestEnrollmentRetriesOnceOnARebadgedRefusal(t *testing.T) {
+	env := enrollEnv(t)
+	var mu sync.Mutex
+	var declared []int
+	rt := &serverRuntime{cfg: ServerConfig{
+		Name:        "work",
+		URL:         "https://example.invalid",
+		TokenSource: func(context.Context) (string, error) { return "one-time", nil },
+		Enroller: func(_ context.Context, req protoenroll.EnrollRequest) (protoenroll.EnrollResponse, error) {
+			mu.Lock()
+			declared = append(declared, req.SchemaVersion)
+			mu.Unlock()
+			// The refusal, re-badged: the measured marker body arriving as the
+			// intermediary's own 502 instead of the origin's 500. The body, not the
+			// status, is what names the cause, which is why the schema numbers in it
+			// are pinned verbatim and the status is not the origin's.
+			if req.SchemaVersion == protocol.SchemaVersion {
+				return protoenroll.EnrollResponse{}, &enroll.StatusError{
+					StatusCode: http.StatusBadGateway,
+					Status:     "502 Bad Gateway",
+					Body:       `{"error":"unsupported schema_version 8 (this build speaks 7; upgrade the other side)"}`,
+				}
+			}
+			return protoenroll.EnrollResponse{AgentID: "agent-1", SiteID: "site-1", AgentToken: "issued"}, nil
+		},
+	}}
+
+	cred, used, err := enrollServer(context.Background(), env, rt, protocol.SchemaVersion)
+	if err != nil {
+		t.Fatalf("enrollServer: %v", err)
+	}
+	if cred.AgentToken != "issued" {
+		t.Fatalf("credential = %+v; want the issued one", cred)
+	}
+	if used != enroll.PreviousSchema {
+		t.Fatalf("reported schema = %d, want %d — the caller has to learn which one worked", used, enroll.PreviousSchema)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := declared; len(got) != 2 || got[0] != protocol.SchemaVersion || got[1] != enroll.PreviousSchema {
+		t.Fatalf("schemas declared = %v; want the native one then exactly one retry in %d", got, enroll.PreviousSchema)
+	}
+	// The status carried no epoch and the re-badging must not have invented one;
+	// zero is what makes the session that follows barrier-free.
+	if cred.EnrollmentEpoch != 0 {
+		t.Fatalf("credential epoch = %d, want 0", cred.EnrollmentEpoch)
+	}
+}
+
 // The search is symmetric. An agent that remembers a downgrade and meets a
 // server that has since been upgraded has the same problem in the other
 // direction, and the same single retry solves it.
