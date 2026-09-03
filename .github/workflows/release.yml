@@ -16,9 +16,9 @@
 # moves. To reproduce a published release, pass its recorded commit as the
 # protocol_ref dispatch input below.
 #
-# Required secret: CI_SUBMODULE_SSH_KEY (org-level recommended) — read access to
-# nettact/protocol and nettact/docs. GHCR auth uses GITHUB_TOKEN; cosign is
-# keyless OIDC.
+# Required secrets: CI_SUBMODULE_SSH_KEY (org-level recommended) — read access to
+# nettact/protocol; DOCS_READ_TOKEN — read access to nettact/docs. GHCR auth
+# uses GITHUB_TOKEN; cosign is keyless OIDC.
 
 # Public downloads are served by the d.nettact.org Cloudflare Worker directly
 # from this private GitHub Release. No release asset is copied to R2.
@@ -150,7 +150,7 @@ jobs:
         with:
           repository: nettact/docs
           path: docs
-          ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
+          token: ${{ secrets.DOCS_READ_TOKEN }}
 
       - uses: actions/setup-go@v5
         with:

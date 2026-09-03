@@ -6,7 +6,8 @@
 #
 # Requires CI_SUBMODULE_SSH_KEY (read access to nettact/protocol), like the
 # release workflow: the agent does not compile without protocol in the
-# workspace.
+# workspace. The docs checkout uses DOCS_READ_TOKEN (read access to
+# nettact/docs) instead.
 
 name: CI
 
@@ -45,7 +46,7 @@ jobs:
         with:
           repository: nettact/docs
           path: docs
-          ssh-key: ${{ secrets.CI_SUBMODULE_SSH_KEY }}
+          token: ${{ secrets.DOCS_READ_TOKEN }}
 
       - uses: actions/setup-go@v5
         with:
