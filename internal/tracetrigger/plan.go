@@ -185,8 +185,15 @@ func derivePlan(evd evidence, views permission.Set, granted, supported permissio
 	if !ok {
 		return plan{}, false
 	}
+	return gatePlan(p, views, granted, supported), true
+}
+
+// gatePlan applies this server's traceroute permissions to a derived plan: the
+// TCP-to-ICMP downgrade, or a terminal denial. A plan that is already terminal
+// passes through untouched.
+func gatePlan(p plan, views permission.Set, granted, supported permission.Set) plan {
 	if p.terminal != "" {
-		return p, true
+		return p
 	}
 
 	// An in-tunnel plan is gated on GRANTED, not effective. Its probes never
@@ -198,7 +205,7 @@ func derivePlan(evd evidence, views permission.Set, granted, supported permissio
 		if !granted.Has(permission.DiagnosticTracerouteICMP) {
 			p.terminal, p.reason = telemetry.TraceStatusUnsupported, reasonPermissionDenied
 		}
-		return p, true
+		return p
 	}
 	switch {
 	case p.mode == pcfg.TraceModeTCP && !views.Has(permission.DiagnosticTracerouteTCP):
@@ -213,7 +220,7 @@ func derivePlan(evd evidence, views permission.Set, granted, supported permissio
 	case p.mode == pcfg.TraceModeICMP && !views.Has(permission.DiagnosticTracerouteICMP):
 		p.terminal, p.reason = telemetry.TraceStatusUnsupported, reasonPermissionDenied
 	}
-	return p, true
+	return p
 }
 
 // planFor picks the diagnosis subject, destination and mode from the round's

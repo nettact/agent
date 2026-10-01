@@ -1018,6 +1018,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				// this callback is on the session goroutine and must not block it.
 				if up {
 					rt.scene.SessionUp()
+					rt.trigger.SessionUp()
 				}
 
 				kind := EventDisconnected
@@ -1055,7 +1056,11 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				// well enough to be refused proves the network works, and the fault
 				// is in the credential.
 				if reason != conn.ReasonAuth {
-					rt.scene.SessionLost(string(reason), time.Now())
+					lostAt := time.Now()
+					rt.scene.SessionLost(string(reason), lostAt)
+					// The same edge traces toward this server, when its grant allows
+					// traceroute; the report waits in the outbox like the scene does.
+					rt.trigger.SessionLost(rt.cfg.URL, lostAt)
 				}
 				env.status.set(rt.cfg.Name, func(s *serverStatus) {
 					s.State = statusWaitingRetry
@@ -1072,6 +1077,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 		// set would hand it to the first failed dial of the NEXT enrollment, which
 		// would then describe a session that never existed.
 		rt.scene.Disarm()
+		rt.trigger.Disarm()
 
 		if ctx.Err() != nil {
 			return nil

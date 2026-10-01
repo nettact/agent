@@ -211,6 +211,12 @@ type Tracker struct {
 	cooldown map[string]time.Time        // plan cohort key → when a trace last finished
 	inflight map[string]struct{}         // plan cohort key → a trace is running now
 
+	// The server-disconnect arm (see server.go): sessionUp is set by an
+	// established session and spent by the first loss; armedOnce records that
+	// the process-start arm is gone.
+	sessionUp bool
+	armedOnce bool
+
 	ctx  context.Context
 	wg   sync.WaitGroup
 	stop bool
