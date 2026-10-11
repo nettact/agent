@@ -201,9 +201,11 @@ type Limits struct {
 	// question: how long this machine may spend answering "what does it look like
 	// right now" before answering partially instead.
 	SnapshotTimeout time.Duration
-	// MaxTraceConcurrency bounds simultaneously executing incident traceroutes
-	// (distinct report ids) on this Agent; diagnostics use their own work channel,
-	// never the probe scheduler.
+	// MaxTraceConcurrency bounds simultaneously executing traceroutes (distinct
+	// report ids) on this Agent — incident diagnoses and route-monitor sweeps
+	// alike. Route monitors may hold at most one slot fewer than this, so a
+	// diagnosis always has room (see traceroute.Limiter); neither draws on the
+	// probe budget.
 	MaxTraceConcurrency int
 }
 
@@ -987,7 +989,7 @@ func runServer(ctx context.Context, env runEnv, rt *serverRuntime, cred identity
 				Platform:        env.platformID,
 				AgentVersion:    Version,
 				Permissions:     rt.report,
-				Capabilities:    []string{wire.CapSequenceFloorV1},
+				Capabilities:    helloCapabilities(),
 				EnrollmentEpoch: cred.EnrollmentEpoch,
 			},
 			OnAuthRejected: func() bool {
@@ -1256,6 +1258,18 @@ func preferredSchema(neg identity.Negotiated) int {
 // of a server that may since have been upgraded.
 const negotiationRefresh = time.Hour
 
+// helloCapabilities is the capability list every session's Hello declares.
+//
+// The list is the same for every server and every grant. A capability says
+// which protocol state machines and target kinds this build understands, not
+// what it is allowed to do: a server that has not granted probe.traceroute still
+// needs to know this agent can run a route monitor, so it pushes the target and
+// the agent reports it permission_blocked — the actionable answer — instead of
+// the server withholding it as if the agent needed an upgrade.
+func helloCapabilities() []string {
+	return []string{wire.CapSequenceFloorV1, wire.CapProbeTraceV1}
+}
+
 // recordNegotiated persists what a server was observed to accept and updates
 // the caller's in-memory copy. Called only from a server's own runner
 // goroutine, which is the only writer of both.
@@ -1378,6 +1392,13 @@ func probeMachine(ctx context.Context, cfg Config, p platform.Platform) machineC
 	}
 	if tcpTraceCap {
 		caps.base.Add(permission.DiagnosticTracerouteTCP)
+	}
+	// Route monitors run on the same engine, in whichever mode each monitor
+	// names, so the permission is supported when either mode is. A monitor asking
+	// for the mode this machine lacks is answered per sweep (unsupported, with the
+	// engine's reason) rather than by hiding the whole capability.
+	if icmpTraceCap || tcpTraceCap {
+		caps.base.Add(permission.ProbeTraceroute)
 	}
 
 	anyGranted := permission.Set{}

@@ -141,7 +141,7 @@ host.network.io.read host.temperature.read
 diagnostic.traceroute.icmp diagnostic.traceroute.tcp"
 
 PERM_FULL="probe.icmp probe.dns probe.http probe.http.extended probe.tcp probe.nat
-network.gateway.probe
+network.gateway.probe probe.traceroute
 network.interface.status.read network.interface.address.read
 network.wifi.status.read network.wifi.ssid.read
 network.neighbor.read network.neighbor.hostname.read

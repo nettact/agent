@@ -51,6 +51,11 @@ type Result struct {
 	InterfaceSnapshot *telemetry.InterfaceSnapshot
 	// Blocked lists monitors refused by target-access policy this round.
 	Blocked []BlockedProbe
+	// TraceResults are finished scheduled traceroutes (route monitors only). A
+	// sweep is a report in its own right rather than a set of samples, so it
+	// rides beside the metrics instead of being flattened into them; the runtime
+	// files each one in the outbox the same way a diagnosis trace is filed.
+	TraceResults []telemetry.TraceResult
 }
 
 // Collector is a single monitoring probe.
@@ -255,6 +260,24 @@ func (s *schedState) holds(key string, token int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.inflight[key] == token
+}
+
+// retryAt pulls a claimed probe's next run forward to at, when that is sooner
+// than the interval-derived due time claim already recorded. It is for a run
+// that could not start for a reason unrelated to its target — a route monitor
+// whose sweep found the machine's trace budget busy — so the target is retried
+// shortly instead of losing a whole interval (ten minutes, for a default route
+// monitor) to someone else's work. It never pushes a due time later, and a run
+// that no longer holds its claim changes nothing: its generation is gone.
+func (s *schedState) retryAt(sp scheduledProbe, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight[sp.Key] != sp.token {
+		return
+	}
+	if nd, ok := s.nextDue[sp.Key]; ok && at.Before(nd) {
+		s.nextDue[sp.Key] = at
+	}
 }
 
 // dueLocked selects the probes due at now and advances their next-due times.

@@ -35,6 +35,7 @@ var PERMISSIONS = [
 	{ id: 'probe.tcp',                         def: true,  label: 'TCP probe' },
 	{ id: 'probe.nat',                         def: true,  label: 'NAT probe' },
 	{ id: 'network.gateway.probe',             def: true,  label: 'Gateway probe' },
+	{ id: 'probe.traceroute',                  def: false, label: 'Route monitoring' },
 	{ id: 'network.interface.status.read',     def: true,  label: 'Interface status read' },
 	{ id: 'network.interface.address.read',    def: true,  label: 'Interface address read', requires: 'network.interface.status.read' },
 	{ id: 'network.wifi.status.read',          def: true,  label: 'Wi-Fi status read', requires: 'network.interface.status.read' },

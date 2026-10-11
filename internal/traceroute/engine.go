@@ -87,6 +87,19 @@ const (
 	reasonEgressNotAvailable       = "egress_not_available"
 )
 
+// Exported aliases for the reason codes a caller outside this package has to
+// branch on. A scheduled trace treats them differently from a diagnosis: a
+// policy refusal is surfaced as a monitor block rather than as a route sample,
+// and the three "the path itself said no" outcomes still count as a measured
+// round. The values are the stable wire codes above; aliasing keeps one
+// spelling.
+const (
+	ReasonPolicyDenied = reasonPolicyDenied
+	ReasonDNSError     = reasonDNSError
+	ReasonNoIPv4       = reasonNoIPv4
+	ReasonLocalNoRoute = reasonLocalNoRoute
+)
+
 // errUnsupported is the sentinel a non-implementing platform probe returns; the
 // engine maps it to an unsupported terminal status.
 var errUnsupported = errors.New("traceroute: mode not supported on this platform")
@@ -110,7 +123,7 @@ type Engine struct {
 	// request then fails closed with egress_not_available.
 	egress EgressResolver
 
-	sem  chan struct{} // machine-wide concurrency limiter, shared across servers
+	lim  *Limiter // machine-wide concurrency limiter, shared across servers
 	caps capabilities
 }
 
@@ -122,22 +135,78 @@ type Engine struct {
 // adjudication has to be — but what the limit protects is not: raw sockets,
 // probe threads and the burst of packets they emit are the machine's, and they
 // do not become more plentiful because a second server asked for a trace.
-type Limiter chan struct{}
+//
+// # Two kinds of trace, one budget, one priority
+//
+// Two callers draw from it. A diagnosis trace (Run) is evidence about a fault
+// that is happening now: it waits for a slot, bounded by its own window. A
+// scheduled trace (TryRun) is a route sample that will be taken again next
+// interval: it never waits, and it may hold at most the background share — one
+// slot fewer than the whole budget — so however many route monitors exist, a
+// diagnosis always finds at least one slot that no scheduled trace can occupy.
+//
+// Why a reserved share and not a priority queue: the only priority that matters
+// is "diagnosis is never starved by sampling", and a cap on the sampler states
+// it structurally with two channels. Diagnosis also wins every contended slot,
+// not just the reserved one: a released slot is handed directly to a blocked
+// sender (Go's buffered-channel receive moves the first waiting sender's value
+// into the freed buffer cell before returning), so a scheduled trace's
+// non-blocking try can never overtake a diagnosis that was already waiting.
+//
+// A budget of one has no slot to spare. Rather than silently disabling route
+// monitoring there, the background share is floored at one: on such a machine a
+// diagnosis may wait for at most one scheduled sweep, which is bounded by that
+// sweep's own deadline.
+type Limiter struct {
+	slots      chan struct{} // the whole budget, shared by both kinds
+	background chan struct{} // the share scheduled traces may hold at once
+}
 
 // NewLimiter builds the machine's trace-concurrency budget. concurrency <= 0
 // selects DefaultConcurrency.
-func NewLimiter(concurrency int) Limiter {
+func NewLimiter(concurrency int) *Limiter {
 	if concurrency <= 0 {
 		concurrency = DefaultConcurrency
 	}
-	return make(Limiter, concurrency)
+	share := concurrency - 1
+	if share < 1 {
+		share = 1
+	}
+	return &Limiter{slots: make(chan struct{}, concurrency), background: make(chan struct{}, share)}
+}
+
+// Cap is the whole budget; BackgroundCap the share scheduled traces may hold.
+func (l *Limiter) Cap() int           { return cap(l.slots) }
+func (l *Limiter) BackgroundCap() int { return cap(l.background) }
+
+// tryAcquireBackground takes a slot for a scheduled trace without waiting: first
+// a background token (the reserved-share cap), then a real slot. Both or
+// neither — a token whose slot was unavailable is handed straight back.
+func (l *Limiter) tryAcquireBackground() bool {
+	select {
+	case l.background <- struct{}{}:
+	default:
+		return false
+	}
+	select {
+	case l.slots <- struct{}{}:
+		return true
+	default:
+		<-l.background
+		return false
+	}
+}
+
+func (l *Limiter) releaseBackground() {
+	<-l.slots
+	<-l.background
 }
 
 // New builds an Engine for one server. The permission views are that server's
 // immutable sets; supported must already reflect this build+runtime's real
 // ICMP/TCP capability (see Supported). lim is the machine-wide budget — pass the
 // same Limiter to every engine.
-func New(guard *netguard.Guard, effective, granted, supported permission.Set, lim Limiter, egress EgressResolver) *Engine {
+func New(guard *netguard.Guard, effective, granted, supported permission.Set, lim *Limiter, egress EgressResolver) *Engine {
 	if lim == nil {
 		lim = NewLimiter(0)
 	}
@@ -147,7 +216,7 @@ func New(guard *netguard.Guard, effective, granted, supported permission.Set, li
 		granted:   granted,
 		supported: supported,
 		egress:    egress,
-		sem:       lim,
+		lim:       lim,
 		caps:      detectCapabilities(),
 	}
 }
@@ -221,6 +290,22 @@ type Request struct {
 // not handed back as extra window — and the destination is resolved once through
 // the guard, with the actual destination IP reported.
 func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) telemetry.TraceResult {
+	res, _ := e.run(ctx, req, decidedAt, false)
+	return res
+}
+
+// TryRun is Run for a scheduled trace: identical adjudication, resolution and
+// sweep, but admission never waits and draws only on the limiter's background
+// share (see Limiter). ok is false when no slot was free — nothing was probed
+// and the result must be discarded, not reported: a busy budget is a fact about
+// this machine's other work, not about the path, and the caller simply tries
+// again later. Every other outcome, including the refusals that send no probe
+// (permission, capability, policy, resolution), is final and ok is true.
+func (e *Engine) TryRun(ctx context.Context, req Request, decidedAt time.Time) (telemetry.TraceResult, bool) {
+	return e.run(ctx, req, decidedAt, true)
+}
+
+func (e *Engine) run(ctx context.Context, req Request, decidedAt time.Time, background bool) (telemetry.TraceResult, bool) {
 	res := telemetry.TraceResult{
 		ReportID: req.ReportID,
 		Mode:     req.Mode,
@@ -254,19 +339,19 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 	// Validate + clamp locally. Invalid mode/port/destination send no probes.
 	mode := req.Mode
 	if mode != pcfg.TraceModeICMP && mode != pcfg.TraceModeTCP {
-		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode)
+		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode), true
 	}
 	if egress && mode != pcfg.TraceModeICMP {
 		// In-tunnel probing is ICMP echo only; the planner never chooses otherwise,
 		// so this is defense against a malformed plan.
-		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode)
+		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidMode), true
 	}
 	if req.DestHost == "" {
-		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidDestination)
+		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidDestination), true
 	}
 	port := req.Port
 	if mode == pcfg.TraceModeTCP && (port <= 0 || port > 65535) {
-		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidPort)
+		return terminal(res, telemetry.TraceStatusFailed, reasonInvalidPort), true
 	}
 	maxHops := clampInt(req.MaxHops, defaultMaxHops, 1, maxHopsCeiling)
 	attempts := clampInt(req.AttemptsPerHop, defaultAttempts, 1, maxAttempts)
@@ -285,10 +370,10 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 	}
 	if egress {
 		if !e.granted.Has(permID) {
-			return terminal(res, telemetry.TraceStatusUnsupported, reasonPermissionDenied)
+			return terminal(res, telemetry.TraceStatusUnsupported, reasonPermissionDenied), true
 		}
 	} else if !e.effective.Has(permID) {
-		return terminal(res, telemetry.TraceStatusUnsupported, e.capabilityReason(permID, mode))
+		return terminal(res, telemetry.TraceStatusUnsupported, e.capabilityReason(permID, mode)), true
 	}
 
 	// The whole sweep — queueing included — lives inside one window anchored at
@@ -297,10 +382,10 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 	// would describe a later network.
 	deadline := decidedAt.Add(totalTimeout)
 	if !time.Now().Before(deadline) {
-		return terminal(res, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded)
+		return terminal(res, telemetry.TraceStatusTimedOut, reasonDeadlineExceeded), true
 	}
 	if ctx.Err() != nil {
-		return terminal(res, telemetry.TraceStatusCanceled, reasonCanceled)
+		return terminal(res, telemetry.TraceStatusCanceled, reasonCanceled), true
 	}
 
 	// Resolve the pinned egress before the destination: the egress reference is
@@ -313,9 +398,9 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 		p, err := e.resolveEgress(ctx, req.EgressProxyID, req.EgressConfigSerial)
 		if err != nil {
 			if errors.Is(err, ErrEgressGenerationMismatch) {
-				return terminal(res, telemetry.TraceStatusFailed, reasonEgressGenerationMismatch)
+				return terminal(res, telemetry.TraceStatusFailed, reasonEgressGenerationMismatch), true
 			}
-			return terminal(res, telemetry.TraceStatusFailed, reasonEgressNotAvailable)
+			return terminal(res, telemetry.TraceStatusFailed, reasonEgressNotAvailable), true
 		}
 		egressProbe = p
 	}
@@ -326,7 +411,7 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 	// local for the tunnel transport).
 	dest, reason := e.resolveDestination(ctx, req.DestHost)
 	if reason != "" {
-		return terminal(res, telemetry.TraceStatusFailed, reason)
+		return terminal(res, telemetry.TraceStatusFailed, reason), true
 	}
 	res.DestinationIP = dest.String()
 	res.StartedAt = time.Now().UTC()
@@ -334,11 +419,21 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 	// Acquire a per-machine slot; distinct reports run concurrently up to the
 	// limit. A waiter that loses its whole budget before a slot frees returns a
 	// clean terminal state rather than blocking forever.
-	if st, rsn, ok := e.acquire(ctx, deadline); !ok {
-		res.CompletedAt = time.Now().UTC()
-		return terminal(res, st, rsn)
+	//
+	// A scheduled trace does not wait at all: no free background slot means it
+	// is deferred by its caller, and nothing about it is reported.
+	if background {
+		if !e.lim.tryAcquireBackground() {
+			return telemetry.TraceResult{}, false
+		}
+		defer e.lim.releaseBackground()
+	} else {
+		if st, rsn, ok := e.acquire(ctx, deadline); !ok {
+			res.CompletedAt = time.Now().UTC()
+			return terminal(res, st, rsn), true
+		}
+		defer func() { <-e.lim.slots }()
 	}
-	defer func() { <-e.sem }()
 
 	runCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -360,7 +455,7 @@ func (e *Engine) Run(ctx context.Context, req Request, decidedAt time.Time) tele
 
 	res.Status, res.Reason = out.status, out.reason
 	res.CompletedAt = time.Now().UTC()
-	return res
+	return res, true
 }
 
 // walkResult is the outcome of the hop loop before status finalization.
@@ -477,7 +572,7 @@ func (e *Engine) acquire(ctx context.Context, deadline time.Time) (status, reaso
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
-	case e.sem <- struct{}{}:
+	case e.lim.slots <- struct{}{}:
 		return "", "", true
 	case <-ctx.Done():
 		return telemetry.TraceStatusCanceled, reasonCanceled, false

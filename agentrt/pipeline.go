@@ -105,7 +105,7 @@ func buildServer(
 	p platform.Platform,
 	limits Limits,
 	drain time.Duration,
-	traceLimit traceroute.Limiter,
+	traceLimit *traceroute.Limiter,
 	probeGate *collector.ProbeGate,
 	hostname string,
 	clock conn.ClockAnchor,
@@ -156,6 +156,15 @@ func buildServer(
 	}
 	if v.effective.Has(permission.ProbeNAT) {
 		addProbe(collector.NewNATCollector(v.guard, rt.proxies, probeGate))
+	}
+	// Route monitors (kind "trace") share the machine-wide traceroute limiter
+	// with incident diagnosis rather than the probe gate: a sweep can hold its
+	// slot for minutes, and the limiter is what reserves room for diagnosis (see
+	// traceroute.Limiter). effective already folds in the platform capability —
+	// probe.traceroute is supported only where some traceroute mode can run — so
+	// a machine with neither mode never builds this.
+	if v.effective.Has(permission.ProbeTraceroute) {
+		addProbe(collector.NewTraceCollector(v.guard, v.granted, v.supported, traceLimit))
 	}
 
 	// Tiered collectors: interface (status), ARP (neighbor), host metrics — each
@@ -279,6 +288,16 @@ func (rt *serverRuntime) appendScene(scene telemetry.SceneReport) {
 func (rt *serverRuntime) sink(res collector.Result) {
 	for _, b := range res.Blocked {
 		rt.tracker.RuntimeBlocked(b.MonitorID, b.ConfigSerial, b.Matched, b.Reason)
+	}
+	// A route monitor's sweep is filed exactly as a diagnosis report is — its own
+	// outbox group, through the one path every trace takes — so the two kinds
+	// differ only in what the report itself says (trigger, monitor id).
+	//
+	// The report alone does not mark the monitor runtime-OK; its metrics do, in
+	// the loop below. A sweep the engine refused for a missing mode carries a
+	// report but no metrics, and must not clear anything on its way through.
+	for _, tr := range res.TraceResults {
+		rt.appendTrace(tr)
 	}
 	for _, m := range res.Metrics {
 		if m.MonitorID != "" {

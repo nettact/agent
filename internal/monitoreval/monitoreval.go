@@ -147,6 +147,11 @@ func (t *Tracker) stampSchedule(entry *wire.MonitorStatusEntry, tgt config.Probe
 	if t.minProbeInterval > 0 && iv < t.minProbeInterval {
 		iv = t.minProbeInterval
 	}
+	// A route monitor has a floor of its own that the collector enforces whatever
+	// it is pushed; report the cadence it will actually run at.
+	if tgt.Kind == "trace" && iv < config.MinTraceInterval {
+		iv = config.MinTraceInterval
+	}
 	entry.EffectiveIntervalSeconds = int(iv / time.Second)
 	entry.CycleDeadlineMs = int(config.CycleDeadline(tgt.Kind, tgt.Params) / time.Millisecond)
 }
@@ -345,6 +350,15 @@ func (t *Tracker) evaluateProxy(tgt config.ProbeTarget) (wire.MonitorStatusEntry
 			Reason:    reason,
 		}, true
 	}
+	// A route monitor never runs over a proxy, whatever the proxy is. Its whole
+	// output is the hop-by-hop path from this host, and no egress transport here
+	// can carry that walk for a route history: a relay proxy hides every hop
+	// behind it, and an in-tunnel sweep describes a different path than the one
+	// the history is about. Checked before presence so the reason is stable — a
+	// pinned trace is unsupported as configured, not merely waiting for its proxy.
+	if tgt.Kind == "trace" {
+		return blocked(ReasonProxyUnsupported)
+	}
 	// No proxy manager at all (a build or test without proxy support) still fails
 	// closed: a pinned monitor must not quietly become a direct one.
 	if t.proxies == nil {
@@ -382,7 +396,7 @@ func staticHost(tgt config.ProbeTarget) string {
 			return u.Hostname()
 		}
 		return ""
-	case "icmp", "tcp":
+	case "icmp", "tcp", "trace":
 		return hostOnly(tgt.Target)
 	case "nat":
 		return hostOnly(tgt.Target)

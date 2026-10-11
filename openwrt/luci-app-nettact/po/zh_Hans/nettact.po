@@ -182,6 +182,9 @@ msgstr "NAT 探测"
 msgid "Gateway probe"
 msgstr "网关探测"
 
+msgid "Route monitoring"
+msgstr "线路监控"
+
 msgid "Interface status read"
 msgstr "网卡状态读取"
 

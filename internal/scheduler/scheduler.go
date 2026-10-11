@@ -159,7 +159,7 @@ func (s *Scheduler) selfLoop(ctx context.Context) {
 // otherwise write to durable storage on every tick, forever.
 func empty(res collector.Result) bool {
 	return len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Inventory) == 0 &&
-		len(res.Blocked) == 0 && res.InterfaceSnapshot == nil
+		len(res.Blocked) == 0 && res.InterfaceSnapshot == nil && len(res.TraceResults) == 0
 }
 
 func (s *Scheduler) tierLoop(ctx context.Context, cols []collector.Collector, isBase bool) {

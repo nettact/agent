@@ -1,6 +1,7 @@
 package agentrt
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/nettact/agent/internal/wal"
 	"github.com/nettact/agent/probepolicy"
 	"github.com/nettact/protocol/permission"
+	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/protocol/wire"
 )
 
 // probeViews grants every probe kind so buildServer constructs all six probe
@@ -105,3 +108,101 @@ func TestProbeGateFromLimits(t *testing.T) {
 
 // report is an empty permission report; buildServer only stores it.
 func report() permission.PermissionReport { return permission.PermissionReport{} }
+
+// A route-monitor collector exists only for a server whose effective set holds
+// probe.traceroute — a denied collector is never built, not built and idled.
+// It also stays out of the probe budget: it is paced by the trace limiter.
+func TestTraceCollectorGatedOnTraceroutePermission(t *testing.T) {
+	outbox, err := wal.Open(t.TempDir(), []string{"alpha"}, wal.Options{})
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	limits := DefaultLimits()
+	traceLimit := traceroute.NewLimiter(limits.MaxTraceConcurrency)
+	gate := collector.NewProbeGate(16)
+
+	count := func(v permViews) int {
+		rt := buildServer(ServerConfig{Name: "alpha"}, v, report(), outbox, platform.New(),
+			limits, 30*time.Second, traceLimit, gate, "test-host", nil)
+		n := 0
+		for _, c := range rt.configurables {
+			if tc, ok := c.(*collector.TraceCollector); ok {
+				n++
+				if _, budgeted := any(tc).(budgeted); budgeted {
+					t.Fatal("the trace collector advertises a probe budget it never draws from")
+				}
+			}
+		}
+		return n
+	}
+	if n := count(probeViews()); n != 0 {
+		t.Fatalf("built %d trace collectors without probe.traceroute, want 0", n)
+	}
+	v := probeViews()
+	with := v.effective.Clone()
+	with.Add(permission.ProbeTraceroute)
+	v.granted, v.supported, v.effective = with, with, with
+	if n := count(v); n != 1 {
+		t.Fatalf("built %d trace collectors with probe.traceroute, want 1", n)
+	}
+}
+
+// Every session declares route-monitor support, independent of grants: the
+// capability says what this build understands, and the permission check is
+// what reports a monitor blocked.
+func TestHelloDeclaresTraceCapability(t *testing.T) {
+	caps := helloCapabilities()
+	for _, want := range []string{wire.CapSequenceFloorV1, wire.CapProbeTraceV1} {
+		if !wire.HasCapability(caps, want) {
+			t.Fatalf("Hello capabilities %v lack %s", caps, want)
+		}
+	}
+}
+
+// probe.traceroute is supported exactly when the engine can run either
+// traceroute mode here; a monitor naming the missing mode is answered per sweep.
+func TestTracerouteMonitorSupportFollowsEngineCapability(t *testing.T) {
+	caps := probeMachine(context.Background(), Config{Servers: []ServerConfig{{Name: "alpha"}}}, platform.New())
+	icmp, tcp := traceroute.Supported()
+	if got := caps.base.Has(permission.ProbeTraceroute); got != (icmp || tcp) {
+		t.Fatalf("supported has probe.traceroute = %v, engine icmp=%v tcp=%v", got, icmp, tcp)
+	}
+}
+
+// A route monitor's sweep reaches this server's slice of the outbox beside
+// its summary metrics, through the same sink every collector result takes.
+func TestSinkFilesScheduledTraceResults(t *testing.T) {
+	outbox, err := wal.Open(t.TempDir(), []string{"alpha"}, wal.Options{})
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	limits := DefaultLimits()
+	rt := buildServer(ServerConfig{Name: "alpha"}, probeViews(), report(), outbox, platform.New(),
+		limits, 30*time.Second, traceroute.NewLimiter(0), collector.NewProbeGate(16), "test-host", nil)
+	rt.sink(collector.Result{
+		TraceResults: []telemetry.TraceResult{{ReportID: "trace_1", MonitorID: "m1", ConfigSerial: 3,
+			TriggerReason: telemetry.TraceTriggerScheduled}},
+		Metrics: []telemetry.Metric{{TS: time.Now().UTC(), Kind: collector.TraceReached, Value: 1, MonitorID: "m1", ConfigSerial: 3}},
+	})
+	var traces []telemetry.TraceResult
+	metrics := 0
+	for {
+		b, ok, err := outbox.NextBatch("alpha", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		traces = append(traces, b.TraceResults...)
+		metrics += len(b.Metrics)
+		if err := outbox.Ack("alpha", b.Sequence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(traces) != 1 || traces[0].MonitorID != "m1" || traces[0].ConfigSerial != 3 || metrics != 1 {
+		t.Fatalf("outbox traces=%+v metrics=%d, want the stamped report and its metric", traces, metrics)
+	}
+}

@@ -221,6 +221,7 @@ func (r *probeRunner) drain() Result {
 		res.Events = append(res.Events, d.Events...)
 		res.Blocked = append(res.Blocked, d.Blocked...)
 		res.Inventory = append(res.Inventory, d.Inventory...)
+		res.TraceResults = append(res.TraceResults, d.TraceResults...)
 	}
 	return res
 }
@@ -243,6 +244,7 @@ var (
 	_ interface{ WaitIdle() } = (*HTTPCollector)(nil)
 	_ interface{ WaitIdle() } = (*TCPCollector)(nil)
 	_ interface{ WaitIdle() } = (*NATCollector)(nil)
+	_ interface{ WaitIdle() } = (*TraceCollector)(nil)
 )
 
 // Tests use it to make Collect deterministic (start the runs, WaitIdle, then
@@ -258,5 +260,5 @@ func (r *probeRunner) SetMinInterval(d time.Duration) { r.sched.SetMinInterval(d
 // empty sink call for no data.
 func resultEmpty(res Result) bool {
 	return len(res.Metrics) == 0 && len(res.Events) == 0 && len(res.Blocked) == 0 &&
-		len(res.Inventory) == 0
+		len(res.Inventory) == 0 && len(res.TraceResults) == 0
 }
